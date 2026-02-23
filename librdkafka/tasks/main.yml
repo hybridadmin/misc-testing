@@ -1,0 +1,39 @@
+---
+- name: Ensure keyrings directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+
+- name: Download Confluent GPG key and dearmor into keyring
+  ansible.builtin.shell: |
+    set -o pipefail
+    wget -qO - "{{ confluent_repo_key_url }}" | gpg --dearmor > "{{ confluent_keyring_path }}"
+  args:
+    creates: "{{ confluent_keyring_path }}"
+    executable: /bin/bash
+
+- name: Set permissions on keyring file
+  ansible.builtin.file:
+    path: "{{ confluent_keyring_path }}"
+    mode: "0644"
+    owner: root
+    group: root
+
+- name: Add Confluent clients APT repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch={{ ansible_architecture | regex_replace('x86_64', 'amd64') | regex_replace('aarch64', 'arm64') }}
+      signed-by={{ confluent_keyring_path }}]
+      {{ confluent_repo_url }} {{ confluent_repo_distribution }} {{ confluent_repo_component }}
+    filename: confluent-clients
+    state: present
+    update_cache: true
+
+- name: Install Confluent packages
+  ansible.builtin.apt:
+    name: "{{ confluent_packages }}"
+    state: present
+    update_cache: true

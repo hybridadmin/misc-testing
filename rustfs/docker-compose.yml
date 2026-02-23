@@ -1,0 +1,43 @@
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      RUSTFS_ROOT_USER: ${RUSTFS_ROOT_USER:-rustfsadmin}
+      RUSTFS_ROOT_PASSWORD: ${RUSTFS_ROOT_PASSWORD:-rustfsadmin}
+      RUSTFS_TLS_PATH: "/opt/tls/"
+    volumes:
+      - $PWD/certs:/opt/tls/
+      - rustfs-data:/data
+      - rustfs-logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -k https://localhost:9000/health || wget -q --spider http://localhost:9000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+  create-buckets:
+    image: minio/mc:latest
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      RUSTFS_ROOT_USER: ${RUSTFS_ROOT_USER:-rustfsadmin}
+      RUSTFS_ROOT_PASSWORD: ${RUSTFS_ROOT_PASSWORD:-rustfsadmin}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set rustfs https://rustfs:9000 --insecure $${RUSTFS_ROOT_USER} $${RUSTFS_ROOT_PASSWORD};
+      mc mb rustfs/pg-bucket --insecure --ignore-existing;
+      mc anonymous set upload --insecure rustfs/pg-bucket;
+      mc anonymous set download --insecure rustfs/pg-bucket;
+      echo 'Bucket creation complete';
+      "
+volumes:
+  rustfs-data:
+    driver: local
+  rustfs-logs:
+    driver: local

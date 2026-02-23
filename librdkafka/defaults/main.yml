@@ -1,0 +1,10 @@
+---
+confluent_major_version: "7.9"
+confluent_keyring_path: /etc/apt/keyrings/confluent.gpg
+confluent_repo_key_url: "https://packages.confluent.io/deb/{{ confluent_major_version }}/archive.key"
+confluent_repo_url: "https://packages.confluent.io/clients/deb/"
+confluent_repo_distribution: jammy
+confluent_repo_component: main
+confluent_packages:
+  - librdkafka-dev
+  - rsyslog-kafka
