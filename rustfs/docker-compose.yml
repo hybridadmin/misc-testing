@@ -37,8 +37,70 @@ services:
       rc mb rustfs/pg-bucket || true;
       echo 'Bucket creation complete';
       "
+  postgres:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM postgres:18.2
+        RUN apt-get update && \
+            apt-get install -y --no-install-recommends pgbackrest && \
+            rm -rf /var/lib/apt/lists/* && \
+            mkdir -p /var/spool/pgbackrest && \
+            chown postgres:postgres /var/spool/pgbackrest && \
+            mkdir -p /var/log/pgbackrest && \
+            chown postgres:postgres /var/log/pgbackrest
+    container_name: postgres
+    restart: unless-stopped
+    depends_on:
+      create-buckets:
+        condition: service_completed_successfully
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - $PWD/pgbackrest/conf/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf
+      - $PWD/cacert:/opt/cacert:ro
+      - pg-data:/var/lib/postgresql/18/docker
+      - pgbackrest-spool:/var/spool/pgbackrest
+      - pgbackrest-logs:/var/log/pgbackrest
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        # Background process: wait for PG to be ready, then create the pgbackrest stanza
+        (
+          echo "pgbackrest-init: waiting for PostgreSQL to accept connections..."
+          until pg_isready -U postgres -q; do
+            sleep 2
+          done
+          echo "pgbackrest-init: PostgreSQL is ready, creating stanza..."
+          pgbackrest --stanza=default stanza-create && \
+            echo "pgbackrest-init: stanza created successfully" || \
+            echo "pgbackrest-init: stanza-create failed (may already exist)"
+        ) &
+        # Exec into the standard postgres entrypoint as PID 1
+        exec docker-entrypoint.sh postgres \
+          -c archive_mode=on \
+          -c "archive_command=pgbackrest --stanza=default archive-push %p" \
+          -c archive_timeout=60 \
+          -c wal_level=replica
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 volumes:
   rustfs-data:
     driver: local
   rustfs-logs:
+    driver: local
+  pg-data:
+    driver: local
+  pgbackrest-spool:
+    driver: local
+  pgbackrest-logs:
     driver: local
