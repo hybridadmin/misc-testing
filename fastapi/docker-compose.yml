@@ -25,6 +25,10 @@ services:
       APP_CACHE_PASS: "valkeyS3cret!"
       APP_CACHE_DB: 0
       APP_CACHE_TTL: 60
+      # OpenTelemetry (Python SDK)
+      OTEL_SERVICE_NAME: fastapi-app
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_TRACES_EXPORTER: otlp
     depends_on:
       postgres:
         condition: service_healthy

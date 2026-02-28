@@ -8,25 +8,25 @@ Dockerized **Nginx** reverse proxy with a **FastAPI** backend, **PostgreSQL 18**
                  :8080                    :8000 (internal)
 ┌────────┐      ┌─────────────┐          ┌──────────────────┐        ┌──────────────┐
 │ Client ├─────►│    Nginx    ├─proxy───►│  Uvicorn/FastAPI │───────►│ PostgreSQL 18│
-└────────┘      │ (ngx_otel)  │          │  (app/main.py)   │        │  :5432       │
-                └──────┬──────┘          └────────┬─────────┘        └──────────────┘
-                       │ traces                   │ cache
-                       ▼ :4317 (gRPC)             ▼ :6379
-                ┌──────────────────┐      ┌──────────────┐
-                │  OTel Collector  │      │    Valkey    │
-                │  (contrib)       │      │  (auth + AOF)│
-                └──────────────────┘      └──────────────┘
+└────────┘      │ (brotli+gz) │          │  (OTel SDK)      │        │  :5432       │
+                └─────────────┘          └───────┬──┬───────┘        └──────────────┘
+                                          traces │  │ cache
+                                     :4317 (gRPC)│  │ :6379
+                                         ┌───────▼┐ ▼──────────┐
+                                         │  OTel  │ │   Valkey  │
+                                         │Collector│ │(auth+AOF) │
+                                         └────────┘ └───────────┘
 ```
 
-Nginx listens on `:8080`, proxies `/api/`, `/docs`, `/redoc`, `/openapi.json`, and `/health` to the FastAPI backend running on Uvicorn (`:8000` inside the container). Read endpoints are cached in Valkey; write operations automatically invalidate related cache keys. Static file serving is still handled directly by Nginx. Trace spans are exported over gRPC to the OTel Collector.
+Nginx listens on `:8080`, proxies `/api/`, `/docs`, `/redoc`, `/openapi.json`, and `/health` to the FastAPI backend running on Uvicorn (`:8000` inside the container). Read endpoints are cached in Valkey; write operations automatically invalidate related cache keys. Static file serving is still handled directly by Nginx. The FastAPI app is instrumented with the OpenTelemetry Python SDK, which exports trace spans over gRPC to the OTel Collector.
 
 ## Stack
 
 | Component | Version / Source |
 |-----------|-----------------|
-| Nginx | `nginx:1.29.5-trixie-otel` (Debian Trixie + OTel) |
+| Nginx | `nginx:1.29.5-trixie` (Debian Trixie) |
 | Brotli module | Dynamic module compiled from [google/ngx_brotli](https://github.com/google/ngx_brotli) |
-| OTel module | Pre-built in the `nginx:trixie-otel` base image ([nginxinc/nginx-otel](https://github.com/nginxinc/nginx-otel)) |
+| OTel Python SDK | `opentelemetry-sdk` 1.39+ with auto-instrumentation for FastAPI, SQLAlchemy, and Redis |
 | OTel Collector | `otel/opentelemetry-collector-contrib:latest` |
 | FastAPI | `0.115.12` with Uvicorn `0.34.2` |
 | Python packaging | [uv](https://docs.astral.sh/uv/) (lockfile-based, replaces pip + venv) |
@@ -61,20 +61,21 @@ docker compose down -v
 
 | File | Purpose |
 |------|---------|
-| `app/main.py` | FastAPI application entrypoint with lifespan handler (auto-creates DB tables, initialises cache) |
+| `app/main.py` | FastAPI application entrypoint with lifespan handler (auto-creates DB tables, initialises cache, sets up OTel tracing) |
 | `app/config.py` | App settings via `pydantic-settings` (reads DB + cache + app config from env) |
 | `app/database.py` | Async SQLAlchemy engine and session factory |
 | `app/cache.py` | Valkey connection pool and cache helpers (get, set, delete, pattern delete) |
 | `app/models.py` | SQLAlchemy models: `Item` and `Note` |
 | `app/schemas.py` | Pydantic request/response schemas |
 | `app/routes.py` | CRUD API routes for items and notes (with Valkey caching) |
+| `app/telemetry.py` | OpenTelemetry SDK setup: TracerProvider, OTLP exporter, auto-instrumentation for FastAPI, SQLAlchemy, Redis |
 | `pyproject.toml` | Project metadata and Python dependencies (used by uv) |
 | `uv.lock` | Lockfile for reproducible dependency installs |
-| `config/nginx.conf` | Nginx config: reverse proxy, performance tuning, gzip, brotli, OTel tracing, rate limiting, security headers |
+| `config/nginx.conf` | Nginx config: reverse proxy, performance tuning, gzip, brotli, rate limiting, security headers |
 | `config/otel-collector-config.yaml` | OTel Collector config: OTLP receivers, batch processor, debug exporter, health check |
 | `config/valkey.conf` | Valkey config: auth, memory limits, LRU eviction, AOF persistence, security hardening |
 | `entrypoint.sh` | Container entrypoint: starts Uvicorn in the background, then Nginx in the foreground |
-| `Dockerfile` | Multi-stage build — compiles Brotli dynamic modules, installs Python + FastAPI app |
+| `Dockerfile` | Multi-stage build — compiles Brotli dynamic modules, installs Python + OTel SDK + FastAPI app |
 | `docker-compose.yml` | Four services: `nginx` + `postgres` + `valkey` + `otel-collector`, with kernel tuning |
 
 ## API Reference
@@ -108,7 +109,7 @@ Simple notes with a title and content body.
 
 | Port | Path | Description |
 |------|------|-------------|
-| 8080 | `/health` | Health check (proxied to FastAPI, no rate limiting, no tracing) |
+| 8080 | `/health` | Health check (proxied to FastAPI, no rate limiting, excluded from tracing) |
 | 8080 | `/docs` | Swagger UI (interactive API docs) |
 | 8080 | `/redoc` | ReDoc (alternative API docs) |
 | 8080 | `/openapi.json` | OpenAPI schema |
@@ -204,7 +205,7 @@ Nginx proxies API traffic to the Uvicorn backend running on `127.0.0.1:8000` (bo
 |----------|---------|-------|
 | `/api/` | `http://backend` | Rate limited, full proxy headers, 30s read timeout |
 | `/docs`, `/redoc`, `/openapi.json` | `http://backend` | FastAPI interactive docs |
-| `/health` | `http://backend` | No tracing, no access log |
+| `/health` | `http://backend` | No access log, excluded from OTel tracing |
 | `/` | static files | Served directly by Nginx |
 
 The upstream block uses `keepalive 32` for persistent connections to Uvicorn.
@@ -236,23 +237,27 @@ Both encodings are enabled simultaneously. Clients that send `Accept-Encoding: b
 
 ### OpenTelemetry Tracing
 
-Nginx uses the [`ngx_otel_module`](https://github.com/nginxinc/nginx-otel) to generate trace spans for every request and export them to the OTel Collector over gRPC.
+The FastAPI application is instrumented with the [OpenTelemetry Python SDK](https://opentelemetry.io/docs/languages/python/), which exports trace spans directly to the OTel Collector over gRPC. All configuration uses standard OTel environment variables set in `docker-compose.yml`.
 
-**Nginx-side config (`config/nginx.conf`):**
+**Instrumented libraries (`app/telemetry.py`):**
 
-| Directive | Value | Description |
-|-----------|-------|-------------|
-| `otel_exporter endpoint` | `otel-collector:4317` | gRPC endpoint of the collector |
-| `otel_exporter interval` | `5s` | Export interval |
-| `otel_exporter batch_size` | `512` | Spans per batch |
-| `otel_exporter batch_count` | `4` | Max concurrent batches |
-| `otel_service_name` | `nginx` | Service name in traces |
-| `otel_trace` | `on` | Enable tracing globally |
-| `otel_trace_context` | `propagate` | Propagate W3C `traceparent` / `tracestate` headers |
-| `otel_span_name` | `$request_uri` | Span name set to the request URI |
-| `otel_span_attr` | `http.server.name $server_name` | Custom span attribute |
+| Instrumentor | What it traces |
+|---------------|----------------|
+| `FastAPIInstrumentor` | HTTP request/response spans for every API call |
+| `SQLAlchemyInstrumentor` | Database query spans (SELECT, INSERT, UPDATE, DELETE) |
+| `RedisInstrumentor` | Valkey/Redis command spans (GET, SET, DEL, SCAN, etc.) |
 
-The `/health` endpoint has `otel_trace off` to avoid noisy health-check spans.
+The `/health` endpoint is excluded from tracing to avoid noisy health-check spans.
+
+**Environment variables (set on the `nginx` service in `docker-compose.yml`):**
+
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `OTEL_SERVICE_NAME` | `fastapi-app` | Service name in trace data |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel-collector:4317` | gRPC endpoint of the collector |
+| `OTEL_TRACES_EXPORTER` | `otlp` | Use OTLP protocol for export |
+
+The SDK reads these automatically — no application code changes are needed to reconfigure the endpoint or service name.
 
 **Collector-side config (`config/otel-collector-config.yaml`):**
 
@@ -438,8 +443,8 @@ You can list multiple exporters in the pipeline to fan out traces to several bac
 - **Port** — change the `listen` directive in `config/nginx.conf` and the port mapping in `docker-compose.yml`
 - **Rate limit** — adjust `rate=1000r/s` and `burst=200` in `config/nginx.conf`
 - **Compression levels** — raise `gzip_comp_level` / `brotli_comp_level` (1-11) for better ratio at the cost of CPU
-- **OTel service name** — change `otel_service_name` in `config/nginx.conf`
-- **OTel sampling** — add `otel_trace $variable` with a map to sample a percentage of requests
+- **OTel service name** — change `OTEL_SERVICE_NAME` in `docker-compose.yml`
+- **OTel endpoint** — change `OTEL_EXPORTER_OTLP_ENDPOINT` in `docker-compose.yml` to point to a different collector
 - **Collector exporters** — edit `config/otel-collector-config.yaml` to add backends (see examples above)
 - **Static content** — mount your content directory to `/usr/share/nginx/html`
 - **Database credentials** — change `APP_DB_USER`, `APP_DB_PASS`, `APP_DB_HOST`, `APP_DB_PORT`, `APP_DB_NAME` in `docker-compose.yml` (and keep `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB` in sync on the postgres service)
@@ -471,13 +476,11 @@ curl -s -H "Accept-Encoding: gzip" -D - -o /dev/null http://localhost:8080/api/i
 
 The Dockerfile uses a multi-stage build. The builder stage:
 
-1. Starts from `nginx:1.29.5-trixie-otel` (which includes the OTel module pre-built)
+1. Starts from `nginx:1.29.5-trixie`
 2. Downloads the matching Nginx source and runs `./configure --with-compat`
 3. Clones and compiles the **Brotli** filter + static modules
 
-The final stage copies the two Brotli `.so` module files into a clean `nginx:1.29.5-trixie-otel` image (which already contains the OTel module and its runtime dependencies), installs [uv](https://docs.astral.sh/uv/) from its official container image, then runs `uv sync --frozen` against the `pyproject.toml` and `uv.lock` to create a virtual environment with all Python dependencies (including `redis[hiredis]` for Valkey) using the system Python 3.13 that ships with Trixie. The app source is copied into `/srv/app/`. The container starts via `entrypoint.sh`, which launches Uvicorn in the background and Nginx in the foreground.
-
-Using the `trixie-otel` base image eliminates the ~10-15 minute OTel/gRPC compilation step, reducing build time significantly.
+The final stage copies the two Brotli `.so` module files into a clean `nginx:1.29.5-trixie` image, installs [uv](https://docs.astral.sh/uv/) from its official container image, then runs `uv sync --frozen` against the `pyproject.toml` and `uv.lock` to create a virtual environment with all Python dependencies (including `redis[hiredis]` for Valkey and the OpenTelemetry SDK with auto-instrumentation packages) using the system Python 3.13 that ships with Trixie. The app source is copied into `/srv/app/`. The container starts via `entrypoint.sh`, which launches Uvicorn in the background and Nginx in the foreground.
 
 ## Environment Variables
 
@@ -495,7 +498,10 @@ All application env vars use the `APP_` prefix (consumed by `pydantic-settings`)
 | `APP_CACHE_HOST` | **required** | Valkey hostname |
 | `APP_CACHE_PORT` | **required** | Valkey port |
 | `APP_CACHE_PASS` | **required** | Valkey auth password (must match `VALKEY_PASSWORD` on the valkey service) |
-| `VALKEY_PASSWORD` | `valkeyS3cret!` | Valkey server auth password (set on the valkey service, passed via `--requirepass`) |
-| `VALKEY_LOGLEVEL` | `notice` | Valkey log level (`debug`, `verbose`, `notice`, `warning`) |
 | `APP_CACHE_DB` | **required** | Valkey database index |
 | `APP_CACHE_TTL` | `60` | Default cache TTL in seconds |
+| `OTEL_SERVICE_NAME` | `fastapi-app` | Service name in trace data |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | OTLP gRPC endpoint for the OTel Collector |
+| `OTEL_TRACES_EXPORTER` | `otlp` | Traces exporter type |
+| `VALKEY_PASSWORD` | `valkeyS3cret!` | Valkey server auth password (set on the valkey service, passed via `--requirepass`) |
+| `VALKEY_LOGLEVEL` | `notice` | Valkey log level (`debug`, `verbose`, `notice`, `warning`) |

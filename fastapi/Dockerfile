@@ -1,7 +1,6 @@
-FROM nginx:1.29.5-trixie-otel AS builder
+FROM nginx:1.29.5-trixie AS builder
 
-# Install build dependencies for Brotli module only
-# (OTel module is pre-built in the trixie-otel base image)
+# Install build dependencies for Brotli module
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     gcc \
@@ -28,10 +27,9 @@ RUN NGINX_VERSION=$(nginx -v 2>&1 | sed 's/.*nginx\///') && \
     cp objs/ngx_http_brotli_static_module.so /tmp/
 
 # --- Final image ---
-FROM nginx:1.29.5-trixie-otel
+FROM nginx:1.29.5-trixie
 
 # Install runtime dependencies for Brotli + Python 3.13 (ships with Trixie)
-# (OTel module and its deps are already in the base image)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libbrotli1 \
     python3 \
@@ -41,7 +39,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 # Copy compiled Brotli modules from builder
-# (OTel module is already present in the base image)
 COPY --from=builder /tmp/ngx_http_brotli_filter_module.so /usr/lib/nginx/modules/
 COPY --from=builder /tmp/ngx_http_brotli_static_module.so /usr/lib/nginx/modules/
 

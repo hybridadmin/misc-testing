@@ -7,6 +7,7 @@ from app.config import get_settings
 from app.cache import init_cache, close_cache
 from app.database import engine, Base
 from app.routes import router
+from app.telemetry import init_telemetry, shutdown_telemetry
 
 
 @asynccontextmanager
@@ -21,9 +22,13 @@ async def lifespan(application: FastAPI):
     # Initialise Valkey connection pool
     await init_cache()
 
+    # Initialise OpenTelemetry tracing
+    init_telemetry(application, engine)
+
     yield
 
     # Shutdown
+    shutdown_telemetry()
     await close_cache()
     await engine.dispose()
 
