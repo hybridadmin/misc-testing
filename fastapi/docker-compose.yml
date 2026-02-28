@@ -27,7 +27,8 @@ services:
       APP_CACHE_TTL: 60
       # OpenTelemetry (Python SDK)
       OTEL_SERVICE_NAME: fastapi-app
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+#      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
       OTEL_TRACES_EXPORTER: otlp
     depends_on:
       postgres:
@@ -110,6 +111,22 @@ services:
       - "4318:4318"
       # Health check
       - "13133:13133"
+    depends_on:
+      jaeger:
+        condition: service_started
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/jaeger:2.15.0
+    container_name: jaeger
+    command:
+      - --set=receivers.otlp.protocols.grpc.endpoint=0.0.0.0:4317
+      - --set=receivers.otlp.protocols.http.endpoint=0.0.0.0:4318
+    ports:
+      # Jaeger UI
+      - "16686:16686"
+      # OTLP gRPC (used by OTel Collector to forward traces)
+      - "4320:4317"
     restart: unless-stopped
 
 volumes:

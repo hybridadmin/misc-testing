@@ -1,6 +1,6 @@
 # High-Performance Nginx + FastAPI Docker Setup
 
-Dockerized **Nginx** reverse proxy with a **FastAPI** backend, **PostgreSQL 18** database, and **Valkey** cache — tuned for high throughput (~1000 connections/sec) with **Gzip** and **Brotli** compression, plus **OpenTelemetry** distributed tracing exported to an OTel Collector.
+Dockerized **Nginx** reverse proxy with a **FastAPI** backend, **PostgreSQL 18** database, and **Valkey** cache — tuned for high throughput (~1000 connections/sec) with **Gzip** and **Brotli** compression, plus **OpenTelemetry** distributed tracing visualised in **Jaeger**.
 
 ## Architecture
 
@@ -15,10 +15,15 @@ Dockerized **Nginx** reverse proxy with a **FastAPI** backend, **PostgreSQL 18**
                                          ┌───────▼┐ ▼──────────┐
                                          │  OTel  │ │   Valkey  │
                                          │Collector│ │(auth+AOF) │
-                                         └────────┘ └───────────┘
+                                         └───┬────┘ └───────────┘
+                                             │ :4317 (gRPC)
+                                         ┌───▼────────┐
+                                         │   Jaeger   │
+                                         │  UI :16686 │
+                                         └────────────┘
 ```
 
-Nginx listens on `:8080`, proxies `/api/`, `/docs`, `/redoc`, `/openapi.json`, and `/health` to the FastAPI backend running on Uvicorn (`:8000` inside the container). Read endpoints are cached in Valkey; write operations automatically invalidate related cache keys. Static file serving is still handled directly by Nginx. The FastAPI app is instrumented with the OpenTelemetry Python SDK, which exports trace spans over gRPC to the OTel Collector.
+Nginx listens on `:8080`, proxies `/api/`, `/docs`, `/redoc`, `/openapi.json`, and `/health` to the FastAPI backend running on Uvicorn (`:8000` inside the container). Read endpoints are cached in Valkey; write operations automatically invalidate related cache keys. Static file serving is still handled directly by Nginx. The FastAPI app is instrumented with the OpenTelemetry Python SDK, which exports trace spans over gRPC to the OTel Collector. The collector forwards traces to Jaeger for visualisation (and also logs them to stdout via the debug exporter).
 
 ## Stack
 
@@ -28,6 +33,7 @@ Nginx listens on `:8080`, proxies `/api/`, `/docs`, `/redoc`, `/openapi.json`, a
 | Brotli module | Dynamic module compiled from [google/ngx_brotli](https://github.com/google/ngx_brotli) |
 | OTel Python SDK | `opentelemetry-sdk` 1.39+ with auto-instrumentation for FastAPI, SQLAlchemy, and Redis |
 | OTel Collector | `otel/opentelemetry-collector-contrib:latest` |
+| Jaeger | `jaegertracing/jaeger:2.15.0` (v2 — trace storage + query + UI) |
 | FastAPI | `0.115.12` with Uvicorn `0.34.2` |
 | Python packaging | [uv](https://docs.astral.sh/uv/) (lockfile-based, replaces pip + venv) |
 | PostgreSQL | `postgres:18` |
@@ -46,6 +52,9 @@ curl http://localhost:8080/health
 
 # Verify OTel Collector is running
 curl http://localhost:13133/
+
+# Open the Jaeger UI to view traces
+open http://localhost:16686
 
 # Open the interactive API docs
 open http://localhost:8080/docs
@@ -72,11 +81,11 @@ docker compose down -v
 | `pyproject.toml` | Project metadata and Python dependencies (used by uv) |
 | `uv.lock` | Lockfile for reproducible dependency installs |
 | `config/nginx.conf` | Nginx config: reverse proxy, performance tuning, gzip, brotli, rate limiting, security headers |
-| `config/otel-collector-config.yaml` | OTel Collector config: OTLP receivers, batch processor, debug exporter, health check |
+| `config/otel-collector-config.yaml` | OTel Collector config: OTLP receivers, batch processor, debug + Jaeger exporters, health check |
 | `config/valkey.conf` | Valkey config: auth, memory limits, LRU eviction, AOF persistence, security hardening |
 | `entrypoint.sh` | Container entrypoint: starts Uvicorn in the background, then Nginx in the foreground |
 | `Dockerfile` | Multi-stage build — compiles Brotli dynamic modules, installs Python + OTel SDK + FastAPI app |
-| `docker-compose.yml` | Four services: `nginx` + `postgres` + `valkey` + `otel-collector`, with kernel tuning |
+| `docker-compose.yml` | Five services: `nginx` + `postgres` + `valkey` + `otel-collector` + `jaeger`, with kernel tuning |
 
 ## API Reference
 
@@ -114,6 +123,7 @@ Simple notes with a title and content body.
 | 8080 | `/redoc` | ReDoc (alternative API docs) |
 | 8080 | `/openapi.json` | OpenAPI schema |
 | 8080 | `/` | Static files from `/usr/share/nginx/html` |
+| 16686 | `/` | Jaeger UI (trace search, span details, service dependency graph) |
 
 ## API Usage Examples
 
@@ -263,13 +273,15 @@ The SDK reads these automatically — no application code changes are needed to 
 
 ```
 Receivers  →  Processors  →  Exporters
-  otlp          batch          debug
- (gRPC+HTTP)  (1024/5s)     (stdout)
+  otlp          batch        debug (stdout)
+ (gRPC+HTTP)  (1024/5s)     otlp/jaeger (gRPC → Jaeger)
 ```
 
 - **Receivers:** OTLP gRPC (`:4317`) and HTTP (`:4318`)
 - **Processors:** `batch` — batches 1024 spans or flushes every 5 seconds
-- **Exporters:** `debug` — logs trace data to the collector's stdout with detailed verbosity
+- **Exporters:**
+  - `debug` — logs trace data to the collector's stdout with detailed verbosity
+  - `otlp/jaeger` — forwards traces to Jaeger over gRPC (`:4317`)
 - **Extensions:** `health_check` on `:13133`
 
 ### Rate Limiting
@@ -367,21 +379,42 @@ docker compose logs -f
 
 ## Viewing Traces
 
-By default, traces are printed to the collector's stdout via the `debug` exporter:
+Traces are viewable in the **Jaeger UI** at [http://localhost:16686](http://localhost:16686).
 
 ```bash
-# Send a request to generate a trace
+# Generate some traces
 curl http://localhost:8080/api/items
+curl -X POST http://localhost:8080/api/items \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Test item"}'
 
-# View traces in collector output
+# Open the Jaeger UI
+open http://localhost:16686
+```
+
+In the Jaeger UI:
+
+1. Select **`fastapi-app`** from the "Service" dropdown
+2. Click **"Find Traces"** to see recent traces
+3. Click any trace to see the full span tree — HTTP request, database queries, and cache operations are all visible as child spans
+
+Each API request generates a trace with spans for:
+
+- **FastAPI** — the root HTTP span (method, path, status code, latency)
+- **SQLAlchemy** — child spans for each database query (`SELECT`, `INSERT`, etc.)
+- **Redis** — child spans for each Valkey command (`GET`, `SET`, `DEL`, etc.)
+
+Traces are also logged to the collector's stdout via the `debug` exporter:
+
+```bash
 docker compose logs otel-collector | grep -A 20 "Span #"
 ```
 
-### Adding a Trace Backend
+### Adding More Trace Backends
 
-To send traces to a real backend, edit `config/otel-collector-config.yaml`. Examples:
+The collector can fan out traces to multiple backends simultaneously. Edit `config/otel-collector-config.yaml` to add exporters:
 
-**Jaeger:**
+**Grafana Tempo:**
 
 ```yaml
 exporters:
@@ -391,21 +424,6 @@ exporters:
     endpoint: jaeger:4317
     tls:
       insecure: true
-
-service:
-  pipelines:
-    traces:
-      receivers: [otlp]
-      processors: [batch]
-      exporters: [debug, otlp/jaeger]
-```
-
-**Grafana Tempo:**
-
-```yaml
-exporters:
-  debug:
-    verbosity: detailed
   otlp/tempo:
     endpoint: tempo:4317
     tls:
@@ -416,7 +434,7 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug, otlp/tempo]
+      exporters: [debug, otlp/jaeger, otlp/tempo]
 ```
 
 **Zipkin:**
@@ -425,6 +443,10 @@ service:
 exporters:
   debug:
     verbosity: detailed
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
   zipkin:
     endpoint: http://zipkin:9411/api/v2/spans
 
@@ -433,10 +455,8 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [debug, zipkin]
+      exporters: [debug, otlp/jaeger, zipkin]
 ```
-
-You can list multiple exporters in the pipeline to fan out traces to several backends simultaneously.
 
 ## Customization
 
