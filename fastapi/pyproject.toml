@@ -1,0 +1,26 @@
+[project]
+name = "fastapi-app"
+version = "0.1.0"
+description = "High-performance FastAPI backend with async PostgreSQL and Valkey caching"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi==0.115.12",
+    "uvicorn[standard]==0.34.2",
+    "sqlalchemy[asyncio]==2.0.40",
+    "asyncpg==0.30.0",
+    "pydantic==2.11.1",
+    "pydantic-settings==2.9.1",
+    "alembic==1.15.2",
+    "redis[hiredis]==5.3.0",
+]
+
+[tool.uv]
+# Bytecode compilation for faster cold starts in the container
+compile-bytecode = true
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

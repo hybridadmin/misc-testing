@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from app.config import get_settings
+from app.cache import init_cache, close_cache
 from app.database import engine, Base
 from app.routes import router
 
@@ -16,8 +17,14 @@ async def lifespan(application: FastAPI):
         await conn.execute(text("SELECT pg_advisory_lock(1)"))
         await conn.run_sync(Base.metadata.create_all)
         await conn.execute(text("SELECT pg_advisory_unlock(1)"))
+
+    # Initialise Valkey connection pool
+    await init_cache()
+
     yield
-    # Dispose of the engine on shutdown
+
+    # Shutdown
+    await close_cache()
     await engine.dispose()
 
 
