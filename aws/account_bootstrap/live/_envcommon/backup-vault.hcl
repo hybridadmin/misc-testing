@@ -25,18 +25,18 @@ inputs = {
   # -------------------------------------------------------------------------
   # IMPORTANT: Replace placeholder values with your actual environment config
   # -------------------------------------------------------------------------
-  name            = "hbdorg-production-backups"
+  name            = "hbdorg-prod-backups"
   organization_id = "o-pfayzcebx5"
 
-  backup_source_account_ids = ["520453265019"] # Production account(s) that send backups
+  backup_source_account_ids = ["394848222143"] # Prod account(s) that send backups
 
   sns_topic_arn       = "arn:aws:sns:${local.aws_region}:${local.account_id}:devops-events-general"
   notification_events = ["COPY_JOB_FAILED"]
 
   admin_role_name         = "CrossAccountAdminAccess"
-  cross_account_role_name = "HBDORG-PRODUCTION-BACKUP-CrossAccountBackupRole"
+  cross_account_role_name = "HDBORG-PROD-BACKUP-CrossAccountBackupRole"
 
-  # Production accounts OU path for S3 bucket read access
+  # Prod accounts OU path for S3 bucket read access
   bucket_read_org_paths = ["o-pfayzcebx5/r-zkdv/ou-zkdv-a0k0yvv1"]
 
   backup_retention_days       = 180

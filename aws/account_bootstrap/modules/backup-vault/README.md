@@ -48,7 +48,7 @@ Converted from the `backup-account/template.yml` CloudFormation template.
 ```
 ┌──────────────────────────┐
 │  Source Account(s)       │
-│  (e.g. 520453265019)    │
+│  (e.g. 394848222143)    │
 │                          │
 │  sts:AssumeRole ─────────┼──────────────┐
 └──────────────────────────┘              │
@@ -83,16 +83,16 @@ Converted from the `backup-account/template.yml` CloudFormation template.
 module "backup_vault" {
   source = "../../modules/backup-vault"
 
-  name            = "myproject-production-backups"
+  name            = "hbdorg-prod-backups"
   organization_id = "o-pfayzcebx5"
 
-  backup_source_account_ids = ["520453265019"]
+  backup_source_account_ids = ["394848222143"]
   sns_topic_arn             = "arn:aws:sns:eu-west-1:444444444444:devops-events-general"
-  cross_account_role_name   = "MYPROJECT-PRODUCTION-BACKUP-CrossAccountBackupRole"
+  cross_account_role_name   = "HBDORG-PROD-BACKUP-CrossAccountBackupRole"
   bucket_read_org_paths     = ["o-pfayzcebx5/r-zkdv/ou-zkdv-a0k0yvv1"]
 
   tags = {
-    Environment = "production"
+    Environment = "prod"
     ManagedBy   = "terragrunt"
   }
 }

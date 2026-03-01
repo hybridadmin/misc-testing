@@ -6,8 +6,8 @@ Terraform modules + Terragrunt live configurations for bootstrapping foundationa
 
 | Module | Description | Deployed To |
 |---|---|---|
-| [`cross-account-roles`](modules/cross-account-roles/) | IAM roles allowing a trusted identity account to assume admin/read-only access | dev, staging, production |
-| [`kms-keys`](modules/kms-keys/) | KMS key for encrypting shared AMIs across the organisation | dev, staging, production |
+| [`cross-account-roles`](modules/cross-account-roles/) | IAM roles allowing a trusted identity account to assume admin/read-only access | dev, staging, prod |
+| [`kms-keys`](modules/kms-keys/) | KMS key for encrypting shared AMIs across the organisation | dev, staging, prod |
 | [`backup-vault`](modules/backup-vault/) | DR backup vault, S3 bucket, KMS key, and cross-account IAM role | backup |
 
 ## Architecture
@@ -34,7 +34,7 @@ Terraform modules + Terragrunt live configurations for bootstrapping foundationa
 
 ┌──────────────────────────┐
 │  Source Account(s)       │
-│  (520453265019)          │
+│  (394848222143)          │
 │  sts:AssumeRole ─────────┼──┐
 └──────────────────────────┘  │
                               v
@@ -96,7 +96,7 @@ Terraform modules + Terragrunt live configurations for bootstrapping foundationa
     │   └── kms-keys/
     │       └── terragrunt.hcl
     │
-    ├── production/
+    ├── prod/
     │   ├── account.hcl
     │   ├── cross-account-roles/
     │   │   └── terragrunt.hcl
@@ -150,7 +150,7 @@ There are several placeholder values you must update before deploying:
 | `live/_envcommon/backup-vault.hcl` | `organization_id`, `backup_source_account_ids`, `sns_topic_arn`, `cross_account_role_name`, `bucket_read_org_paths` |
 | `live/dev/account.hcl` | `account_id` |
 | `live/staging/account.hcl` | `account_id` |
-| `live/production/account.hcl` | `account_id` |
+| `live/prod/account.hcl` | `account_id` |
 | `live/backup/account.hcl` | `account_id` |
 
 ### 2. Remote State Setup
@@ -347,10 +347,10 @@ terragrunt run-all destroy
 
 ## Per-Account Overrides
 
-Each account can override any input from the envcommon config. For example, to use a different KMS key alias in production:
+Each account can override any input from the envcommon config. For example, to use a different KMS key alias in prod:
 
 ```hcl
-# live/production/kms-keys/terragrunt.hcl
+# live/prod/kms-keys/terragrunt.hcl
 
 include "root" {
   path = find_in_parent_folders()
@@ -362,7 +362,7 @@ include "envcommon" {
 }
 
 inputs = {
-  alias_name = "production-ami-encryption"
+  alias_name = "prod-ami-encryption"
 }
 ```
 
@@ -378,7 +378,7 @@ s3://my-org-terraform-state/
   ├── staging/
   │   ├── cross-account-roles/terraform.tfstate
   │   └── kms-keys/terraform.tfstate
-  ├── production/
+  ├── prod/
   │   ├── cross-account-roles/terraform.tfstate
   │   └── kms-keys/terraform.tfstate
   └── backup/

@@ -25,7 +25,7 @@ module "cross_account_roles" {
   trusted_account_id = "283837321132"
 
   tags = {
-    Environment = "production"
+    Environment = "prod"
     ManagedBy   = "terragrunt"
   }
 }

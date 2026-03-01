@@ -33,7 +33,7 @@ module "kms_keys" {
   organization_id = "o-pfayzcebx5"
 
   tags = {
-    Environment = "production"
+    Environment = "prod"
     ManagedBy   = "terragrunt"
   }
 }
