@@ -1,0 +1,43 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.lock.hcl
+
+# Terragrunt
+.terragrunt-cache/
+terragrunt-debug.tfvars.json
+
+# Generated files
+backend.tf
+provider.tf
+provider_override.tf
+versions.tf
+
+# Environment files
+.env
+.env.*
+*.auto.tfvars
+
+# Secrets — NEVER commit these
+*.pem
+*.key
+*credentials*
+*secret*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
