@@ -1,0 +1,124 @@
+###############################################################################
+# Filebeat — ship Nginx JSON logs to Kafka
+#
+# Critical: ClickHouse's Kafka engine with JSONEachRow expects flat JSON
+# matching column names exactly. We must strip ALL Filebeat envelope fields
+# so only the raw Nginx JSON keys reach Kafka.
+###############################################################################
+
+# ---- Global settings ----
+name: "filebeat-nginx"
+path.data: /var/lib/filebeat
+
+filebeat.inputs:
+  # --- Nginx access logs (JSON) ---
+  - type: filestream
+    id: nginx-access
+    enabled: true
+    paths:
+      - /var/log/nginx/access.log
+    parsers:
+      - ndjson:
+          keys_under_root: true        # promote JSON fields to top-level
+          overwrite_keys: true         # overwrite default fields with JSON keys
+          add_error_key: true          # add error.message on parse failure
+          expand_keys: true
+    prospector.scanner.check_interval: 5s
+    close.on_state_change.inactive: 5m
+    clean_inactive: 72h
+    ignore_older: 48h
+
+  # --- Nginx error logs (plain text) ---
+  - type: filestream
+    id: nginx-error
+    enabled: true
+    paths:
+      - /var/log/nginx/error.log
+    fields:
+      log_type: "nginx-error"
+      environment: "production"
+    fields_under_root: true
+    parsers:
+      - multiline:
+          type: pattern
+          pattern: '^\d{4}/\d{2}/\d{2}'
+          negate: true
+          match: after
+    prospector.scanner.check_interval: 5s
+    close.on_state_change.inactive: 5m
+    clean_inactive: 72h
+    ignore_older: 48h
+
+# ---- Processors ----
+# Strip ALL Filebeat envelope fields so Kafka receives flat Nginx JSON only.
+# ClickHouse's JSONEachRow format requires the message to contain only the
+# columns defined in the kafka_log table schema.
+processors:
+  - drop_fields:
+      fields:
+        # Filebeat envelope fields
+        - "@timestamp"
+        - "@metadata"
+        - "agent"
+        - "ecs"
+        - "input"
+        - "log"
+        - "host"                       # Filebeat's host object (conflicts with Nginx host string)
+        - "event"
+        # Custom fields we don't need in Kafka
+        - "log_type"
+        - "environment"
+        # Error key from ndjson parser
+        - "error"
+      ignore_missing: true
+  # Rename http_host → host (Nginx emits as http_host to avoid collision
+  # with Filebeat's host object, then we rename after dropping)
+  - rename:
+      fields:
+        - from: "http_host"
+          to: "host"
+      ignore_missing: true
+      fail_on_error: false
+
+# ---- Output: Kafka ----
+output.kafka:
+  enabled: true
+  hosts: ["kafka:9092"]
+  topic: "nginx-logs"
+  partition.round_robin:
+    reachable_only: true
+  required_acks: 1                    # leader ack (balance durability/throughput)
+  compression: lz4                    # matches topic compression
+  max_message_bytes: 1048576          # 1 MiB — matches Kafka max.message.bytes
+  codec.json:
+    pretty: false
+    escape_html: false
+
+  # Retry / backoff
+  max_retries: 3
+  backoff:
+    init: 1s
+    max: 60s
+
+  # Batching
+  bulk_max_size: 2048
+  channel_buffer_size: 256
+
+  # Metadata refresh
+  metadata:
+    retry.max: 3
+    retry.backoff: 250ms
+    refresh_frequency: 10m
+    full: true
+
+  # Client ID
+  client_id: "filebeat-nginx"
+
+# ---- Logging ----
+logging.level: info
+logging.to_stderr: true
+logging.metrics.enabled: true
+logging.metrics.period: 30s
+
+# ---- Monitoring (self-monitoring disabled to keep stack lean) ----
+monitoring.enabled: false
