@@ -1,0 +1,1050 @@
+# =============================================================================
+# Azure Pipelines Template: moya-build-push
+# =============================================================================
+# Ported from: .github/workflows/build-push.yml (GitHub Actions reusable workflow)
+#
+# This is an Azure Pipelines *template* file. It is the equivalent of a GitHub
+# Actions "workflow_call" reusable workflow. Consuming pipelines reference it
+# via `extends` or `template` from a shared repository resource.
+#
+# ----- PREREQUISITES / SETUP -----
+#
+# 1. Variable Group: "moya-build-push-secrets"
+#    Create a variable group (or link an Azure Key Vault) containing:
+#      - REPO_USER_PAT          : GitHub PAT for private submodule cloning
+#      - REPO_PRIVATE_KEY       : Base64-encoded SSH private key for Docker SSH builds
+#      - DOCKER_USER            : Docker Hub username
+#      - DOCKER_PASS            : Docker Hub password/token
+#      - GHCR_USERNAME          : GitHub Container Registry username (usually org name)
+#      - GHCR_TOKEN             : GitHub PAT with packages:write scope
+#      - MOYA_NETRC             : .netrc content for Docker build secrets
+#      - AWS_ACCESS_KEY_ID      : AWS credentials (or use an AWS service connection instead)
+#      - AWS_SECRET_ACCESS_KEY  : AWS credentials
+#      - AWS_ROLE_TO_ASSUME     : IAM role ARN for OIDC / assume-role
+#      - OPSBUILDS_SLACK_WEBHOOK_URL : Slack incoming webhook URL
+#      - WEBHOOK_URL            : Deployment webhook URL
+#      - WEBHOOK_SECRET         : Deployment webhook secret
+#
+# 2. Variable Group: "moya-build-push-vars"
+#    Non-secret variables (equivalent to GitHub repo-level `vars`):
+#      - DOCKER_HUB_URL         : Default ECR pull-through cache URL (eu-west-1)
+#      - DOCKER_HUB_CI_CD_URL   : Alternate ECR pull-through cache URL (us-east-1)
+#
+# 3. Agent Pools:
+#    - For x86 builds: Microsoft-hosted "ubuntu-24.04" (default) or a self-hosted pool
+#    - For ARM builds: A self-hosted agent pool with ARM64 machines (Azure DevOps
+#      does NOT offer hosted ARM agents). The parameter `pool_arm` should be set to
+#      the name of your self-hosted ARM pool.
+#
+# 4. Tools required on agents: docker, docker buildx, yq, jq, curl, aws CLI, ssh-keyscan
+#    Microsoft-hosted ubuntu images include most of these. For yq, you may need to
+#    install it in a setup step (see install_yq anchor below).
+#
+# 5. AWS Authentication:
+#    The original workflow uses GitHub OIDC (id-token: write) to assume an AWS role.
+#    In Azure Pipelines you can either:
+#      a) Use the AWS Toolkit extension with an AWS service connection, or
+#      b) Use aws configure / aws sts assume-role-with-web-identity with
+#         Azure AD workload identity federation, or
+#      c) Use static credentials from the variable group (simplest but least secure).
+#    This template uses option (c) by default. Replace the "Configure AWS credentials"
+#    steps with your preferred approach.
+# =============================================================================
+
+parameters:
+  # --- Equivalent to GitHub Actions workflow_call inputs ---
+  - name: docker_build_context
+    type: string
+    displayName: 'Docker build context directory'
+    default: '.'
+
+  - name: pool_x86
+    type: string
+    displayName: 'Agent pool (or vmImage) for x86 builds'
+    default: 'ubuntu-24.04'
+
+  - name: pool_arm
+    type: string
+    displayName: 'Agent pool name for ARM64 builds (must be self-hosted)'
+    default: 'arm64-pool'
+
+  - name: trigger_webhook
+    type: boolean
+    displayName: 'Trigger webhook to start deployment'
+    default: true
+
+  - name: docker_build_timeout
+    type: number
+    displayName: 'Docker build timeout in minutes'
+    default: 10
+
+  - name: skip_arm_image
+    type: boolean
+    displayName: 'Skip ARM64 build'
+    default: false
+
+  - name: alt_ecr_cache
+    type: boolean
+    displayName: 'Use alternate ECR Pull Through cache region (us-east-1)'
+    default: false
+
+  # --- Additional parameters not in the original (Azure-specific) ---
+  - name: ghcr_repository
+    type: string
+    displayName: 'GHCR image path (e.g. myorg/myrepo)'
+    default: ''
+
+  - name: repository_name
+    type: string
+    displayName: 'Repository name (used for image tar filename)'
+    default: ''
+
+  - name: secrets_variable_group
+    type: string
+    displayName: 'Variable group name containing secrets'
+    default: 'moya-build-push-secrets'
+
+  - name: vars_variable_group
+    type: string
+    displayName: 'Variable group name containing non-secret variables'
+    default: 'moya-build-push-vars'
+
+variables:
+  - group: ${{ parameters.secrets_variable_group }}
+  - group: ${{ parameters.vars_variable_group }}
+  - name: CACHE_DIR
+    value: '/tmp'
+  # Resolve GHCR repository: use parameter if given, otherwise fall back to
+  # Azure DevOps predefined variables.
+  - name: GHCR_REPO
+    ${{ if ne(parameters.ghcr_repository, '') }}:
+      value: ${{ parameters.ghcr_repository }}
+    ${{ else }}:
+      value: '$(Build.Repository.Name)'
+  - name: REPO_NAME
+    ${{ if ne(parameters.repository_name, '') }}:
+      value: ${{ parameters.repository_name }}
+    ${{ else }}:
+      value: '$(Build.Repository.Name)'
+
+# =============================================================================
+# YAML Anchors — reusable snippets (Azure Pipelines doesn't natively support
+# YAML anchors in templates, so these are written as inline step sequences that
+# are duplicated where needed. Comments mark them for easy maintenance.)
+# =============================================================================
+
+stages:
+  # ===========================================================================
+  # Stage 1: set_job_vars
+  # Determines ref_type (tag vs branch), tag_name, branch_name, skip_arm_build
+  # ===========================================================================
+  - stage: set_job_vars
+    displayName: 'Set Job Variables'
+    jobs:
+      - job: set_vars
+        displayName: 'Determine ref type and tag'
+        timeoutInMinutes: 1
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: none
+
+          - bash: |
+              set -euo pipefail
+
+              SOURCE_BRANCH="$(Build.SourceBranch)"
+              echo "Source branch: ${SOURCE_BRANCH}"
+
+              # Determine if this is a tag or branch
+              if [[ "${SOURCE_BRANCH}" == refs/tags/* ]]; then
+                ref_type="tag"
+                # Tag name with slashes replaced by underscores
+                tag_name=$(echo "${SOURCE_BRANCH#refs/tags/}" | sed 's,/,_,g')
+              else
+                ref_type="branch"
+                tag_name=$(echo "${SOURCE_BRANCH#refs/heads/}" | sed 's,/,_,g')
+              fi
+
+              branch_name=$(echo "${SOURCE_BRANCH#refs/heads/}" | sed 's,/,_,g')
+
+              skip_arm_build="${{ parameters.skip_arm_image }}"
+              # Normalize to lowercase
+              skip_arm_build=$(echo "${skip_arm_build}" | tr '[:upper:]' '[:lower:]')
+
+              echo "ref_type=${ref_type}"
+              echo "tag_name=${tag_name}"
+              echo "branch_name=${branch_name}"
+              echo "skip_arm_build=${skip_arm_build}"
+
+              # Export as pipeline output variables so downstream stages can read them
+              echo "##vso[task.setvariable variable=ref_type;isOutput=true]${ref_type}"
+              echo "##vso[task.setvariable variable=tag_name;isOutput=true]${tag_name}"
+              echo "##vso[task.setvariable variable=branch_name;isOutput=true]${branch_name}"
+              echo "##vso[task.setvariable variable=skip_arm_build;isOutput=true]${skip_arm_build}"
+            name: check_tag
+            displayName: 'Determine ref type, tag name, branch name'
+
+  # ===========================================================================
+  # Stage 2: image_push (amd64)
+  # Builds and pushes the Docker image for x86_64 / amd64
+  # This only runs when ref_type == 'tag'
+  # ===========================================================================
+  - stage: image_push_amd64
+    displayName: 'Build & Push Docker (amd64)'
+    dependsOn: set_job_vars
+    # Only run for tag refs (equivalent to: if needs.set_job_vars.outputs.ref_type == 'tag')
+    condition: eq(stageDependencies.set_job_vars.set_vars.outputs['check_tag.ref_type'], 'tag')
+    variables:
+      IMAGE_TAG: $[ stageDependencies.set_job_vars.set_vars.outputs['check_tag.tag_name'] ]
+      SKIP_ARM: $[ stageDependencies.set_job_vars.set_vars.outputs['check_tag.skip_arm_build'] ]
+    jobs:
+      - job: build_amd64
+        displayName: 'Build amd64 image'
+        timeoutInMinutes: ${{ parameters.docker_build_timeout }}
+        pool:
+          vmImage: '${{ parameters.pool_x86 }}'
+        steps:
+          - checkout: self
+            submodules: recursive
+            persistCredentials: true
+            # NOTE: For private submodules, configure a Git credential in the
+            # Azure DevOps project settings or override with REPO_USER_PAT.
+
+          # -- Install yq if not present --
+          - bash: |
+              if ! command -v yq &> /dev/null; then
+                echo "Installing yq..."
+                sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+                sudo chmod +x /usr/local/bin/yq
+              fi
+            displayName: 'Ensure yq is installed'
+
+          # -- Set deploy variables from project config --
+          - bash: |
+              set -euo pipefail
+              aws_account=$(yq e ".account" vars/systest.yml)
+              aws_region=$(yq e ".region" vars/systest.yml)
+              project=$(yq e ".project" devops.yml)
+              service=$(yq e ".service" devops.yml)
+
+              echo "##vso[task.setvariable variable=aws_account;isOutput=true]${aws_account}"
+              echo "##vso[task.setvariable variable=aws_region;isOutput=true]${aws_region}"
+              echo "##vso[task.setvariable variable=project;isOutput=true]${project}"
+              echo "##vso[task.setvariable variable=service;isOutput=true]${service}"
+            name: deploy_vars
+            displayName: 'Set variables from devops.yml / systest.yml'
+
+          # -- Download project artifacts --
+          - bash: |
+              set -euo pipefail
+              function getProperty {
+                  filename=${2:-devops.yml}
+                  echo $(yq e ".$1" "${filename}")
+              }
+              function hasProperty {
+                  filename=${2:-devops.yml}
+                  if [[ "$(getProperty "$1" "${filename}")" == "null" ]]; then echo "false"; else echo "true"; fi
+              }
+
+              if [[ "$(hasProperty build.files)" == "true" && "$(deploy_vars.service)" != "infrastructure" ]]; then
+                  DOWNLOAD_FILES=$(yq e -o=j -I=0 '.build.files' $PWD/devops.yml)
+                  echo $DOWNLOAD_FILES | jq -c '.[] | [.source, .destination]' | column -t -s'[],"' | while read FILE_SRC FILE_DEST ; do
+                      echo "Downloading $FILE_SRC to $FILE_DEST"
+                      DEST_PATH=$(dirname ${FILE_DEST})
+                      if [ ! -d ${DEST_PATH} ]; then mkdir -p $DEST_PATH; fi
+                      curl -fsSL $FILE_SRC -o $FILE_DEST
+                  done
+              fi
+            displayName: 'Download project artifacts'
+            env:
+              SERVICE: $(deploy_vars.service)
+
+          # -- Build config: version bumping, .dockerignore, maven --
+          - bash: |
+              set -euo pipefail
+              IMAGE_TAG="$(IMAGE_TAG)"
+              DOCKER_BUILD_CONTEXT="${{ parameters.docker_build_context }}"
+              GHCR_REPO="$(GHCR_REPO)"
+
+              # Bump version for python builds
+              if [ -f "./pyproject.toml" ]; then
+                  sed -i "s/^version = \"[^\"]*\"/version = \"${IMAGE_TAG}\"/g" ./pyproject.toml
+              fi
+
+              # Bump version for gradle builds
+              if [ -f "${DOCKER_BUILD_CONTEXT}/build.gradle" ]; then
+                  sed -i "s/version.*develop.*/version '${IMAGE_TAG}'/g" "${DOCKER_BUILD_CONTEXT}/build.gradle"
+              fi
+
+              # Append to .dockerignore
+              cat << 'EOFDOCKERIGNORE' >> .dockerignore
+
+              # Extra directories that should *never* be included in builds
+              .git/
+
+              # Extra files to be excluded
+              Dockerfile
+              docker-compose.*
+              .env
+              EOFDOCKERIGNORE
+
+              # Set maven credentials for java builds
+              maven_build="false"
+              if [[ -f $PWD/pom.xml && -f ./maven_settings_for_docker_build.xml.example ]]; then
+                  cp maven_settings_for_docker_build.xml.example maven_settings_for_docker_build.xml
+                  # NOTE: Replace with your org/user and PAT from variables
+                  sed -i 's/GITHUB_USERNAME/'"$(GHCR_USERNAME)"'/g' maven_settings_for_docker_build.xml
+                  sed -i 's/GITHUB_ACCESS_TOKEN/'"$(REPO_USER_PAT)"'/g' maven_settings_for_docker_build.xml
+                  maven_build="true"
+              fi
+
+              echo "##vso[task.setvariable variable=maven_build;isOutput=true]${maven_build}"
+            name: build_cmds
+            displayName: 'Build config commands (version bump, dockerignore, maven)'
+
+          # -- Run pre_build script if present --
+          - bash: |
+              PRE_BUILD_SCRIPT="pre_build.sh"
+              if [ -f "${PRE_BUILD_SCRIPT}" ]; then
+                  echo "Detected pre build script, executing ${PRE_BUILD_SCRIPT}"
+                  ./${PRE_BUILD_SCRIPT} || { echo "##vso[task.logissue type=error]preBuild script failed"; exit 1; }
+              fi
+            displayName: 'Run pre_build script if present'
+
+          # -- Login to GitHub Container Registry --
+          - bash: |
+              echo "$(GHCR_TOKEN)" | docker login ghcr.io -u "$(GHCR_USERNAME)" --password-stdin
+            displayName: 'Login to GitHub Container Registry'
+
+          # -- Login to Docker Hub --
+          - bash: |
+              echo "$(DOCKER_PASS)" | docker login -u "$(DOCKER_USER)" --password-stdin
+            displayName: 'Login to Docker Hub'
+
+          # -- Set up Docker Buildx --
+          - bash: |
+              docker buildx create --use --name multiarch-builder || true
+              docker buildx inspect --bootstrap
+            displayName: 'Set up Docker Buildx'
+
+          # -- Decode SSH private key --
+          - bash: |
+              set -euo pipefail
+              SSH_KEY_PATH="$(Agent.TempDirectory)/id_rsa"
+              echo "$(REPO_PRIVATE_KEY)" | base64 -d > "${SSH_KEY_PATH}"
+              chmod 600 "${SSH_KEY_PATH}"
+              echo "##vso[task.setvariable variable=ssh_key_path;isOutput=true]${SSH_KEY_PATH}"
+            name: write_key_file
+            displayName: 'Decode SSH private key'
+
+          # -- Update known hosts --
+          - bash: |
+              mkdir -p ~/.ssh
+              ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+            displayName: 'Update known hosts'
+
+          # -- Determine image tag --
+          - bash: |
+              set -euo pipefail
+              IMAGE_TAG="$(IMAGE_TAG)"
+              SKIP_ARM="${{ parameters.skip_arm_image }}"
+
+              if [[ "${SKIP_ARM}" == "True" || "${SKIP_ARM}" == "true" ]]; then
+                new_tag="${IMAGE_TAG}"
+              else
+                new_tag="${IMAGE_TAG}-amd64"
+              fi
+              echo "##vso[task.setvariable variable=new_tag;isOutput=true]${new_tag}"
+            name: set_tag
+            displayName: 'Set image tag'
+
+          # -- Determine ECR cache URL --
+          - bash: |
+              set -euo pipefail
+              if [[ "${{ parameters.alt_ecr_cache }}" == "True" || "${{ parameters.alt_ecr_cache }}" == "true" ]]; then
+                  ECR_CACHE_URL="$(DOCKER_HUB_CI_CD_URL)"
+                  ECR_CACHE_REGION="us-east-1"
+              else
+                  ECR_CACHE_URL="$(DOCKER_HUB_URL)"
+                  ECR_CACHE_REGION="eu-west-1"
+              fi
+              echo "##vso[task.setvariable variable=ecr_cache_url;isOutput=true]${ECR_CACHE_URL}"
+              echo "##vso[task.setvariable variable=ecr_cache_region;isOutput=true]${ECR_CACHE_REGION}"
+            name: set_ecr_cache
+            displayName: 'ECR Caching URL'
+
+          # -- Configure AWS credentials (for ECR cache region) --
+          - bash: |
+              set -euo pipefail
+              export AWS_DEFAULT_REGION="$(set_ecr_cache.ecr_cache_region)"
+              # Login to ECR in the cache region
+              aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | \
+                docker login --username AWS --password-stdin \
+                "$(set_ecr_cache.ecr_cache_url)"
+            displayName: 'Login to Amazon ECR (Caching region)'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # -- Build Docker image (common - non-maven) --
+          - bash: |
+              set -euo pipefail
+              GHCR_REPO="$(GHCR_REPO)"
+              NEW_TAG="$(set_tag.new_tag)"
+              REPO_NAME="$(REPO_NAME)"
+              SSH_KEY="$(write_key_file.ssh_key_path)"
+              ECR_CACHE_URL="$(set_ecr_cache.ecr_cache_url)"
+              IMAGE_TAG="$(IMAGE_TAG)"
+
+              docker buildx build \
+                --platform linux/amd64 \
+                --tag "ghcr.io/${GHCR_REPO}:${NEW_TAG}" \
+                --output "type=docker,dest=$(CACHE_DIR)/${REPO_NAME}.tar" \
+                --cache-from "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-amd64" \
+                --cache-to "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-amd64,mode=max" \
+                --ssh "default=${SSH_KEY}" \
+                --build-arg "DOCKER_HUB_URL=${ECR_CACHE_URL}" \
+                --build-arg "COMMIT_TAG=${IMAGE_TAG}" \
+                --secret "id=netrc,env=MOYA_NETRC" \
+                "${{ parameters.docker_build_context }}"
+            displayName: 'Build Docker image (common)'
+            condition: ne(variables['build_cmds.maven_build'], 'true')
+            env:
+              MOYA_NETRC: $(MOYA_NETRC)
+              DOCKER_BUILDKIT: 1
+
+          # -- Build Docker image (maven) --
+          - bash: |
+              set -euo pipefail
+              GHCR_REPO="$(GHCR_REPO)"
+              NEW_TAG="$(set_tag.new_tag)"
+              REPO_NAME="$(REPO_NAME)"
+              SSH_KEY="$(write_key_file.ssh_key_path)"
+              ECR_CACHE_URL="$(set_ecr_cache.ecr_cache_url)"
+              IMAGE_TAG="$(IMAGE_TAG)"
+
+              docker buildx build \
+                --platform linux/amd64 \
+                --tag "ghcr.io/${GHCR_REPO}:${NEW_TAG}" \
+                --output "type=docker,dest=$(CACHE_DIR)/${REPO_NAME}.tar" \
+                --cache-from "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-amd64" \
+                --cache-to "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-amd64,mode=max" \
+                --ssh "default=${SSH_KEY}" \
+                --build-arg "DOCKER_HUB_URL=${ECR_CACHE_URL}" \
+                --build-arg "COMMIT_TAG=${IMAGE_TAG}" \
+                --secret "id=build-settings,src=./maven_settings_for_docker_build.xml" \
+                "${{ parameters.docker_build_context }}"
+            displayName: 'Build Docker image (maven)'
+            condition: eq(variables['build_cmds.maven_build'], 'true')
+            env:
+              DOCKER_BUILDKIT: 1
+
+          # -- Configure AWS credentials (app image region) and push to ECR --
+          - bash: |
+              set -euo pipefail
+              AWS_REGION="$(deploy_vars.aws_region)"
+              PROJECT="$(deploy_vars.project)"
+              SERVICE="$(deploy_vars.service)"
+              REPO_NAME="$(REPO_NAME)"
+              GHCR_REPO="$(GHCR_REPO)"
+              NEW_TAG="$(set_tag.new_tag)"
+
+              export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+              # Get ECR registry URL
+              REGISTRY=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com
+              REPOSITORY="${PROJECT}-${SERVICE}"
+
+              # Login to ECR
+              aws ecr get-login-password --region "${AWS_REGION}" | \
+                docker login --username AWS --password-stdin "${REGISTRY}"
+
+              # Load, tag, and push
+              docker load --input "$(CACHE_DIR)/${REPO_NAME}.tar"
+              LOCAL_IMAGE="ghcr.io/${GHCR_REPO}:${NEW_TAG}"
+              ECR_IMAGE="${REGISTRY}/${REPOSITORY}:${NEW_TAG}"
+              docker tag "${LOCAL_IMAGE}" "${ECR_IMAGE}"
+              docker push "${ECR_IMAGE}"
+
+              # Export registry for downstream use
+              echo "##vso[task.setvariable variable=ecr_registry;isOutput=true]${REGISTRY}"
+              echo "##vso[task.setvariable variable=ecr_repository;isOutput=true]${REPOSITORY}"
+            name: ecr_push
+            displayName: 'Push Docker image to Amazon ECR'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # -- Slack failure notification --
+          - bash: |
+              set -euo pipefail
+              IMAGE_TAG="$(IMAGE_TAG)"
+              REPO_NAME="$(REPO_NAME)"
+              BUILD_URL="$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+
+              curl -s -X POST -H 'Content-type: application/json' \
+                --data '{
+                  "attachments": [{
+                    "color": "#E74C3C",
+                    "blocks": [
+                      {
+                        "type": "section",
+                        "text": {
+                          "type": "mrkdwn",
+                          "text": "*Repository: '"${REPO_NAME}"', tag: '"${IMAGE_TAG}"'*"
+                        }
+                      },
+                      {
+                        "type": "section",
+                        "fields": [
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Job Status:* Failed"
+                          },
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Message:* Errors detected building docker image (amd64), please check the pipeline run '"${BUILD_URL}"' for issue details."
+                          }
+                        ]
+                      }
+                    ]
+                  }]
+                }' "$(OPSBUILDS_SLACK_WEBHOOK_URL)"
+            displayName: 'Send Slack failure notification'
+            condition: failed()
+
+  # ===========================================================================
+  # Stage 2b: image_push (arm64) — only if skip_arm_image is false
+  # ===========================================================================
+  - stage: image_push_arm64
+    displayName: 'Build & Push Docker (arm64)'
+    dependsOn: set_job_vars
+    condition: |
+      and(
+        eq(stageDependencies.set_job_vars.set_vars.outputs['check_tag.ref_type'], 'tag'),
+        ne('${{ parameters.skip_arm_image }}', true)
+      )
+    variables:
+      IMAGE_TAG: $[ stageDependencies.set_job_vars.set_vars.outputs['check_tag.tag_name'] ]
+    jobs:
+      - job: build_arm64
+        displayName: 'Build arm64 image'
+        timeoutInMinutes: ${{ parameters.docker_build_timeout }}
+        pool:
+          # NOTE: Azure DevOps does not have hosted ARM agents.
+          # This must be a self-hosted agent pool with ARM64 machines.
+          name: '${{ parameters.pool_arm }}'
+        steps:
+          - checkout: self
+            submodules: recursive
+            persistCredentials: true
+
+          # -- Install yq if not present --
+          - bash: |
+              if ! command -v yq &> /dev/null; then
+                echo "Installing yq..."
+                sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_arm64
+                sudo chmod +x /usr/local/bin/yq
+              fi
+            displayName: 'Ensure yq is installed'
+
+          # -- Set deploy variables from project config --
+          - bash: |
+              set -euo pipefail
+              aws_account=$(yq e ".account" vars/systest.yml)
+              aws_region=$(yq e ".region" vars/systest.yml)
+              project=$(yq e ".project" devops.yml)
+              service=$(yq e ".service" devops.yml)
+
+              echo "##vso[task.setvariable variable=aws_account;isOutput=true]${aws_account}"
+              echo "##vso[task.setvariable variable=aws_region;isOutput=true]${aws_region}"
+              echo "##vso[task.setvariable variable=project;isOutput=true]${project}"
+              echo "##vso[task.setvariable variable=service;isOutput=true]${service}"
+            name: deploy_vars
+            displayName: 'Set variables from devops.yml / systest.yml'
+
+          # -- Download project artifacts --
+          - bash: |
+              set -euo pipefail
+              function getProperty {
+                  filename=${2:-devops.yml}
+                  echo $(yq e ".$1" "${filename}")
+              }
+              function hasProperty {
+                  filename=${2:-devops.yml}
+                  if [[ "$(getProperty "$1" "${filename}")" == "null" ]]; then echo "false"; else echo "true"; fi
+              }
+
+              if [[ "$(hasProperty build.files)" == "true" && "$(deploy_vars.service)" != "infrastructure" ]]; then
+                  DOWNLOAD_FILES=$(yq e -o=j -I=0 '.build.files' $PWD/devops.yml)
+                  echo $DOWNLOAD_FILES | jq -c '.[] | [.source, .destination]' | column -t -s'[],"' | while read FILE_SRC FILE_DEST ; do
+                      echo "Downloading $FILE_SRC to $FILE_DEST"
+                      DEST_PATH=$(dirname ${FILE_DEST})
+                      if [ ! -d ${DEST_PATH} ]; then mkdir -p $DEST_PATH; fi
+                      curl -fsSL $FILE_SRC -o $FILE_DEST
+                  done
+              fi
+            displayName: 'Download project artifacts'
+
+          # -- Build config: version bumping, .dockerignore, maven --
+          - bash: |
+              set -euo pipefail
+              IMAGE_TAG="$(IMAGE_TAG)"
+              DOCKER_BUILD_CONTEXT="${{ parameters.docker_build_context }}"
+
+              if [ -f "./pyproject.toml" ]; then
+                  sed -i "s/^version = \"[^\"]*\"/version = \"${IMAGE_TAG}\"/g" ./pyproject.toml
+              fi
+
+              if [ -f "${DOCKER_BUILD_CONTEXT}/build.gradle" ]; then
+                  sed -i "s/version.*develop.*/version '${IMAGE_TAG}'/g" "${DOCKER_BUILD_CONTEXT}/build.gradle"
+              fi
+
+              cat << 'EOFDOCKERIGNORE' >> .dockerignore
+
+              # Extra directories that should *never* be included in builds
+              .git/
+
+              # Extra files to be excluded
+              Dockerfile
+              docker-compose.*
+              .env
+              EOFDOCKERIGNORE
+
+              maven_build="false"
+              if [[ -f $PWD/pom.xml && -f ./maven_settings_for_docker_build.xml.example ]]; then
+                  cp maven_settings_for_docker_build.xml.example maven_settings_for_docker_build.xml
+                  sed -i 's/GITHUB_USERNAME/'"$(GHCR_USERNAME)"'/g' maven_settings_for_docker_build.xml
+                  sed -i 's/GITHUB_ACCESS_TOKEN/'"$(REPO_USER_PAT)"'/g' maven_settings_for_docker_build.xml
+                  maven_build="true"
+              fi
+
+              echo "##vso[task.setvariable variable=maven_build;isOutput=true]${maven_build}"
+            name: build_cmds
+            displayName: 'Build config commands'
+
+          # -- Run pre_build script if present --
+          - bash: |
+              PRE_BUILD_SCRIPT="pre_build.sh"
+              if [ -f "${PRE_BUILD_SCRIPT}" ]; then
+                  echo "Detected pre build script, executing ${PRE_BUILD_SCRIPT}"
+                  ./${PRE_BUILD_SCRIPT} || { echo "##vso[task.logissue type=error]preBuild script failed"; exit 1; }
+              fi
+            displayName: 'Run pre_build script if present'
+
+          # -- Login to GHCR --
+          - bash: |
+              echo "$(GHCR_TOKEN)" | docker login ghcr.io -u "$(GHCR_USERNAME)" --password-stdin
+            displayName: 'Login to GitHub Container Registry'
+
+          # -- Login to Docker Hub --
+          - bash: |
+              echo "$(DOCKER_PASS)" | docker login -u "$(DOCKER_USER)" --password-stdin
+            displayName: 'Login to Docker Hub'
+
+          # -- Set up Docker Buildx --
+          - bash: |
+              docker buildx create --use --name multiarch-builder || true
+              docker buildx inspect --bootstrap
+            displayName: 'Set up Docker Buildx'
+
+          # -- Decode SSH private key --
+          - bash: |
+              set -euo pipefail
+              SSH_KEY_PATH="$(Agent.TempDirectory)/id_rsa"
+              echo "$(REPO_PRIVATE_KEY)" | base64 -d > "${SSH_KEY_PATH}"
+              chmod 600 "${SSH_KEY_PATH}"
+              echo "##vso[task.setvariable variable=ssh_key_path;isOutput=true]${SSH_KEY_PATH}"
+            name: write_key_file
+            displayName: 'Decode SSH private key'
+
+          # -- Update known hosts --
+          - bash: |
+              mkdir -p ~/.ssh
+              ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+            displayName: 'Update known hosts'
+
+          # -- Determine image tag --
+          - bash: |
+              set -euo pipefail
+              IMAGE_TAG="$(IMAGE_TAG)"
+              new_tag="${IMAGE_TAG}-arm64"
+              echo "##vso[task.setvariable variable=new_tag;isOutput=true]${new_tag}"
+            name: set_tag
+            displayName: 'Set image tag'
+
+          # -- Determine ECR cache URL --
+          - bash: |
+              set -euo pipefail
+              if [[ "${{ parameters.alt_ecr_cache }}" == "True" || "${{ parameters.alt_ecr_cache }}" == "true" ]]; then
+                  ECR_CACHE_URL="$(DOCKER_HUB_CI_CD_URL)"
+                  ECR_CACHE_REGION="us-east-1"
+              else
+                  ECR_CACHE_URL="$(DOCKER_HUB_URL)"
+                  ECR_CACHE_REGION="eu-west-1"
+              fi
+              echo "##vso[task.setvariable variable=ecr_cache_url;isOutput=true]${ECR_CACHE_URL}"
+              echo "##vso[task.setvariable variable=ecr_cache_region;isOutput=true]${ECR_CACHE_REGION}"
+            name: set_ecr_cache
+            displayName: 'ECR Caching URL'
+
+          # -- Login to ECR (cache region) --
+          - bash: |
+              set -euo pipefail
+              export AWS_DEFAULT_REGION="$(set_ecr_cache.ecr_cache_region)"
+              aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | \
+                docker login --username AWS --password-stdin \
+                "$(set_ecr_cache.ecr_cache_url)"
+            displayName: 'Login to Amazon ECR (Caching region)'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # -- Build Docker image (common - non-maven) --
+          - bash: |
+              set -euo pipefail
+              GHCR_REPO="$(GHCR_REPO)"
+              NEW_TAG="$(set_tag.new_tag)"
+              REPO_NAME="$(REPO_NAME)"
+              SSH_KEY="$(write_key_file.ssh_key_path)"
+              ECR_CACHE_URL="$(set_ecr_cache.ecr_cache_url)"
+              IMAGE_TAG="$(IMAGE_TAG)"
+
+              docker buildx build \
+                --platform linux/arm64 \
+                --tag "ghcr.io/${GHCR_REPO}:${NEW_TAG}" \
+                --output "type=docker,dest=$(CACHE_DIR)/${REPO_NAME}.tar" \
+                --cache-from "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-arm64" \
+                --cache-to "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-arm64,mode=max" \
+                --ssh "default=${SSH_KEY}" \
+                --build-arg "DOCKER_HUB_URL=${ECR_CACHE_URL}" \
+                --build-arg "COMMIT_TAG=${IMAGE_TAG}" \
+                --secret "id=netrc,env=MOYA_NETRC" \
+                "${{ parameters.docker_build_context }}"
+            displayName: 'Build Docker image (common)'
+            condition: ne(variables['build_cmds.maven_build'], 'true')
+            env:
+              MOYA_NETRC: $(MOYA_NETRC)
+              DOCKER_BUILDKIT: 1
+
+          # -- Build Docker image (maven) --
+          - bash: |
+              set -euo pipefail
+              GHCR_REPO="$(GHCR_REPO)"
+              NEW_TAG="$(set_tag.new_tag)"
+              REPO_NAME="$(REPO_NAME)"
+              SSH_KEY="$(write_key_file.ssh_key_path)"
+              ECR_CACHE_URL="$(set_ecr_cache.ecr_cache_url)"
+              IMAGE_TAG="$(IMAGE_TAG)"
+
+              docker buildx build \
+                --platform linux/arm64 \
+                --tag "ghcr.io/${GHCR_REPO}:${NEW_TAG}" \
+                --output "type=docker,dest=$(CACHE_DIR)/${REPO_NAME}.tar" \
+                --cache-from "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-arm64" \
+                --cache-to "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-arm64,mode=max" \
+                --ssh "default=${SSH_KEY}" \
+                --build-arg "DOCKER_HUB_URL=${ECR_CACHE_URL}" \
+                --build-arg "COMMIT_TAG=${IMAGE_TAG}" \
+                --secret "id=build-settings,src=./maven_settings_for_docker_build.xml" \
+                "${{ parameters.docker_build_context }}"
+            displayName: 'Build Docker image (maven)'
+            condition: eq(variables['build_cmds.maven_build'], 'true')
+            env:
+              DOCKER_BUILDKIT: 1
+
+          # -- Push to ECR --
+          - bash: |
+              set -euo pipefail
+              AWS_REGION="$(deploy_vars.aws_region)"
+              PROJECT="$(deploy_vars.project)"
+              SERVICE="$(deploy_vars.service)"
+              REPO_NAME="$(REPO_NAME)"
+              GHCR_REPO="$(GHCR_REPO)"
+              NEW_TAG="$(set_tag.new_tag)"
+
+              export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+              REGISTRY=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com
+              REPOSITORY="${PROJECT}-${SERVICE}"
+
+              aws ecr get-login-password --region "${AWS_REGION}" | \
+                docker login --username AWS --password-stdin "${REGISTRY}"
+
+              docker load --input "$(CACHE_DIR)/${REPO_NAME}.tar"
+              LOCAL_IMAGE="ghcr.io/${GHCR_REPO}:${NEW_TAG}"
+              ECR_IMAGE="${REGISTRY}/${REPOSITORY}:${NEW_TAG}"
+              docker tag "${LOCAL_IMAGE}" "${ECR_IMAGE}"
+              docker push "${ECR_IMAGE}"
+            name: ecr_push
+            displayName: 'Push Docker image to Amazon ECR'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # -- Slack failure notification --
+          - bash: |
+              set -euo pipefail
+              IMAGE_TAG="$(IMAGE_TAG)"
+              REPO_NAME="$(REPO_NAME)"
+              BUILD_URL="$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+
+              curl -s -X POST -H 'Content-type: application/json' \
+                --data '{
+                  "attachments": [{
+                    "color": "#E74C3C",
+                    "blocks": [
+                      {
+                        "type": "section",
+                        "text": {
+                          "type": "mrkdwn",
+                          "text": "*Repository: '"${REPO_NAME}"', tag: '"${IMAGE_TAG}"'*"
+                        }
+                      },
+                      {
+                        "type": "section",
+                        "fields": [
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Job Status:* Failed"
+                          },
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Message:* Errors detected building docker image (arm64), please check the pipeline run '"${BUILD_URL}"' for issue details."
+                          }
+                        ]
+                      }
+                    ]
+                  }]
+                }' "$(OPSBUILDS_SLACK_WEBHOOK_URL)"
+            displayName: 'Send Slack failure notification'
+            condition: failed()
+
+  # ===========================================================================
+  # Stage 3: create_manifest
+  # Creates a multi-arch Docker manifest in ECR (combining amd64 + arm64).
+  # Only runs when it's a tag AND arm builds are NOT skipped.
+  # ===========================================================================
+  - stage: create_manifest
+    displayName: 'Create Multi-Arch Manifest'
+    dependsOn:
+      - set_job_vars
+      - image_push_amd64
+      - image_push_arm64
+    condition: |
+      and(
+        eq(stageDependencies.set_job_vars.set_vars.outputs['check_tag.ref_type'], 'tag'),
+        eq(stageDependencies.set_job_vars.set_vars.outputs['check_tag.skip_arm_build'], 'false')
+      )
+    variables:
+      IMAGE_TAG: $[ stageDependencies.set_job_vars.set_vars.outputs['check_tag.tag_name'] ]
+    jobs:
+      - job: manifest
+        displayName: 'Create and push manifest'
+        timeoutInMinutes: 5
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+
+          # -- Install yq --
+          - bash: |
+              if ! command -v yq &> /dev/null; then
+                sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+                sudo chmod +x /usr/local/bin/yq
+              fi
+            displayName: 'Ensure yq is installed'
+
+          # -- Set deploy variables --
+          - bash: |
+              set -euo pipefail
+              aws_account=$(yq e ".account" vars/systest.yml)
+              aws_region=$(yq e ".region" vars/systest.yml)
+              project=$(yq e ".project" devops.yml)
+              service=$(yq e ".service" devops.yml)
+
+              echo "##vso[task.setvariable variable=aws_account;isOutput=true]${aws_account}"
+              echo "##vso[task.setvariable variable=aws_region;isOutput=true]${aws_region}"
+              echo "##vso[task.setvariable variable=project;isOutput=true]${project}"
+              echo "##vso[task.setvariable variable=service;isOutput=true]${service}"
+            name: deploy_vars
+            displayName: 'Set variables from devops.yml / systest.yml'
+
+          # -- Login to ECR and create manifest --
+          - bash: |
+              set -euo pipefail
+              AWS_REGION="$(deploy_vars.aws_region)"
+              PROJECT="$(deploy_vars.project)"
+              SERVICE="$(deploy_vars.service)"
+              IMAGE_TAG="$(IMAGE_TAG)"
+
+              export AWS_DEFAULT_REGION="${AWS_REGION}"
+
+              REGISTRY=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_REGION}.amazonaws.com
+              REPOSITORY="${PROJECT}-${SERVICE}"
+
+              # Login to ECR
+              aws ecr get-login-password --region "${AWS_REGION}" | \
+                docker login --username AWS --password-stdin "${REGISTRY}"
+
+              # Create multi-arch manifest
+              docker manifest create "${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}" \
+                  "${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}-amd64" \
+                  "${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}-arm64"
+
+              docker manifest annotate --arch arm64 "${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}" \
+                  "${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}-arm64"
+
+              docker manifest push "${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+            displayName: 'Create and push image manifest'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # -- Slack failure notification --
+          - bash: |
+              set -euo pipefail
+              IMAGE_TAG="$(IMAGE_TAG)"
+              REPO_NAME="$(REPO_NAME)"
+              BUILD_URL="$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+
+              curl -s -X POST -H 'Content-type: application/json' \
+                --data '{
+                  "attachments": [{
+                    "color": "#E74C3C",
+                    "blocks": [
+                      {
+                        "type": "section",
+                        "text": {
+                          "type": "mrkdwn",
+                          "text": "*Repository: '"${REPO_NAME}"', tag: '"${IMAGE_TAG}"'*"
+                        }
+                      },
+                      {
+                        "type": "section",
+                        "fields": [
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Job Status:* Failed"
+                          },
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Message:* Errors detected creating docker image manifest, please check the pipeline run '"${BUILD_URL}"' for issue details."
+                          }
+                        ]
+                      }
+                    ]
+                  }]
+                }' "$(OPSBUILDS_SLACK_WEBHOOK_URL)"
+            displayName: 'Send Slack failure notification'
+            condition: failed()
+
+  # ===========================================================================
+  # Stage 4: web_hook
+  # Triggers deployment webhook after successful build + manifest creation.
+  # Only runs on tags and when trigger_webhook is true.
+  # ===========================================================================
+  - stage: web_hook
+    displayName: 'Trigger Deployment Webhook'
+    dependsOn:
+      - set_job_vars
+      - image_push_amd64
+      - ${{ if ne(parameters.skip_arm_image, true) }}:
+        - image_push_arm64
+      - ${{ if ne(parameters.skip_arm_image, true) }}:
+        - create_manifest
+    condition: |
+      and(
+        eq(stageDependencies.set_job_vars.set_vars.outputs['check_tag.ref_type'], 'tag'),
+        eq('${{ parameters.trigger_webhook }}', true)
+      )
+    variables:
+      IMAGE_TAG: $[ stageDependencies.set_job_vars.set_vars.outputs['check_tag.tag_name'] ]
+    jobs:
+      - job: webhook
+        displayName: 'Invoke deployment webhook'
+        timeoutInMinutes: 5
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: none
+
+          - bash: |
+              set -euo pipefail
+              IMAGE_TAG="$(IMAGE_TAG)"
+              REPO_NAME="$(REPO_NAME)"
+
+              # Build a JSON payload similar to the GitHub context
+              PAYLOAD=$(cat <<EOFPAYLOAD
+              {
+                "ref": "$(Build.SourceBranch)",
+                "repository": "$(Build.Repository.Name)",
+                "tag": "${IMAGE_TAG}",
+                "build_id": "$(Build.BuildId)",
+                "build_url": "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)",
+                "source": "azure-pipelines"
+              }
+              EOFPAYLOAD
+              )
+
+              # Compute HMAC signature if webhook secret is provided
+              SIGNATURE=""
+              if [[ -n "$(WEBHOOK_SECRET)" ]]; then
+                SIGNATURE=$(echo -n "${PAYLOAD}" | openssl dgst -sha256 -hmac "$(WEBHOOK_SECRET)" | awk '{print $2}')
+              fi
+
+              # Send the webhook
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X POST \
+                -H "Content-Type: application/json" \
+                -H "X-Hub-Signature-256: sha256=${SIGNATURE}" \
+                -d "${PAYLOAD}" \
+                "$(WEBHOOK_URL)")
+
+              echo "Webhook response status: ${HTTP_STATUS}"
+              if [[ "${HTTP_STATUS}" -lt 200 || "${HTTP_STATUS}" -ge 300 ]]; then
+                echo "##vso[task.logissue type=error]Webhook returned HTTP ${HTTP_STATUS}"
+                exit 1
+              fi
+            displayName: 'Invoke deployment webhook'
+            env:
+              WEBHOOK_URL: $(WEBHOOK_URL)
+              WEBHOOK_SECRET: $(WEBHOOK_SECRET)
+
+          # -- Slack failure notification --
+          - bash: |
+              set -euo pipefail
+              IMAGE_TAG="$(IMAGE_TAG)"
+              REPO_NAME="$(REPO_NAME)"
+              BUILD_URL="$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+
+              curl -s -X POST -H 'Content-type: application/json' \
+                --data '{
+                  "attachments": [{
+                    "color": "#E74C3C",
+                    "blocks": [
+                      {
+                        "type": "section",
+                        "text": {
+                          "type": "mrkdwn",
+                          "text": "*Repository: '"${REPO_NAME}"', tag: '"${IMAGE_TAG}"'*"
+                        }
+                      },
+                      {
+                        "type": "section",
+                        "fields": [
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Job Status:* Failed"
+                          },
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Message:* Errors detected triggering deployment webhook, please check the pipeline run '"${BUILD_URL}"' for issue details."
+                          }
+                        ]
+                      }
+                    ]
+                  }]
+                }' "$(OPSBUILDS_SLACK_WEBHOOK_URL)"
+            displayName: 'Send Slack failure notification'
+            condition: failed()

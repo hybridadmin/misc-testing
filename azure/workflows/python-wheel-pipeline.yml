@@ -1,0 +1,51 @@
+# =============================================================================
+# Sample Azure Pipeline that consumes the python-wheel template
+# =============================================================================
+# This is the equivalent of a GitHub Actions workflow that calls the reusable
+# workflow via `uses: org/shared-workflows/.github/workflows/python-wheel.yml`.
+#
+# Place this file in the consuming repository as `azure-pipelines.yml` and
+# adjust the resource reference to point to your shared templates repo.
+# =============================================================================
+
+trigger:
+  tags:
+    include:
+      - '*'
+  branches:
+    include:
+      - main
+
+resources:
+  repositories:
+    # Reference the shared templates repository.
+    # Adjust `repository`, `type`, `ref`, and `endpoint` to match your setup.
+    - repository: shared-templates
+      type: git                          # Use 'github' if the templates repo is on GitHub
+      name: 'YourProject/shared-workflows'  # Azure Repos: 'project/repo', GitHub: 'org/repo'
+      ref: refs/heads/main
+      # endpoint: 'your-github-service-connection'  # Only needed for GitHub repos
+
+# Extend from the shared template (equivalent to workflow_call)
+extends:
+  template: shared/python-wheel.yml@shared-templates
+  parameters:
+    # --- Building from a submodule (e.g. vendored C extension) ---
+    # from_local_source: false             # Default
+    # source_folder: 'vendor/some-lib'     # Path to the submodule
+    # source_tag: 'v1.2.3'                 # Tag to checkout in submodule
+
+    # --- Building from local source ---
+    from_local_source: true
+    auto_set_version: true
+
+    # --- Runner / pool configuration ---
+    # pool_x86: 'ubuntu-24.04'            # Default; override if using self-hosted
+    # pool_arm: 'arm64-pool'              # Set to your self-hosted ARM pool name
+
+    # --- Release configuration ---
+    push_to_mirror: true                   # Upload to devpi on tagged builds from main
+
+    # --- Variable groups ---
+    # secrets_variable_group: 'python-wheel-secrets'   # Default
+    # vars_variable_group: 'python-wheel-vars'         # Default

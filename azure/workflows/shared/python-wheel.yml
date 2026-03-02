@@ -1,0 +1,551 @@
+# =============================================================================
+# Azure Pipelines Template: build-python-wheel
+# =============================================================================
+# Ported from: .github/workflows/python-wheel.yml (GitHub Actions reusable workflow)
+#
+# This is an Azure Pipelines *template* file. It is the equivalent of a GitHub
+# Actions "workflow_call" reusable workflow. Consuming pipelines reference it
+# via `extends` or `template` from a shared repository resource.
+#
+# ----- PREREQUISITES / SETUP -----
+#
+# 1. Variable Group: "python-wheel-secrets"
+#    Create a variable group (or link an Azure Key Vault) containing:
+#      - PYPI_INDEX_USER   : Username for the devpi (PyPI mirror) server
+#      - PYPI_INDEX_PASS   : Password for the devpi server
+#
+# 2. Variable Group: "python-wheel-vars"
+#    Non-secret variables (equivalent to GitHub repo-level `vars`):
+#      - PYPI_ENDPOINT     : devpi server URL (e.g. https://pypi.example.com)
+#
+# 3. Agent Pools:
+#    - x86 builds use Microsoft-hosted 'ubuntu-24.04' by default.
+#    - ARM builds require a self-hosted agent pool with ARM64 machines
+#      (Azure DevOps does NOT offer hosted ARM agents).
+#      Set `pool_arm` to the name of your self-hosted ARM pool.
+#
+# 4. Tools required on agents:
+#    - git, python3, pip, jq
+#    - cibuildwheel (installed at build time)
+#    - uv (installed via setup step)
+#    - devpi-client (installed at release time)
+#
+# ----- DIFFERENCES FROM GITHUB ACTIONS VERSION -----
+#
+# - Dynamic matrix (fromJSON based on is_pure_wheel) is replaced by separate
+#   parallel stages: build_wheels_x86 always runs; build_wheels_arm64 runs
+#   only when the wheel is NOT pure Python. This is because Azure Pipelines
+#   does not support dynamic matrices derived from job outputs.
+#
+# - actions/upload-artifact / download-artifact are replaced with Azure
+#   Pipeline Artifacts (PublishPipelineArtifact / DownloadPipelineArtifact).
+#
+# - cibuildwheel is invoked via pip + CLI instead of the pypa/cibuildwheel
+#   GitHub Action, since that action is GitHub-specific.
+#
+# - uv is installed via direct download instead of astral-sh/setup-uv action.
+# =============================================================================
+
+parameters:
+  # --- Equivalent to GitHub Actions workflow_call inputs ---
+  - name: from_local_source
+    type: boolean
+    displayName: 'Build using local source file(s)'
+    default: false
+
+  - name: source_folder
+    type: string
+    displayName: 'Submodule folder name'
+    default: ''
+
+  - name: source_tag
+    type: string
+    displayName: 'Submodule tag to checkout'
+    default: ''
+
+  - name: pool_x86
+    type: string
+    displayName: 'Agent pool (or vmImage) for x86 builds'
+    default: 'ubuntu-24.04'
+
+  - name: pool_arm
+    type: string
+    displayName: 'Agent pool name for ARM64 builds (must be self-hosted)'
+    default: 'arm64-pool'
+
+  - name: push_to_mirror
+    type: boolean
+    displayName: 'Whether to push to PyPI mirror'
+    default: false
+
+  - name: auto_set_version
+    type: boolean
+    displayName: 'Whether to change app version in pyproject.toml before build'
+    default: false
+
+  # --- Azure-specific parameters ---
+  - name: secrets_variable_group
+    type: string
+    displayName: 'Variable group name containing secrets'
+    default: 'python-wheel-secrets'
+
+  - name: vars_variable_group
+    type: string
+    displayName: 'Variable group name containing non-secret variables'
+    default: 'python-wheel-vars'
+
+variables:
+  - group: ${{ parameters.secrets_variable_group }}
+  - group: ${{ parameters.vars_variable_group }}
+
+stages:
+  # ===========================================================================
+  # Stage 1: set_job_vars
+  # Determines ref_type, tag_name, commit_tag, branch_name, and whether the
+  # wheel is pure Python or platform-specific.
+  # ===========================================================================
+  - stage: set_job_vars
+    displayName: 'Set Job Variables'
+    jobs:
+      - job: set_vars
+        displayName: 'Determine ref type, tag, and wheel type'
+        timeoutInMinutes: 2
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+            submodules: recursive
+            fetchDepth: 0
+            persistCredentials: true
+
+          - bash: |
+              git fetch --tags
+            displayName: 'Fetch tags'
+
+          - bash: |
+              set -euo pipefail
+
+              SOURCE_BRANCH="$(Build.SourceBranch)"
+              SOURCE_VERSION="$(Build.SourceVersion)"
+              echo "Source branch: ${SOURCE_BRANCH}"
+              echo "Source version (SHA): ${SOURCE_VERSION}"
+
+              # Determine ref_type and ref_name
+              if [[ "${SOURCE_BRANCH}" == refs/tags/* ]]; then
+                ref_type="tag"
+                ref_name="${SOURCE_BRANCH#refs/tags/}"
+              else
+                ref_type="branch"
+                ref_name="${SOURCE_BRANCH#refs/heads/}"
+              fi
+
+              # Determine commit_tag
+              if [[ "${ref_type}" == "tag" ]]; then
+                commit_tag="${ref_name}"
+              else
+                commit_tag=$(git tag --points-at "${SOURCE_VERSION}" | head -n1) || true
+                if [ -z "$commit_tag" ]; then
+                  commit_tag=$(git describe --tags --abbrev=0 "${SOURCE_VERSION}" 2>/dev/null) || true
+                fi
+              fi
+
+              # Determine branch_name from SHA
+              branch_name=$(git ls-remote --heads origin | grep "${SOURCE_VERSION}" | sed "s/.*\///" ) || true
+
+              echo "ref_type=${ref_type}"
+              echo "tag_name=${ref_name}"
+              echo "commit_tag=${commit_tag}"
+              echo "branch_name=${branch_name}"
+
+              echo "##vso[task.setvariable variable=ref_type;isOutput=true]${ref_type}"
+              echo "##vso[task.setvariable variable=tag_name;isOutput=true]${ref_name}"
+              echo "##vso[task.setvariable variable=commit_tag;isOutput=true]${commit_tag}"
+              echo "##vso[task.setvariable variable=branch_name;isOutput=true]${branch_name}"
+            name: check_tag
+            displayName: 'Determine ref type, tag name, commit tag'
+
+          - bash: |
+              set -uo pipefail
+
+              SOURCE_FOLDER="${{ parameters.source_folder }}"
+              PROJECT_DIR="${SOURCE_FOLDER:-"."}"
+              platform_detected=false
+
+              flag_platform() {
+                  echo "[PLATFORM] $1"
+                  platform_detected=true
+              }
+
+              flag_pure() {
+                  echo "[PURE]     $1"
+              }
+
+              # 1. Check the build backend declared in pyproject.toml
+              PYPROJECT="$PROJECT_DIR/pyproject.toml"
+              if [[ -f "$PYPROJECT" ]]; then
+                  build_backend=$(grep -E '^\s*build-backend\s*=' "$PYPROJECT" \
+                      | head -1 \
+                      | sed "s/.*=\s*[\"']\([^\"']*\)[\"'].*/\1/")
+                  if [[ -n "$build_backend" ]]; then
+                      case "$build_backend" in
+                          maturin|maturin.*)
+                              flag_platform "Build backend '$build_backend' always produces platform wheels" ;;
+                          scikit_build_core.*|skbuild.*)
+                              flag_platform "Build backend '$build_backend' always produces platform wheels" ;;
+                          mesonpy|mesonpy.*|mesonbuild.*)
+                              flag_platform "Build backend '$build_backend' always produces platform wheels" ;;
+                          setuptools.build_meta|setuptools.build_meta:*)
+                              flag_pure "Build backend is standard setuptools" ;;
+                          flit_core.*|flit.*)
+                              flag_pure "Build backend '$build_backend' always produces pure wheels" ;;
+                          hatchling|hatchling.*)
+                              flag_pure "Build backend '$build_backend' typically produces pure wheels" ;;
+                          pdm.backend|pdm.backend.*)
+                              flag_pure "Build backend '$build_backend' typically produces pure wheels" ;;
+                          poetry.*|poetry_core.*)
+                              flag_pure "Build backend '$build_backend' typically produces pure wheels" ;;
+                          *)
+                              echo "[INFO]     Unknown build backend '$build_backend' — relying on other checks" ;;
+                      esac
+                  else
+                      echo "[INFO]     No build-backend found in pyproject.toml"
+                  fi
+              else
+                  echo "[INFO]     No pyproject.toml found"
+              fi
+
+              # 2. Check for ext_modules in setup.py or setup.cfg
+              SETUP_PY="$PROJECT_DIR/setup.py"
+              SETUP_CFG="$PROJECT_DIR/setup.cfg"
+              if [[ -f "$SETUP_PY" ]]; then
+                  if grep -qE 'ext_modules\s*=' "$SETUP_PY"; then
+                      flag_platform "setup.py defines ext_modules"
+                  else
+                      flag_pure "setup.py exists but does not define ext_modules"
+                  fi
+              else
+                  flag_pure "No setup.py found (no ext_modules possible via setup.py)"
+              fi
+              if [[ -f "$SETUP_CFG" ]]; then
+                  if grep -qiE '^\[options\.ext_modules\]|^\[extension\]' "$SETUP_CFG"; then
+                      flag_platform "setup.cfg declares extension modules"
+                  fi
+              fi
+              if [[ -f "$PYPROJECT" ]]; then
+                  if grep -qE '^\[tool\.setuptools\.ext-modules' "$PYPROJECT"; then
+                      flag_platform "pyproject.toml declares [tool.setuptools.ext-modules]"
+                  else
+                      flag_pure "No [tool.setuptools.ext-modules] in pyproject.toml"
+                  fi
+              fi
+
+              # 3. Check for native source files (.c, .cpp, .cxx, .pyx, .rs)
+              native_files=$(find "$PROJECT_DIR" \
+                  -not -path '*/.git/*' \
+                  -not -path '*/node_modules/*' \
+                  -not -path '*/.tox/*' \
+                  -not -path '*/.venv/*' \
+                  -not -path '*/venv/*' \
+                  -not -path '*/__pycache__/*' \
+                  -not -path '*/build/*' \
+                  -not -path '*/dist/*' \
+                  -not -path '*/*.egg-info/*' \
+                  \( -name '*.c' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.pyx' -o -name '*.rs' \) \
+                  2>/dev/null || true)
+              if [[ -n "$native_files" ]]; then
+                  count=$(echo "$native_files" | wc -l | tr -d ' ')
+                  flag_platform "Found $count native source file(s): $(echo "$native_files" | head -3 | tr '\n' ' ')"
+              else
+                  flag_pure "No native source files (.c, .cpp, .cxx, .pyx, .rs) found"
+              fi
+
+              # 4. Check for CFFI or Cython build dependencies
+              if [[ -f "$PYPROJECT" ]]; then
+                  if grep -qiE '^\s*"(cffi|cython|pybind11|cppimport)' "$PYPROJECT"; then
+                      flag_platform "Build dependencies include a native compilation tool"
+                  else
+                      flag_pure "No native compilation tools in build dependencies"
+                  fi
+              fi
+              if [[ -f "$SETUP_CFG" ]]; then
+                  if grep -qiE 'cffi|cython|pybind11' "$SETUP_CFG"; then
+                      flag_platform "setup.cfg references native compilation tools"
+                  fi
+              fi
+
+              # 5. Check for Cargo.toml (Rust/PyO3/maturin projects)
+              if [[ -f "$PROJECT_DIR/Cargo.toml" ]]; then
+                  flag_platform "Cargo.toml found — Rust extension project"
+              else
+                  flag_pure "No Cargo.toml found"
+              fi
+
+              # Verdict
+              echo ""
+              echo "==========================================="
+              if [[ "$platform_detected" == true ]]; then
+                  echo "RESULT: PLATFORM-SPECIFIC (multiple wheels)"
+                  echo "==========================================="
+                  echo "##vso[task.setvariable variable=is_pure_wheel;isOutput=true]false"
+              else
+                  echo "RESULT: PURE PYTHON (single none-any wheel)"
+                  echo "==========================================="
+                  echo "##vso[task.setvariable variable=is_pure_wheel;isOutput=true]true"
+              fi
+            name: detect_wheel_type
+            displayName: 'Detect wheel type (pure vs platform)'
+
+  # ===========================================================================
+  # Stage 2a: build_wheels_x86
+  # Builds Python wheels on x86_64. Always runs.
+  # ===========================================================================
+  - stage: build_wheels_x86
+    displayName: 'Build Wheels (x86_64)'
+    dependsOn: set_job_vars
+    variables:
+      IMAGE_TAG_NAME: $[ stageDependencies.set_job_vars.set_vars.outputs['check_tag.tag_name'] ]
+      IMAGE_TAG: $[ stageDependencies.set_job_vars.set_vars.outputs['check_tag.commit_tag'] ]
+      IS_PURE_WHEEL: $[ stageDependencies.set_job_vars.set_vars.outputs['detect_wheel_type.is_pure_wheel'] ]
+    jobs:
+      - job: build_x86
+        displayName: 'Build x86_64 wheel'
+        timeoutInMinutes: 30
+        pool:
+          vmImage: '${{ parameters.pool_x86 }}'
+        steps:
+          - checkout: self
+            submodules: recursive
+            fetchDepth: 0
+            persistCredentials: true
+
+          # -- Checkout target version in submodule (if source_folder is set) --
+          - ${{ if ne(parameters.source_folder, '') }}:
+            - bash: |
+                cd "${{ parameters.source_folder }}" && git checkout "${{ parameters.source_tag }}"
+              displayName: 'Checkout target version in submodule'
+
+          # -- Build wheel with cibuildwheel (when source_folder is set) --
+          - ${{ if ne(parameters.source_folder, '') }}:
+            - bash: |
+                set -euo pipefail
+                pip install cibuildwheel
+                cibuildwheel --output-dir wheelhouse "${{ parameters.source_folder }}"
+              displayName: 'Build wheel with cibuildwheel'
+              env:
+                # Build only x86_64 on this runner
+                CIBW_ARCHS_LINUX: 'x86_64'
+                CIBW_BUILD_FRONTEND: 'build[uv]'
+                CIBW_BUILD: 'cp313-manylinux* cp314-manylinux*'
+                CIBW_BEFORE_BUILD: 'bash pre_build.sh'
+
+          # -- Install uv (when from_local_source) --
+          - ${{ if eq(parameters.from_local_source, true) }}:
+            - bash: |
+                set -euo pipefail
+                curl -LsSf https://astral.sh/uv/install.sh | sh
+                echo "##vso[task.prependpath]$HOME/.local/bin"
+              displayName: 'Install uv'
+
+          # -- Auto-set version in pyproject.toml --
+          - ${{ if and(eq(parameters.from_local_source, true), eq(parameters.auto_set_version, true)) }}:
+            - bash: |
+                set -euo pipefail
+                IMAGE_TAG="$(IMAGE_TAG)"
+                if [ -f "./pyproject.toml" ]; then
+                    awk -v ver="${IMAGE_TAG}" \
+                        'BEGIN {FS=OFS=" = "} \
+                        /^[[:space:]]*version[[:space:]]*=/{ $0 = "version = \"" ver "\"" } \
+                        { print }' "./pyproject.toml" > temp && mv temp "./pyproject.toml"
+                fi
+              displayName: 'Set version in pyproject.toml'
+
+          # -- Build wheel with uv (when from_local_source) --
+          - ${{ if eq(parameters.from_local_source, true) }}:
+            - bash: |
+                set -euo pipefail
+                uv venv && source .venv/bin/activate
+                uv pip install setuptools
+                uv build --sdist --wheel --out-dir wheelhouse
+              displayName: 'Build wheel with uv'
+
+          # -- Publish wheel artifacts --
+          # Equivalent to actions/upload-artifact
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish wheel artifacts (x86_64)'
+            inputs:
+              targetPath: 'wheelhouse'
+              artifact: 'cibw-wheels-x86-0'
+              publishLocation: 'pipeline'
+
+  # ===========================================================================
+  # Stage 2b: build_wheels_arm64
+  # Builds Python wheels on ARM64. Only runs when the wheel is platform-specific
+  # (not pure Python).
+  # ===========================================================================
+  - stage: build_wheels_arm64
+    displayName: 'Build Wheels (arm64)'
+    dependsOn: set_job_vars
+    # Only run if the wheel is NOT pure Python
+    condition: eq(stageDependencies.set_job_vars.set_vars.outputs['detect_wheel_type.is_pure_wheel'], 'false')
+    variables:
+      IMAGE_TAG_NAME: $[ stageDependencies.set_job_vars.set_vars.outputs['check_tag.tag_name'] ]
+      IMAGE_TAG: $[ stageDependencies.set_job_vars.set_vars.outputs['check_tag.commit_tag'] ]
+    jobs:
+      - job: build_arm64
+        displayName: 'Build arm64 wheel'
+        timeoutInMinutes: 30
+        pool:
+          # NOTE: Azure DevOps does not have hosted ARM agents.
+          # This must be a self-hosted agent pool with ARM64 machines.
+          name: '${{ parameters.pool_arm }}'
+        steps:
+          - checkout: self
+            submodules: recursive
+            fetchDepth: 0
+            persistCredentials: true
+
+          # -- Checkout target version in submodule (if source_folder is set) --
+          - ${{ if ne(parameters.source_folder, '') }}:
+            - bash: |
+                cd "${{ parameters.source_folder }}" && git checkout "${{ parameters.source_tag }}"
+              displayName: 'Checkout target version in submodule'
+
+          # -- Build wheel with cibuildwheel (when source_folder is set) --
+          - ${{ if ne(parameters.source_folder, '') }}:
+            - bash: |
+                set -euo pipefail
+                pip install cibuildwheel
+                cibuildwheel --output-dir wheelhouse "${{ parameters.source_folder }}"
+              displayName: 'Build wheel with cibuildwheel'
+              env:
+                # Build only aarch64 on this runner
+                CIBW_ARCHS_LINUX: 'aarch64'
+                CIBW_BUILD_FRONTEND: 'build[uv]'
+                CIBW_BUILD: 'cp313-manylinux* cp314-manylinux*'
+                CIBW_BEFORE_BUILD: 'bash pre_build.sh'
+
+          # -- Install uv (when from_local_source) --
+          - ${{ if eq(parameters.from_local_source, true) }}:
+            - bash: |
+                set -euo pipefail
+                curl -LsSf https://astral.sh/uv/install.sh | sh
+                echo "##vso[task.prependpath]$HOME/.local/bin"
+              displayName: 'Install uv'
+
+          # -- Auto-set version in pyproject.toml --
+          - ${{ if and(eq(parameters.from_local_source, true), eq(parameters.auto_set_version, true)) }}:
+            - bash: |
+                set -euo pipefail
+                IMAGE_TAG="$(IMAGE_TAG)"
+                if [ -f "./pyproject.toml" ]; then
+                    awk -v ver="${IMAGE_TAG}" \
+                        'BEGIN {FS=OFS=" = "} \
+                        /^[[:space:]]*version[[:space:]]*=/{ $0 = "version = \"" ver "\"" } \
+                        { print }' "./pyproject.toml" > temp && mv temp "./pyproject.toml"
+                fi
+              displayName: 'Set version in pyproject.toml'
+
+          # -- Build wheel with uv (when from_local_source) --
+          - ${{ if eq(parameters.from_local_source, true) }}:
+            - bash: |
+                set -euo pipefail
+                uv venv && source .venv/bin/activate
+                uv pip install setuptools
+                uv build --sdist --wheel --out-dir wheelhouse
+              displayName: 'Build wheel with uv'
+
+          # -- Publish wheel artifacts --
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish wheel artifacts (arm64)'
+            inputs:
+              targetPath: 'wheelhouse'
+              artifact: 'cibw-wheels-arm64-1'
+              publishLocation: 'pipeline'
+
+  # ===========================================================================
+  # Stage 3: release
+  # Downloads all wheel artifacts and uploads them to a devpi PyPI mirror.
+  # Only runs when:
+  #   - push_to_mirror is true
+  #   - ref_type is 'tag'
+  #   - branch is 'main'
+  # ===========================================================================
+  - stage: release
+    displayName: 'Release to PyPI Mirror'
+    dependsOn:
+      - set_job_vars
+      - build_wheels_x86
+      - build_wheels_arm64
+    # Run even if build_wheels_arm64 was skipped (pure wheel).
+    # Succeed if x86 succeeded and arm64 either succeeded or was skipped.
+    condition: |
+      and(
+        eq('${{ parameters.push_to_mirror }}', true),
+        eq(stageDependencies.set_job_vars.set_vars.outputs['check_tag.ref_type'], 'tag'),
+        eq(stageDependencies.set_job_vars.set_vars.outputs['check_tag.branch_name'], 'main'),
+        in(stageDependencies.build_wheels_x86.result, 'Succeeded'),
+        in(stageDependencies.build_wheels_arm64.result, 'Succeeded', 'Skipped')
+      )
+    variables:
+      IMAGE_TAG: $[ stageDependencies.set_job_vars.set_vars.outputs['check_tag.commit_tag'] ]
+    jobs:
+      - job: upload
+        displayName: 'Upload wheels to devpi'
+        timeoutInMinutes: 5
+        pool:
+          vmImage: '${{ parameters.pool_x86 }}'
+        steps:
+          - checkout: none
+
+          # -- Download all wheel artifacts --
+          # When source_folder is set, download ALL artifacts (both arches).
+          # When from_local_source is set, download only arm64 artifacts
+          # (matching the original workflow's behavior).
+          #
+          # In Azure Pipelines we download all matching artifacts into a dist/
+          # directory. DownloadPipelineArtifact with a pattern downloads all
+          # matching artifacts.
+          - ${{ if ne(parameters.source_folder, '') }}:
+            - task: DownloadPipelineArtifact@2
+              displayName: 'Download all wheel artifacts'
+              inputs:
+                buildType: 'current'
+                patterns: 'cibw-wheels-*/**/*.whl'
+                targetPath: '$(Pipeline.Workspace)/dist-raw'
+
+          - ${{ if eq(parameters.from_local_source, true) }}:
+            - task: DownloadPipelineArtifact@2
+              displayName: 'Download arm64 wheel artifacts'
+              inputs:
+                buildType: 'current'
+                patterns: 'cibw-wheels-arm64-*/**/*.whl'
+                targetPath: '$(Pipeline.Workspace)/dist-raw'
+
+          # Flatten downloaded artifacts into a single dist/ directory.
+          # DownloadPipelineArtifact places files in subdirectories per artifact name.
+          - bash: |
+              set -euo pipefail
+              mkdir -p "$(Pipeline.Workspace)/dist"
+              find "$(Pipeline.Workspace)/dist-raw" -name '*.whl' -exec cp {} "$(Pipeline.Workspace)/dist/" \;
+              echo "Wheels to upload:"
+              ls -la "$(Pipeline.Workspace)/dist/"
+            displayName: 'Flatten wheel files into dist/'
+
+          # -- Install devpi client --
+          - bash: |
+              set -euo pipefail
+              pip install devpi-client==7.2.0
+            displayName: 'Install devpi-client'
+
+          # -- Upload wheels to devpi --
+          - bash: |
+              set -euo pipefail
+              devpi use "$(PYPI_ENDPOINT)"
+              devpi login "$(PYPI_INDEX_USER)" --password="$(PYPI_INDEX_PASS)"
+              devpi use moya/stable
+              devpi upload --wheel --from-dir "$(Pipeline.Workspace)/dist"
+            displayName: 'Upload wheels to devpi'
+            env:
+              PYPI_ENDPOINT: $(PYPI_ENDPOINT)
+              PYPI_INDEX_USER: $(PYPI_INDEX_USER)
+              PYPI_INDEX_PASS: $(PYPI_INDEX_PASS)

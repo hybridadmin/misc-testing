@@ -1,0 +1,43 @@
+# =============================================================================
+# Sample Azure Pipeline that consumes the build-push template
+# =============================================================================
+# This is the equivalent of a GitHub Actions workflow that calls the reusable
+# workflow via `uses: org/shared-workflows/.github/workflows/build-push.yml`.
+#
+# Place this file in the consuming repository as `azure-pipelines.yml` and
+# adjust the resource reference to point to your shared templates repo.
+# =============================================================================
+
+trigger:
+  tags:
+    include:
+      - '*'
+  branches:
+    include:
+      - main
+
+resources:
+  repositories:
+    # Reference the shared templates repository.
+    # Adjust `repository`, `type`, `ref`, and `endpoint` to match your setup.
+    - repository: shared-templates
+      type: git                          # Use 'github' if the templates repo is on GitHub
+      name: 'YourProject/shared-workflows'  # Azure Repos: 'project/repo', GitHub: 'org/repo'
+      ref: refs/heads/main
+      # endpoint: 'your-github-service-connection'  # Only needed for GitHub repos
+
+# Extend from the shared template (equivalent to workflow_call)
+extends:
+  template: build-push.yml@shared-templates
+  parameters:
+    docker_build_context: '.'
+    # pool_x86: 'ubuntu-24.04'          # Default; override if using self-hosted
+    # pool_arm: 'arm64-pool'            # Set to your self-hosted ARM pool name
+    trigger_webhook: true
+    docker_build_timeout: 10
+    skip_arm_image: false
+    alt_ecr_cache: false
+    ghcr_repository: 'your-org/your-repo'    # e.g. 'moya/my-service'
+    repository_name: 'your-repo'              # Used for the .tar filename
+    # secrets_variable_group: 'moya-build-push-secrets'   # Default
+    # vars_variable_group: 'moya-build-push-vars'         # Default
