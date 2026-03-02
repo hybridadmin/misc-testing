@@ -1,0 +1,209 @@
+# =============================================================================
+# Azure Pipelines Template: webhook-only
+# =============================================================================
+# Ported from: .github/workflows/webhook-only.yml (GitHub Actions reusable workflow)
+#
+# This is an Azure Pipelines *template* file. It is the equivalent of a GitHub
+# Actions "workflow_call" reusable workflow. Consuming pipelines reference it
+# via `extends` or `template` from a shared repository resource.
+#
+# Purpose: Fires a deployment webhook when a tag is pushed, with Slack failure
+# notification. This is a lightweight template for repos that only need the
+# webhook step (no Docker build, no tests).
+#
+# ----- PREREQUISITES / SETUP -----
+#
+# 1. Variable Group: "moya-webhook-only-secrets"
+#    Create a variable group (or link an Azure Key Vault) containing:
+#      - WEBHOOK_URL                : Deployment webhook endpoint URL
+#      - WEBHOOK_SECRET             : HMAC secret for signing the webhook payload
+#      - OPSBUILDS_SLACK_WEBHOOK_URL : Slack incoming webhook URL for failure alerts
+#
+# 2. Agent Pools:
+#    - Microsoft-hosted "ubuntu-latest" (default) — no special requirements.
+#
+# 3. Tools required on agents: curl, openssl, jq
+#    All are available on Microsoft-hosted Ubuntu images.
+#
+# ----- DIFFERENCES FROM GITHUB ACTIONS VERSION -----
+#
+# - The `distributhor/workflow-webhook` action is replaced with a `curl` call
+#   that computes an HMAC-SHA256 signature and posts a JSON payload.
+# - The `slackapi/slack-github-action` action is replaced with a direct `curl`
+#   call to the Slack webhook.
+# - GitHub context (${{ toJson(github) }}) is replaced with a manually built
+#   JSON payload containing the equivalent Azure Pipelines variables.
+# - `github.ref_type` is determined by inspecting `$(Build.SourceBranch)` for
+#   the `refs/tags/` prefix.
+# =============================================================================
+
+parameters:
+  # --- Equivalent to GitHub Actions workflow_call inputs ---
+  - name: trigger_webhook
+    type: boolean
+    displayName: 'Trigger webhook to start deployment'
+    default: true
+
+  # --- Additional parameters (Azure-specific) ---
+  - name: pool_x86
+    type: string
+    displayName: 'Agent pool (or vmImage) for jobs'
+    default: 'ubuntu-latest'
+
+  - name: secrets_variable_group
+    type: string
+    displayName: 'Variable group name containing secrets'
+    default: 'moya-webhook-only-secrets'
+
+variables:
+  - group: ${{ parameters.secrets_variable_group }}
+
+stages:
+  # ===========================================================================
+  # Stage 1: set_job_vars
+  # Determines ref_type (tag vs branch), tag_name, branch_name.
+  # ===========================================================================
+  - stage: set_job_vars
+    displayName: 'Set Job Variables'
+    jobs:
+      - job: set_vars
+        displayName: 'Determine ref type and tag'
+        timeoutInMinutes: 1
+        pool:
+          vmImage: '${{ parameters.pool_x86 }}'
+        steps:
+          - checkout: none
+
+          - bash: |
+              set -euo pipefail
+
+              SOURCE_BRANCH="$(Build.SourceBranch)"
+              echo "Source branch: ${SOURCE_BRANCH}"
+
+              # Determine if this is a tag or branch
+              if [[ "${SOURCE_BRANCH}" == refs/tags/* ]]; then
+                ref_type="tag"
+                tag_name=$(echo "${SOURCE_BRANCH#refs/tags/}" | sed 's,/,_,g')
+              else
+                ref_type="branch"
+                tag_name=$(echo "${SOURCE_BRANCH#refs/heads/}" | sed 's,/,_,g')
+              fi
+
+              branch_name=$(echo "${SOURCE_BRANCH#refs/heads/}" | sed 's,/,_,g')
+
+              echo "ref_type=${ref_type}"
+              echo "tag_name=${tag_name}"
+              echo "branch_name=${branch_name}"
+
+              echo "##vso[task.setvariable variable=ref_type;isOutput=true]${ref_type}"
+              echo "##vso[task.setvariable variable=tag_name;isOutput=true]${tag_name}"
+              echo "##vso[task.setvariable variable=branch_name;isOutput=true]${branch_name}"
+            name: check_tag
+            displayName: 'Determine ref type, tag name, branch name'
+
+  # ===========================================================================
+  # Stage 2: web_hook
+  # Triggers deployment webhook after tag detection.
+  # Only runs on tags and when trigger_webhook is true.
+  # ===========================================================================
+  - stage: web_hook
+    displayName: 'Trigger Deployment Webhook'
+    dependsOn: set_job_vars
+    condition: |
+      and(
+        eq(stageDependencies.set_job_vars.set_vars.outputs['check_tag.ref_type'], 'tag'),
+        eq('${{ parameters.trigger_webhook }}', true)
+      )
+    variables:
+      IMAGE_TAG: $[ stageDependencies.set_job_vars.set_vars.outputs['check_tag.tag_name'] ]
+    jobs:
+      - job: webhook
+        displayName: 'Invoke deployment webhook'
+        timeoutInMinutes: 5
+        pool:
+          vmImage: '${{ parameters.pool_x86 }}'
+        steps:
+          - checkout: none
+
+          # -- Invoke deployment webhook --
+          - bash: |
+              set -euo pipefail
+              IMAGE_TAG="$(IMAGE_TAG)"
+              REPO_NAME="$(Build.Repository.Name)"
+
+              # Build a JSON payload similar to the GitHub context
+              PAYLOAD=$(cat <<EOFPAYLOAD
+              {
+                "ref": "$(Build.SourceBranch)",
+                "repository": "${REPO_NAME}",
+                "tag": "${IMAGE_TAG}",
+                "build_id": "$(Build.BuildId)",
+                "build_url": "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)",
+                "source": "azure-pipelines"
+              }
+              EOFPAYLOAD
+              )
+
+              # Compute HMAC signature if webhook secret is provided
+              SIGNATURE=""
+              if [[ -n "${WEBHOOK_SECRET}" ]]; then
+                SIGNATURE=$(echo -n "${PAYLOAD}" | openssl dgst -sha256 -hmac "${WEBHOOK_SECRET}" | awk '{print $2}')
+              fi
+
+              # Send the webhook
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                -X POST \
+                -H "Content-Type: application/json" \
+                -H "X-Hub-Signature-256: sha256=${SIGNATURE}" \
+                -d "${PAYLOAD}" \
+                "${WEBHOOK_URL}")
+
+              echo "Webhook response status: ${HTTP_STATUS}"
+              if [[ "${HTTP_STATUS}" -lt 200 || "${HTTP_STATUS}" -ge 300 ]]; then
+                echo "##vso[task.logissue type=error]Webhook returned HTTP ${HTTP_STATUS}"
+                exit 1
+              fi
+            displayName: 'Invoke deployment webhook'
+            env:
+              WEBHOOK_URL: $(WEBHOOK_URL)
+              WEBHOOK_SECRET: $(WEBHOOK_SECRET)
+
+          # -- Slack failure notification --
+          - bash: |
+              set -euo pipefail
+              IMAGE_TAG="$(IMAGE_TAG)"
+              REPO_NAME="$(Build.Repository.Name)"
+              BUILD_URL="$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+
+              curl -s -X POST -H 'Content-type: application/json' \
+                --data '{
+                  "attachments": [{
+                    "color": "#E74C3C",
+                    "blocks": [
+                      {
+                        "type": "section",
+                        "text": {
+                          "type": "mrkdwn",
+                          "text": "*Repository: '"${REPO_NAME}"', tag: '"${IMAGE_TAG}"'*"
+                        }
+                      },
+                      {
+                        "type": "section",
+                        "fields": [
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Job Status:* Failed"
+                          },
+                          {
+                            "type": "mrkdwn",
+                            "text": "*Message:* Errors detected triggering deployment webhook, please check the pipeline run '"${BUILD_URL}"' for issue details."
+                          }
+                        ]
+                      }
+                    ]
+                  }]
+                }' "${SLACK_WEBHOOK_URL}"
+            displayName: 'Send Slack failure notification'
+            condition: failed()
+            env:
+              SLACK_WEBHOOK_URL: $(OPSBUILDS_SLACK_WEBHOOK_URL)

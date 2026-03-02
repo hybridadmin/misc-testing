@@ -1,0 +1,195 @@
+# =============================================================================
+# Azure Pipelines Template: packages
+# =============================================================================
+# Ported from: .github/workflows/packages.yml (GitHub Actions reusable workflow)
+#
+# This is an Azure Pipelines *template* file. It is the equivalent of a GitHub
+# Actions "workflow_call" reusable workflow. Consuming pipelines reference it
+# via `extends` or `template` from a shared repository resource.
+#
+# Purpose: Cleans up old package versions. The GitHub Actions version uses
+# `actions/delete-package-versions@v5` to prune GitHub Packages (container or
+# npm). This Azure Pipelines port uses the GitHub API directly via `gh` CLI to
+# perform the same cleanup, since the packages still live on GitHub Packages.
+#
+# ----- PREREQUISITES / SETUP -----
+#
+# 1. Variable Group: "moya-packages-secrets"
+#    Create a variable group (or link an Azure Key Vault) containing:
+#      - GH_TOKEN : GitHub PAT with `packages:delete` and `packages:read` scopes
+#
+# 2. Agent Pools:
+#    - Microsoft-hosted "ubuntu-latest" (default).
+#
+# 3. Tools required on agents: gh (GitHub CLI), jq
+#    Microsoft-hosted Ubuntu images include both.
+#
+# ----- DIFFERENCES FROM GITHUB ACTIONS VERSION -----
+#
+# - The `actions/delete-package-versions@v5` action is replaced with GitHub
+#   REST API calls via `gh api` to list and delete package versions.
+# - The GitHub Actions `github.repository_owner` and
+#   `github.event.repository.name` contexts are replaced with explicit
+#   parameters `github_owner` and `package_name`.
+# - Both container and npm cleanup are handled in a single stage with
+#   conditional steps, rather than two mutually exclusive jobs.
+# =============================================================================
+
+parameters:
+  # --- Equivalent to GitHub Actions workflow_call inputs ---
+  - name: package_type
+    type: string
+    displayName: 'The type of package (container or npm)'
+    default: 'container'
+    values:
+      - container
+      - npm
+
+  - name: tagged_version_count
+    type: number
+    displayName: 'Number of latest tagged versions to keep'
+    default: 20
+
+  - name: untagged_version_count
+    type: number
+    displayName: 'Number of untagged versions to keep (container only)'
+    default: 5
+
+  # --- Additional parameters (Azure-specific) ---
+  - name: github_owner
+    type: string
+    displayName: 'GitHub organization or user that owns the package'
+    default: ''
+
+  - name: package_name
+    type: string
+    displayName: 'Package name (defaults to repository name if empty)'
+    default: ''
+
+  - name: pool_x86
+    type: string
+    displayName: 'Agent pool (or vmImage) for jobs'
+    default: 'ubuntu-latest'
+
+  - name: secrets_variable_group
+    type: string
+    displayName: 'Variable group name containing secrets'
+    default: 'moya-packages-secrets'
+
+variables:
+  - group: ${{ parameters.secrets_variable_group }}
+  - name: PKG_NAME
+    ${{ if ne(parameters.package_name, '') }}:
+      value: ${{ parameters.package_name }}
+    ${{ else }}:
+      value: '$(Build.Repository.Name)'
+
+stages:
+  # ===========================================================================
+  # Stage 1: package_cleanup
+  # Prunes old package versions via the GitHub Packages API.
+  # ===========================================================================
+  - stage: package_cleanup
+    displayName: 'Package Version Cleanup'
+    jobs:
+      - job: cleanup
+        displayName: 'Prune old ${{ parameters.package_type }} package versions'
+        timeoutInMinutes: 15
+        pool:
+          vmImage: '${{ parameters.pool_x86 }}'
+        steps:
+          - checkout: none
+
+          # -- Prune tagged versions (container and npm) --
+          - bash: |
+              set -euo pipefail
+              PKG_TYPE="${{ parameters.package_type }}"
+              PKG_NAME="$(PKG_NAME)"
+              OWNER="${{ parameters.github_owner }}"
+              KEEP=${{ parameters.tagged_version_count }}
+
+              echo "Pruning ${PKG_TYPE} package '${PKG_NAME}' for owner '${OWNER}'"
+              echo "Keeping latest ${KEEP} tagged versions"
+
+              # List all versions sorted by creation date (newest first)
+              VERSIONS=$(gh api \
+                --paginate \
+                -H "Accept: application/vnd.github+json" \
+                "/orgs/${OWNER}/packages/${PKG_TYPE}/${PKG_NAME}/versions" \
+                --jq '.[].id' 2>/dev/null || true)
+
+              if [[ -z "${VERSIONS}" ]]; then
+                echo "No versions found or package does not exist. Skipping."
+                exit 0
+              fi
+
+              # Skip the first KEEP versions, delete the rest
+              TO_DELETE=$(echo "${VERSIONS}" | tail -n +$((KEEP + 1)))
+              COUNT=$(echo "${TO_DELETE}" | grep -c . || true)
+
+              if [[ "${COUNT}" -eq 0 ]]; then
+                echo "Only ${KEEP} or fewer versions exist. Nothing to prune."
+                exit 0
+              fi
+
+              echo "Deleting ${COUNT} old tagged versions..."
+              echo "${TO_DELETE}" | while read -r VER_ID; do
+                echo "  Deleting version ${VER_ID}..."
+                gh api \
+                  --method DELETE \
+                  -H "Accept: application/vnd.github+json" \
+                  "/orgs/${OWNER}/packages/${PKG_TYPE}/${PKG_NAME}/versions/${VER_ID}" \
+                  || echo "  Warning: failed to delete version ${VER_ID}"
+              done
+
+              echo "Tagged version cleanup complete."
+            displayName: 'Prune tagged package versions'
+            env:
+              GH_TOKEN: $(GH_TOKEN)
+
+          # -- Prune untagged versions (container packages only) --
+          - ${{ if eq(parameters.package_type, 'container') }}:
+            - bash: |
+                set -euo pipefail
+                PKG_NAME="$(PKG_NAME)"
+                OWNER="${{ parameters.github_owner }}"
+                KEEP=${{ parameters.untagged_version_count }}
+
+                echo "Pruning untagged container versions for '${PKG_NAME}'"
+                echo "Keeping latest ${KEEP} untagged versions"
+
+                # List versions and filter to untagged ones (empty tags array)
+                UNTAGGED_IDS=$(gh api \
+                  --paginate \
+                  -H "Accept: application/vnd.github+json" \
+                  "/orgs/${OWNER}/packages/container/${PKG_NAME}/versions" \
+                  --jq '.[] | select(.metadata.container.tags | length == 0) | .id' \
+                  2>/dev/null || true)
+
+                if [[ -z "${UNTAGGED_IDS}" ]]; then
+                  echo "No untagged versions found. Skipping."
+                  exit 0
+                fi
+
+                TO_DELETE=$(echo "${UNTAGGED_IDS}" | tail -n +$((KEEP + 1)))
+                COUNT=$(echo "${TO_DELETE}" | grep -c . || true)
+
+                if [[ "${COUNT}" -eq 0 ]]; then
+                  echo "Only ${KEEP} or fewer untagged versions exist. Nothing to prune."
+                  exit 0
+                fi
+
+                echo "Deleting ${COUNT} old untagged versions..."
+                echo "${TO_DELETE}" | while read -r VER_ID; do
+                  echo "  Deleting untagged version ${VER_ID}..."
+                  gh api \
+                    --method DELETE \
+                    -H "Accept: application/vnd.github+json" \
+                    "/orgs/${OWNER}/packages/container/${PKG_NAME}/versions/${VER_ID}" \
+                    || echo "  Warning: failed to delete version ${VER_ID}"
+                done
+
+                echo "Untagged version cleanup complete."
+              displayName: 'Prune untagged container versions'
+              env:
+                GH_TOKEN: $(GH_TOKEN)

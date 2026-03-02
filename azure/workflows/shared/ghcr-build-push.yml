@@ -1,0 +1,228 @@
+# =============================================================================
+# Azure Pipelines Template: ghcr-build-push
+# =============================================================================
+# Ported from: .github/workflows/ghcr-build-push.yml (GitHub Actions reusable workflow)
+#
+# This is an Azure Pipelines *template* file. It is the equivalent of a GitHub
+# Actions "workflow_call" reusable workflow. Consuming pipelines reference it
+# via `extends` or `template` from a shared repository resource.
+#
+# Purpose: Builds a multi-arch Docker image (amd64 + arm64 via QEMU emulation)
+# and pushes to GitHub Container Registry (GHCR) when a tag is pushed. Unlike
+# build-push.yml, this uses QEMU on a single amd64 runner rather than native
+# ARM agents.
+#
+# ----- PREREQUISITES / SETUP -----
+#
+# 1. Variable Group: "moya-ghcr-build-push-secrets"
+#    Create a variable group (or link an Azure Key Vault) containing:
+#      - REPO_USER_PAT     : GitHub PAT for private submodule cloning
+#      - REPO_PRIVATE_KEY   : Base64-encoded SSH private key for Docker SSH builds
+#      - DOCKER_USER        : Docker Hub username
+#      - DOCKER_PASS        : Docker Hub password/token
+#      - GHCR_USERNAME      : GitHub username/org for GHCR login
+#      - GHCR_TOKEN         : GitHub PAT with packages:write scope
+#
+# 2. Agent Pools:
+#    - Microsoft-hosted "ubuntu-24.04" (default). Only amd64 needed (QEMU
+#      handles arm64 emulation).
+#
+# 3. Tools required on agents: docker, docker buildx, qemu-user-static,
+#    ssh-keyscan
+#    Microsoft-hosted Ubuntu images include all of these.
+#
+# ----- DIFFERENCES FROM GITHUB ACTIONS VERSION -----
+#
+# - The single-entry matrix (amd64 only) is replaced with a single stage —
+#   no matrix needed since there is only one architecture runner.
+# - `docker/setup-qemu-action@v3` is replaced with `docker run --privileged`
+#   to register QEMU binfmt interpreters.
+# - `docker/build-push-action@v5` is replaced with `docker buildx build`.
+# - `docker/login-action@v3` is replaced with `docker login` via bash.
+# - `timheuer/base64-to-file@v1.2` is replaced with `base64 -d`.
+# - `github.token` / `github.repository_owner` are replaced with variables
+#   from the secrets variable group.
+# - Cache is changed from `type=gha` (GitHub Actions cache) to
+#   `type=registry` (registry-based cache) since GHA cache is unavailable.
+# =============================================================================
+
+parameters:
+  # --- Equivalent to GitHub Actions workflow_call inputs ---
+  - name: docker_build_context
+    type: string
+    displayName: 'Docker build context directory'
+    default: './app'
+
+  - name: docker_build_target
+    type: string
+    displayName: 'Docker build target (leave empty for default)'
+    default: ''
+
+  # --- Additional parameters (Azure-specific) ---
+  - name: pool_x86
+    type: string
+    displayName: 'Agent pool (or vmImage) for x86 builds'
+    default: 'ubuntu-24.04'
+
+  - name: ghcr_repository
+    type: string
+    displayName: 'GHCR image path (e.g. myorg/myrepo)'
+    default: ''
+
+  - name: secrets_variable_group
+    type: string
+    displayName: 'Variable group name containing secrets'
+    default: 'moya-ghcr-build-push-secrets'
+
+variables:
+  - group: ${{ parameters.secrets_variable_group }}
+  - name: GHCR_REPO
+    ${{ if ne(parameters.ghcr_repository, '') }}:
+      value: ${{ parameters.ghcr_repository }}
+    ${{ else }}:
+      value: '$(Build.Repository.Name)'
+
+stages:
+  # ===========================================================================
+  # Stage 1: set_job_vars
+  # Determines ref_type (tag vs branch), tag_name, branch_name.
+  # ===========================================================================
+  - stage: set_job_vars
+    displayName: 'Set Job Variables'
+    jobs:
+      - job: set_vars
+        displayName: 'Determine ref type and tag'
+        timeoutInMinutes: 1
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: none
+
+          - bash: |
+              set -euo pipefail
+
+              SOURCE_BRANCH="$(Build.SourceBranch)"
+              echo "Source branch: ${SOURCE_BRANCH}"
+
+              if [[ "${SOURCE_BRANCH}" == refs/tags/* ]]; then
+                ref_type="tag"
+                tag_name=$(echo "${SOURCE_BRANCH#refs/tags/}" | sed 's,/,_,g')
+              else
+                ref_type="branch"
+                tag_name=$(echo "${SOURCE_BRANCH#refs/heads/}" | sed 's,/,_,g')
+              fi
+
+              branch_name=$(echo "${SOURCE_BRANCH#refs/heads/}" | sed 's,/,_,g')
+
+              echo "ref_type=${ref_type}"
+              echo "tag_name=${tag_name}"
+              echo "branch_name=${branch_name}"
+
+              echo "##vso[task.setvariable variable=ref_type;isOutput=true]${ref_type}"
+              echo "##vso[task.setvariable variable=tag_name;isOutput=true]${tag_name}"
+              echo "##vso[task.setvariable variable=branch_name;isOutput=true]${branch_name}"
+            name: check_tag
+            displayName: 'Determine ref type, tag name, branch name'
+
+  # ===========================================================================
+  # Stage 2: build_push
+  # Builds multi-arch Docker image via QEMU and pushes to GHCR.
+  # Only runs on tags.
+  # ===========================================================================
+  - stage: build_push
+    displayName: 'Build & Push Docker (multi-arch via QEMU)'
+    dependsOn: set_job_vars
+    condition: eq(stageDependencies.set_job_vars.set_vars.outputs['check_tag.ref_type'], 'tag')
+    variables:
+      IMAGE_TAG: $[ stageDependencies.set_job_vars.set_vars.outputs['check_tag.tag_name'] ]
+    jobs:
+      - job: build_and_push
+        displayName: 'Build and push multi-arch image'
+        timeoutInMinutes: 15
+        pool:
+          vmImage: '${{ parameters.pool_x86 }}'
+        steps:
+          - checkout: self
+            submodules: recursive
+            persistCredentials: true
+
+          # -- Login to GHCR --
+          - bash: |
+              set -euo pipefail
+              echo "${GHCR_TOKEN}" | docker login ghcr.io \
+                -u "${GHCR_USERNAME}" --password-stdin
+              echo "Logged in to GHCR."
+            displayName: 'Login to GitHub Container Registry'
+            env:
+              GHCR_USERNAME: $(GHCR_USERNAME)
+              GHCR_TOKEN: $(GHCR_TOKEN)
+
+          # -- Login to Docker Hub --
+          - bash: |
+              set -euo pipefail
+              echo "${DOCKER_PASS}" | docker login \
+                -u "${DOCKER_USER}" --password-stdin
+              echo "Logged in to Docker Hub."
+            displayName: 'Login to Docker Hub'
+            env:
+              DOCKER_USER: $(DOCKER_USER)
+              DOCKER_PASS: $(DOCKER_PASS)
+
+          # -- Set up Docker Buildx --
+          - bash: |
+              set -euo pipefail
+              docker buildx create --use --name multiarch-builder || true
+              docker buildx inspect --bootstrap
+            displayName: 'Set up Docker Buildx'
+
+          # -- Decode SSH private key --
+          - bash: |
+              set -euo pipefail
+              mkdir -p /tmp/ssh-keys
+              echo "${REPO_PRIVATE_KEY}" | base64 -d > /tmp/ssh-keys/id_rsa
+              chmod 600 /tmp/ssh-keys/id_rsa
+              echo "SSH key decoded."
+            displayName: 'Decode private key'
+            env:
+              REPO_PRIVATE_KEY: $(REPO_PRIVATE_KEY)
+
+          # -- Update known hosts --
+          - bash: |
+              set -euo pipefail
+              mkdir -p ~/.ssh
+              ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+            displayName: 'Update known hosts'
+
+          # -- Set up QEMU for multi-platform builds --
+          - bash: |
+              set -euo pipefail
+              docker run --rm --privileged \
+                multiarch/qemu-user-static --reset -p yes
+              echo "QEMU binfmt handlers registered."
+            displayName: 'Set up QEMU for multi-platform builds'
+
+          # -- Build and push multi-arch image --
+          - bash: |
+              set -euo pipefail
+              GHCR_REPO="$(GHCR_REPO)"
+              IMAGE_TAG="$(IMAGE_TAG)"
+              BUILD_CONTEXT="${{ parameters.docker_build_context }}"
+              BUILD_TARGET="${{ parameters.docker_build_target }}"
+
+              BUILD_ARGS=(
+                --platform "linux/amd64,linux/arm64"
+                --tag "ghcr.io/${GHCR_REPO}:${IMAGE_TAG}"
+                --cache-from "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-amd64"
+                --cache-to "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-amd64,mode=max"
+                --ssh "default=/tmp/ssh-keys/id_rsa"
+                --push
+              )
+
+              # Add build target if specified
+              if [[ -n "${BUILD_TARGET}" ]]; then
+                BUILD_ARGS+=(--target "${BUILD_TARGET}")
+              fi
+
+              echo "Building and pushing: ghcr.io/${GHCR_REPO}:${IMAGE_TAG}"
+              docker buildx build "${BUILD_ARGS[@]}" "${BUILD_CONTEXT}"
+            displayName: 'Build and push multi-arch Docker image'

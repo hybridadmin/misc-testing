@@ -1,0 +1,45 @@
+# =============================================================================
+# SolidJS Pipeline — consumes the frontend-build template
+# =============================================================================
+# This is the Azure Pipelines equivalent of a GitHub Actions workflow that
+# calls: `uses: org/shared-workflows/.github/workflows/solidjs.yml`
+#
+# The original solidjs.yml and angular-build.yml are byte-for-byte identical
+# (only the workflow name differs). They have been consolidated into a single
+# template: shared/frontend-build.yml
+#
+# Place this file in the consuming SolidJS repository as `azure-pipelines.yml`
+# and adjust the resource reference to point to your shared templates repo.
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+resources:
+  repositories:
+    - repository: shared-templates
+      type: git
+      name: 'YourProject/shared-workflows'
+      ref: refs/heads/main
+      # endpoint: 'your-github-service-connection'  # Only needed for GitHub repos
+
+# Extend from the shared template (equivalent to workflow_call)
+extends:
+  template: shared/frontend-build.yml@shared-templates
+  parameters:
+    docker_build_context: '.'
+    # docker_build_target: ''              # No target by default (full build)
+    docker_cmd: '[ "/app/cmd.sh" ]'
+    check_http_running: true
+    # post_startup: ''                     # Optional commands after containers start
+    # test_suite_cmd: ''                   # Optional test command
+    # upload_artifact: ''                  # Optional path to upload
+    alt_ecr_cache: false
+    ghcr_repository: 'your-org/your-solidjs-repo'
+    # pool_x86: 'ubuntu-24.04'            # Default
+    # pool_arm: 'arm64-pool'              # Set to your self-hosted ARM pool name
+    # secrets_variable_group: 'moya-frontend-build-secrets'  # Default
+    # vars_variable_group: 'moya-frontend-build-vars'        # Default

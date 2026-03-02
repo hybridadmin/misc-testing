@@ -1,0 +1,517 @@
+# =============================================================================
+# Azure Pipelines Template: moya-frontend-build-workflow
+# =============================================================================
+# Ported from: .github/workflows/angular-build.yml AND .github/workflows/solidjs.yml
+# (GitHub Actions reusable workflows — both files are byte-for-byte identical
+# except for the workflow name; this single template consolidates them.)
+#
+# This is an Azure Pipelines *template* file. It is the equivalent of a GitHub
+# Actions "workflow_call" reusable workflow. Consuming pipelines reference it
+# via `extends` or `template` from a shared repository resource.
+#
+# ----- PREREQUISITES / SETUP -----
+#
+# 1. Variable Group: "moya-frontend-build-secrets"
+#    Create a variable group (or link an Azure Key Vault) containing:
+#      - REPO_USER_PAT          : GitHub PAT for private submodule cloning
+#      - REPO_PRIVATE_KEY       : Base64-encoded SSH private key for Docker SSH builds
+#      - DOCKER_USER            : Docker Hub username
+#      - DOCKER_PASS            : Docker Hub password/token
+#      - GHCR_USERNAME          : GitHub Container Registry username (org name)
+#      - GHCR_TOKEN             : GitHub PAT with packages:write scope
+#      - AWS_ACCESS_KEY_ID      : AWS credentials (or use an AWS service connection)
+#      - AWS_SECRET_ACCESS_KEY  : AWS credentials
+#      - AWS_ROLE_TO_ASSUME     : IAM role ARN for OIDC / assume-role
+#
+# 2. Variable Group: "moya-frontend-build-vars"
+#    Non-secret variables (equivalent to GitHub repo-level `vars`):
+#      - DOCKER_HUB_URL         : Default ECR pull-through cache URL (eu-west-1)
+#      - DOCKER_HUB_CI_CD_URL   : Alternate ECR pull-through cache URL (us-east-1)
+#
+# 3. Agent Pools:
+#    - x86 builds use Microsoft-hosted 'ubuntu-24.04' by default.
+#    - ARM builds require a self-hosted agent pool with ARM64 machines.
+#      Set `pool_arm` to the name of your self-hosted ARM pool.
+#
+# 4. Tools required on agents:
+#    - docker, docker compose, docker buildx, curl, ssh-keyscan, aws CLI
+#
+# ----- DIFFERENCES FROM GITHUB ACTIONS VERSION -----
+#
+# - The original uses a static matrix with 2 entries (amd64 + arm64).
+#   Azure Pipelines doesn't support inline matrix objects that reference
+#   parameters for pool selection, so this is split into two parallel stages:
+#   test_suite_x86 and test_suite_arm64.
+#
+# - docker/build-push-action is replaced with raw `docker buildx build`.
+#
+# - docker/login-action is replaced with `docker login` shell commands.
+#
+# - timheuer/base64-to-file is replaced with a shell script (base64 -d).
+#
+# - actions/upload-artifact@v4 is replaced with PublishPipelineArtifact@1.
+#
+# - The original workflow calls packages.yml at the end (packages_cleanup job).
+#   That downstream call is NOT included here — wire it up as a separate
+#   stage or pipeline in your consuming pipeline if needed.
+# =============================================================================
+
+parameters:
+  # --- Equivalent to GitHub Actions workflow_call inputs ---
+  - name: docker_build_context
+    type: string
+    displayName: 'Docker build context directory'
+    default: '.'
+
+  - name: docker_build_target
+    type: string
+    displayName: 'Docker build target stage'
+    default: ''
+
+  - name: docker_cmd
+    type: string
+    displayName: 'Command to run on container startup'
+    default: '[ "/app/cmd.sh" ]'
+
+  - name: check_http_running
+    type: boolean
+    displayName: 'Check if the HTTP server is running before tests'
+    default: true
+
+  - name: post_startup
+    type: string
+    displayName: 'Commands to run after infrastructure containers start'
+    default: ''
+
+  - name: test_suite_cmd
+    type: string
+    displayName: 'Command to run the test suite'
+    default: ''
+
+  - name: upload_artifact
+    type: string
+    displayName: 'Path to artifact file or directory to upload after testing'
+    default: ''
+
+  - name: alt_ecr_cache
+    type: boolean
+    displayName: 'Use alternate ECR Pull Through cache region (us-east-1)'
+    default: false
+
+  - name: pool_x86
+    type: string
+    displayName: 'Agent pool (or vmImage) for x86 builds'
+    default: 'ubuntu-24.04'
+
+  - name: pool_arm
+    type: string
+    displayName: 'Agent pool name for ARM64 builds (must be self-hosted)'
+    default: 'arm64-pool'
+
+  # --- Additional parameters (Azure-specific) ---
+  - name: secrets_variable_group
+    type: string
+    displayName: 'Variable group name containing secrets'
+    default: 'moya-frontend-build-secrets'
+
+  - name: vars_variable_group
+    type: string
+    displayName: 'Variable group name containing non-secret variables'
+    default: 'moya-frontend-build-vars'
+
+  - name: ghcr_repository
+    type: string
+    displayName: 'GHCR image path (e.g. myorg/myrepo)'
+    default: ''
+
+variables:
+  - group: ${{ parameters.secrets_variable_group }}
+  - group: ${{ parameters.vars_variable_group }}
+  - name: GHCR_REPO
+    ${{ if ne(parameters.ghcr_repository, '') }}:
+      value: ${{ parameters.ghcr_repository }}
+    ${{ else }}:
+      value: '$(Build.Repository.Name)'
+
+# =============================================================================
+# Reusable step list anchored as a YAML alias is not supported in Azure
+# Pipelines templates. Instead, the test_suite steps are written for each
+# architecture stage. Shared logic is identical; arch-specific differences
+# are noted inline with comments.
+# =============================================================================
+
+stages:
+  # ===========================================================================
+  # Stage 1: test_suite_x86
+  # Runs the full test + build pipeline on amd64. Includes artifact upload.
+  # ===========================================================================
+  - stage: test_suite_x86
+    displayName: 'Test Suite (amd64)'
+    jobs:
+      - job: test_amd64
+        displayName: 'Run tests (amd64)'
+        timeoutInMinutes: 15
+        pool:
+          vmImage: '${{ parameters.pool_x86 }}'
+        steps:
+          - checkout: self
+            submodules: recursive
+            persistCredentials: true
+
+          # -- Login to GHCR --
+          - bash: |
+              echo "$(GHCR_TOKEN)" | docker login ghcr.io -u "$(GHCR_USERNAME)" --password-stdin
+            displayName: 'Login to GitHub Container Registry'
+
+          # -- Login to Docker Hub --
+          - bash: |
+              echo "$(DOCKER_PASS)" | docker login -u "$(DOCKER_USER)" --password-stdin
+            displayName: 'Login to Docker Hub'
+
+          # -- Set up Docker Buildx --
+          - bash: |
+              docker buildx create --use --name multiarch-builder || true
+              docker buildx inspect --bootstrap
+            displayName: 'Set up Docker Buildx'
+
+          # -- Decode SSH private key --
+          - bash: |
+              set -euo pipefail
+              SSH_KEY_PATH="$(Agent.TempDirectory)/id_rsa"
+              echo "$(REPO_PRIVATE_KEY)" | base64 -d > "${SSH_KEY_PATH}"
+              chmod 600 "${SSH_KEY_PATH}"
+              echo "##vso[task.setvariable variable=ssh_key_path]${SSH_KEY_PATH}"
+            displayName: 'Decode SSH private key'
+
+          # -- Determine ECR cache URL --
+          - bash: |
+              set -euo pipefail
+              if [[ "${{ parameters.alt_ecr_cache }}" == "True" || "${{ parameters.alt_ecr_cache }}" == "true" ]]; then
+                  ECR_CACHE_URL="$(DOCKER_HUB_CI_CD_URL)"
+                  ECR_CACHE_REGION="us-east-1"
+              else
+                  ECR_CACHE_URL="$(DOCKER_HUB_URL)"
+                  ECR_CACHE_REGION="eu-west-1"
+              fi
+              echo "##vso[task.setvariable variable=ecr_cache_url]${ECR_CACHE_URL}"
+              echo "##vso[task.setvariable variable=ecr_cache_region]${ECR_CACHE_REGION}"
+            displayName: 'ECR Caching URL'
+
+          # -- Configure AWS credentials and login to ECR (cache region) --
+          - bash: |
+              set -euo pipefail
+              aws ecr get-login-password --region "$(ecr_cache_region)" | \
+                docker login --username AWS --password-stdin "$(ecr_cache_url)"
+            displayName: 'Login to Amazon ECR (Caching region)'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(ecr_cache_region)
+
+          # -- Update known hosts --
+          - bash: |
+              mkdir -p ~/.ssh
+              ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+            displayName: 'Update known hosts'
+
+          # -- Build test image --
+          - bash: |
+              set -euo pipefail
+              GHCR_REPO="$(GHCR_REPO)"
+
+              BUILD_CMD="docker buildx build"
+              BUILD_CMD="${BUILD_CMD} --load"
+              BUILD_CMD="${BUILD_CMD} --tag $(Build.Repository.Name):test"
+              BUILD_CMD="${BUILD_CMD} --cache-from type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-amd64"
+              BUILD_CMD="${BUILD_CMD} --cache-to type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-amd64,mode=max"
+              BUILD_CMD="${BUILD_CMD} --ssh default=$(ssh_key_path)"
+              BUILD_CMD="${BUILD_CMD} --build-arg DOCKER_HUB_URL=$(ecr_cache_url)"
+
+              TARGET="${{ parameters.docker_build_target }}"
+              if [ -n "${TARGET}" ]; then
+                BUILD_CMD="${BUILD_CMD} --target ${TARGET}"
+              fi
+
+              BUILD_CMD="${BUILD_CMD} ${{ parameters.docker_build_context }}"
+              eval ${BUILD_CMD}
+            displayName: 'Build test image'
+            env:
+              DOCKER_BUILDKIT: 1
+
+          # -- Write docker-compose override to use the built image --
+          - bash: |
+              cat <<EOF > docker-compose.ci.yml
+              services:
+                app:
+                  image: $(Build.Repository.Name):test
+                  command: ${{ parameters.docker_cmd }}
+              EOF
+            displayName: 'Write docker-compose.ci.yml override'
+
+          # -- Pull infrastructure container images --
+          - bash: |
+              [ -f app.env.example ] && cp app.env.example app.env
+              docker compose -f docker-compose.yml pull --parallel
+            displayName: 'Pull infrastructure container images'
+            env:
+              DOCKER_HUB_URL: $(ecr_cache_url)
+
+          # -- Start test environment --
+          - bash: |
+              docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d
+            displayName: 'Start test environment containers'
+            env:
+              DOCKER_HUB_URL: $(ecr_cache_url)
+
+          # -- Post-startup commands --
+          - bash: |
+              docker ps -a
+              ${{ parameters.post_startup }}
+            displayName: 'Post-startup commands'
+
+          # -- Test endpoint is working --
+          - ${{ if eq(parameters.check_http_running, true) }}:
+            - bash: |
+                set -euo pipefail
+                TEST_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $(docker compose ps -q app))
+                TIMEOUT=120
+                ELAPSED=0
+                until curl -s "http://${TEST_IP}:8080/version"; do
+                  echo "Waiting for server to come up..."
+                  sleep 1
+                  ELAPSED=$((ELAPSED + 1))
+                  if [ $ELAPSED -ge $TIMEOUT ]; then
+                    echo "##vso[task.logissue type=error]Server did not start within ${TIMEOUT}s"
+                    exit 1
+                  fi
+                done
+              displayName: 'Test HTTP endpoint is working'
+              timeoutInMinutes: 2
+
+          # -- Run test suite --
+          - ${{ if ne(parameters.test_suite_cmd, '') }}:
+            - bash: |
+                ${{ parameters.test_suite_cmd }}
+              displayName: 'Run test suite'
+
+          # -- Upload artifact --
+          - ${{ if ne(parameters.upload_artifact, '') }}:
+            - task: PublishPipelineArtifact@1
+              displayName: 'Upload artifact (amd64)'
+              inputs:
+                targetPath: '${{ parameters.upload_artifact }}'
+                artifactName: 'uploaded-artifact-amd64'
+
+          # -- Build full image to ensure it works --
+          - bash: |
+              set -euo pipefail
+              GHCR_REPO="$(GHCR_REPO)"
+
+              docker buildx build \
+                --tag "$(Build.Repository.Name):full" \
+                --cache-from "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-amd64" \
+                --ssh "default=$(ssh_key_path)" \
+                --build-arg "DOCKER_HUB_URL=$(ecr_cache_url)" \
+                "${{ parameters.docker_build_context }}"
+            displayName: 'Build full image (smoke test)'
+            env:
+              DOCKER_BUILDKIT: 1
+
+          # -- Show all logs (always, even on failure) --
+          - bash: |
+              docker compose logs -t
+              docker ps -a
+            displayName: 'Show all container logs'
+            condition: always()
+
+  # ===========================================================================
+  # Stage 2: test_suite_arm64
+  # Runs the full test + build pipeline on arm64. Runs in PARALLEL with
+  # test_suite_x86. No dependsOn — both stages start immediately.
+  # ===========================================================================
+  - stage: test_suite_arm64
+    displayName: 'Test Suite (arm64)'
+    # No dependsOn — runs in parallel with test_suite_x86
+    jobs:
+      - job: test_arm64
+        displayName: 'Run tests (arm64)'
+        timeoutInMinutes: 15
+        pool:
+          # NOTE: Azure DevOps does not have hosted ARM agents.
+          # This must be a self-hosted agent pool with ARM64 machines.
+          name: '${{ parameters.pool_arm }}'
+        steps:
+          - checkout: self
+            submodules: recursive
+            persistCredentials: true
+
+          # -- Login to GHCR --
+          - bash: |
+              echo "$(GHCR_TOKEN)" | docker login ghcr.io -u "$(GHCR_USERNAME)" --password-stdin
+            displayName: 'Login to GitHub Container Registry'
+
+          # -- Login to Docker Hub --
+          - bash: |
+              echo "$(DOCKER_PASS)" | docker login -u "$(DOCKER_USER)" --password-stdin
+            displayName: 'Login to Docker Hub'
+
+          # -- Set up Docker Buildx --
+          - bash: |
+              docker buildx create --use --name multiarch-builder || true
+              docker buildx inspect --bootstrap
+            displayName: 'Set up Docker Buildx'
+
+          # -- Decode SSH private key --
+          - bash: |
+              set -euo pipefail
+              SSH_KEY_PATH="$(Agent.TempDirectory)/id_rsa"
+              echo "$(REPO_PRIVATE_KEY)" | base64 -d > "${SSH_KEY_PATH}"
+              chmod 600 "${SSH_KEY_PATH}"
+              echo "##vso[task.setvariable variable=ssh_key_path]${SSH_KEY_PATH}"
+            displayName: 'Decode SSH private key'
+
+          # -- Determine ECR cache URL --
+          - bash: |
+              set -euo pipefail
+              if [[ "${{ parameters.alt_ecr_cache }}" == "True" || "${{ parameters.alt_ecr_cache }}" == "true" ]]; then
+                  ECR_CACHE_URL="$(DOCKER_HUB_CI_CD_URL)"
+                  ECR_CACHE_REGION="us-east-1"
+              else
+                  ECR_CACHE_URL="$(DOCKER_HUB_URL)"
+                  ECR_CACHE_REGION="eu-west-1"
+              fi
+              echo "##vso[task.setvariable variable=ecr_cache_url]${ECR_CACHE_URL}"
+              echo "##vso[task.setvariable variable=ecr_cache_region]${ECR_CACHE_REGION}"
+            displayName: 'ECR Caching URL'
+
+          # -- Configure AWS credentials and login to ECR (cache region) --
+          - bash: |
+              set -euo pipefail
+              aws ecr get-login-password --region "$(ecr_cache_region)" | \
+                docker login --username AWS --password-stdin "$(ecr_cache_url)"
+            displayName: 'Login to Amazon ECR (Caching region)'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+              AWS_DEFAULT_REGION: $(ecr_cache_region)
+
+          # -- Update known hosts --
+          - bash: |
+              mkdir -p ~/.ssh
+              ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+            displayName: 'Update known hosts'
+
+          # -- Build test image --
+          - bash: |
+              set -euo pipefail
+              GHCR_REPO="$(GHCR_REPO)"
+
+              BUILD_CMD="docker buildx build"
+              BUILD_CMD="${BUILD_CMD} --load"
+              BUILD_CMD="${BUILD_CMD} --tag $(Build.Repository.Name):test"
+              BUILD_CMD="${BUILD_CMD} --cache-from type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-arm64"
+              BUILD_CMD="${BUILD_CMD} --cache-to type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-arm64,mode=max"
+              BUILD_CMD="${BUILD_CMD} --ssh default=$(ssh_key_path)"
+              BUILD_CMD="${BUILD_CMD} --build-arg DOCKER_HUB_URL=$(ecr_cache_url)"
+
+              TARGET="${{ parameters.docker_build_target }}"
+              if [ -n "${TARGET}" ]; then
+                BUILD_CMD="${BUILD_CMD} --target ${TARGET}"
+              fi
+
+              BUILD_CMD="${BUILD_CMD} ${{ parameters.docker_build_context }}"
+              eval ${BUILD_CMD}
+            displayName: 'Build test image'
+            env:
+              DOCKER_BUILDKIT: 1
+
+          # -- Write docker-compose override to use the built image --
+          - bash: |
+              cat <<EOF > docker-compose.ci.yml
+              services:
+                app:
+                  image: $(Build.Repository.Name):test
+                  command: ${{ parameters.docker_cmd }}
+              EOF
+            displayName: 'Write docker-compose.ci.yml override'
+
+          # -- Pull infrastructure container images --
+          - bash: |
+              [ -f app.env.example ] && cp app.env.example app.env
+              docker compose -f docker-compose.yml pull --parallel
+            displayName: 'Pull infrastructure container images'
+            env:
+              DOCKER_HUB_URL: $(ecr_cache_url)
+
+          # -- Start test environment --
+          - bash: |
+              docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d
+            displayName: 'Start test environment containers'
+            env:
+              DOCKER_HUB_URL: $(ecr_cache_url)
+
+          # -- Post-startup commands --
+          - bash: |
+              docker ps -a
+              ${{ parameters.post_startup }}
+            displayName: 'Post-startup commands'
+
+          # -- Test endpoint is working --
+          - ${{ if eq(parameters.check_http_running, true) }}:
+            - bash: |
+                set -euo pipefail
+                TEST_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $(docker compose ps -q app))
+                TIMEOUT=120
+                ELAPSED=0
+                until curl -s "http://${TEST_IP}:8080/version"; do
+                  echo "Waiting for server to come up..."
+                  sleep 1
+                  ELAPSED=$((ELAPSED + 1))
+                  if [ $ELAPSED -ge $TIMEOUT ]; then
+                    echo "##vso[task.logissue type=error]Server did not start within ${TIMEOUT}s"
+                    exit 1
+                  fi
+                done
+              displayName: 'Test HTTP endpoint is working'
+              timeoutInMinutes: 2
+
+          # -- Run test suite --
+          - ${{ if ne(parameters.test_suite_cmd, '') }}:
+            - bash: |
+                ${{ parameters.test_suite_cmd }}
+              displayName: 'Run test suite'
+
+          # -- Upload artifact --
+          - ${{ if ne(parameters.upload_artifact, '') }}:
+            - task: PublishPipelineArtifact@1
+              displayName: 'Upload artifact (arm64)'
+              inputs:
+                targetPath: '${{ parameters.upload_artifact }}'
+                artifactName: 'uploaded-artifact-arm64'
+
+          # -- Build full image to ensure it works --
+          - bash: |
+              set -euo pipefail
+              GHCR_REPO="$(GHCR_REPO)"
+
+              docker buildx build \
+                --tag "$(Build.Repository.Name):full" \
+                --cache-from "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-arm64" \
+                --ssh "default=$(ssh_key_path)" \
+                --build-arg "DOCKER_HUB_URL=$(ecr_cache_url)" \
+                "${{ parameters.docker_build_context }}"
+            displayName: 'Build full image (smoke test)'
+            env:
+              DOCKER_BUILDKIT: 1
+
+          # -- Show all logs (always, even on failure) --
+          - bash: |
+              docker compose logs -t
+              docker ps -a
+            displayName: 'Show all container logs'
+            condition: always()
+
+  # NOTE: The original GitHub Actions workflow calls packages.yml at the end
+  # (packages_cleanup job). That downstream workflow is NOT included in this
+  # template. Wire it up as a separate stage or pipeline in your consuming
+  # pipeline if needed.

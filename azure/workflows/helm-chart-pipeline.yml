@@ -1,0 +1,45 @@
+# =============================================================================
+# Sample Azure Pipeline that consumes the helm-chart template
+# =============================================================================
+# This is the equivalent of a GitHub Actions workflow that calls the reusable
+# workflow via `uses: org/shared-workflows/.github/workflows/helm-chart.yml`.
+#
+# Place this file in the consuming repository as `azure-pipelines.yml` and
+# adjust the resource reference to point to your shared templates repo.
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - 'feature/*'
+  paths:
+    include:
+      - 'chart/**'
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - 'chart/**'
+
+resources:
+  repositories:
+    - repository: shared-templates
+      type: git
+      name: 'YourProject/shared-workflows'
+      ref: refs/heads/main
+      # endpoint: 'your-github-service-connection'  # Only needed for GitHub repos
+
+extends:
+  template: shared/helm-chart.yml@shared-templates
+  parameters:
+    chart_dir: 'chart'
+    # helm_version: '3.18.3'                            # Default
+    # ct_version: '3.13.0'                              # Default
+    # kubeconform_version: '0.7.0'                      # Default
+    # kubernetes_version: '1.33.0'                       # Default
+    # pool_x86: 'ubuntu-latest'                          # Default
+    # secrets_variable_group: 'moya-helm-chart-secrets'  # Default

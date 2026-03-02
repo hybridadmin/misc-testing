@@ -1,0 +1,34 @@
+# =============================================================================
+# Sample Azure Pipeline that consumes the packages template
+# =============================================================================
+# This is the equivalent of a GitHub Actions workflow that calls the reusable
+# workflow via `uses: org/shared-workflows/.github/workflows/packages.yml`.
+#
+# Place this file in the consuming repository as `azure-pipelines.yml` and
+# adjust the resource reference to point to your shared templates repo.
+#
+# NOTE: This template is typically called from other templates (e.g. java.yml,
+# angular-build.yml) rather than used standalone. This consumer pipeline is
+# provided as a reference for standalone usage.
+# =============================================================================
+
+trigger: none   # Typically triggered by other pipelines, not directly
+
+resources:
+  repositories:
+    - repository: shared-templates
+      type: git
+      name: 'YourProject/shared-workflows'
+      ref: refs/heads/main
+      # endpoint: 'your-github-service-connection'  # Only needed for GitHub repos
+
+extends:
+  template: shared/packages.yml@shared-templates
+  parameters:
+    package_type: 'container'
+    tagged_version_count: 20
+    untagged_version_count: 5
+    github_owner: 'your-org'
+    package_name: 'your-repo'
+    # pool_x86: 'ubuntu-latest'                       # Default
+    # secrets_variable_group: 'moya-packages-secrets'  # Default

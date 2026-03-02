@@ -1,0 +1,52 @@
+# =============================================================================
+# Sample Azure Pipeline that consumes the frontend-build template
+# =============================================================================
+# This is the equivalent of a GitHub Actions workflow that calls the reusable
+# workflow via `uses: org/shared-workflows/.github/workflows/angular-build.yml`
+# or `uses: org/shared-workflows/.github/workflows/solidjs.yml`.
+#
+# Both angular-build.yml and solidjs.yml are identical workflows; this single
+# template (shared/frontend-build.yml) replaces both.
+#
+# Place this file in the consuming repository as `azure-pipelines.yml` and
+# adjust the resource reference to point to your shared templates repo.
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  # Optionally trigger on PRs too:
+  # pr:
+  #   branches:
+  #     include:
+  #       - main
+
+resources:
+  repositories:
+    # Reference the shared templates repository.
+    # Adjust `repository`, `type`, `ref`, and `endpoint` to match your setup.
+    - repository: shared-templates
+      type: git                          # Use 'github' if the templates repo is on GitHub
+      name: 'YourProject/shared-workflows'  # Azure Repos: 'project/repo', GitHub: 'org/repo'
+      ref: refs/heads/main
+      # endpoint: 'your-github-service-connection'  # Only needed for GitHub repos
+
+# Extend from the shared template (equivalent to workflow_call)
+extends:
+  template: shared/frontend-build.yml@shared-templates
+  parameters:
+    docker_build_context: '.'
+    # docker_build_target: ''              # Default: no target
+    docker_cmd: '[ "/app/cmd.sh" ]'
+    check_http_running: true
+    # post_startup: ''                     # Optional commands after containers start
+    # test_suite_cmd: ''                   # Optional test command
+    # upload_artifact: ''                  # Optional path to upload
+    alt_ecr_cache: false
+    ghcr_repository: 'your-org/your-repo'
+    # pool_x86: 'ubuntu-24.04'            # Default
+    # pool_arm: 'arm64-pool'              # Set to your self-hosted ARM pool name
+    # secrets_variable_group: 'moya-frontend-build-secrets'  # Default
+    # vars_variable_group: 'moya-frontend-build-vars'        # Default

@@ -1,0 +1,258 @@
+# =============================================================================
+# Azure Pipelines Template: helm-chart
+# =============================================================================
+# Ported from: .github/workflows/helm-chart.yml (GitHub Actions reusable workflow)
+#
+# This is an Azure Pipelines *template* file. It is the equivalent of a GitHub
+# Actions "workflow_call" reusable workflow. Consuming pipelines reference it
+# via `extends` or `template` from a shared repository resource.
+#
+# Purpose: Lints Helm charts using chart-testing (ct), validates with
+# kubeconform, and optionally runs Helm unit tests.
+#
+# ----- PREREQUISITES / SETUP -----
+#
+# 1. Variable Group: "moya-helm-chart-secrets"
+#    Create a variable group (or link an Azure Key Vault) containing:
+#      - REPO_USER_PAT  : GitHub PAT (used for helm-unittest plugin install)
+#
+# 2. Agent Pools:
+#    - Microsoft-hosted "ubuntu-latest" (default).
+#
+# 3. Tools required on agents: helm, ct, kubeconform, pip3, curl, jq
+#    These are either pre-installed on hosted agents or installed by the
+#    template itself.
+#
+# ----- DIFFERENCES FROM GITHUB ACTIONS VERSION -----
+#
+# - The `d3adb5/helm-unittest-action@v2` action is replaced with direct
+#   installation of the helm-unittest plugin and manual test invocation.
+# - The `actions/cache@v4` action is replaced with Azure Pipelines
+#   `Cache@2` task for caching installed binaries.
+# - Tool versions (Helm, ct, kubeconform) are parameterized instead of
+#   hardcoded env vars.
+# =============================================================================
+
+parameters:
+  # --- Equivalent to GitHub Actions workflow_call inputs ---
+  # (The original workflow has no inputs — all values were hardcoded)
+
+  # --- Additional parameters (Azure-specific) ---
+  - name: helm_version
+    type: string
+    displayName: 'Helm version'
+    default: '3.18.3'
+
+  - name: ct_version
+    type: string
+    displayName: 'chart-testing (ct) version'
+    default: '3.13.0'
+
+  - name: kubeconform_version
+    type: string
+    displayName: 'kubeconform version'
+    default: '0.7.0'
+
+  - name: kubernetes_version
+    type: string
+    displayName: 'Kubernetes version for kubeconform validation'
+    default: '1.33.0'
+
+  - name: chart_dir
+    type: string
+    displayName: 'Path to the Helm chart directory'
+    default: 'chart'
+
+  - name: pool_x86
+    type: string
+    displayName: 'Agent pool (or vmImage) for jobs'
+    default: 'ubuntu-latest'
+
+  - name: secrets_variable_group
+    type: string
+    displayName: 'Variable group name containing secrets'
+    default: 'moya-helm-chart-secrets'
+
+variables:
+  - group: ${{ parameters.secrets_variable_group }}
+
+stages:
+  # ===========================================================================
+  # Stage 1: unit_tests
+  # Runs Helm unit tests if the test file exists.
+  # ===========================================================================
+  - stage: unit_tests
+    displayName: 'Helm Unit Tests'
+    jobs:
+      - job: helm_unit_tests
+        displayName: 'Run Helm unit tests'
+        pool:
+          vmImage: '${{ parameters.pool_x86 }}'
+        steps:
+          - checkout: self
+
+          # -- Check if unit test file exists --
+          - bash: |
+              set -euo pipefail
+              CHART_DIR="${{ parameters.chart_dir }}"
+
+              if [ -f "${CHART_DIR}/tests/systest/env_vars_test.yaml" ]; then
+                echo "Unit test file found."
+                echo "##vso[task.setvariable variable=check_result;isOutput=true]true"
+              else
+                echo "Unit test file not found. Skipping unit tests."
+                echo "##vso[task.setvariable variable=check_result;isOutput=true]false"
+              fi
+            name: file_check
+            displayName: 'Check for unit test file'
+
+          # -- Install Helm and helm-unittest plugin --
+          - bash: |
+              set -euo pipefail
+              HELM_VER="${{ parameters.helm_version }}"
+
+              # Install Helm
+              curl -fsSL https://get.helm.sh/helm-v${HELM_VER}-linux-amd64.tar.gz \
+                | tar xz -C /tmp
+              sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
+              helm version
+
+              # Install helm-unittest plugin
+              helm plugin install https://github.com/helm-unittest/helm-unittest.git || true
+            displayName: 'Install Helm and unittest plugin'
+            condition: eq(variables['file_check.check_result'], 'true')
+
+          # -- Run Helm unit tests --
+          - bash: |
+              set -euo pipefail
+              CHART_DIR="${{ parameters.chart_dir }}"
+
+              helm unittest \
+                -f "${CHART_DIR}/tests/systest/env_vars_test.yaml" \
+                "${CHART_DIR}"
+            displayName: 'Run Helm unit tests'
+            condition: eq(variables['file_check.check_result'], 'true')
+
+  # ===========================================================================
+  # Stage 2: helm_check
+  # Installs tools, lints charts with ct, validates with kubeconform.
+  # ===========================================================================
+  - stage: helm_check
+    displayName: 'Helm Lint & Validate'
+    dependsOn: unit_tests
+    jobs:
+      - job: lint_validate
+        displayName: 'Lint and validate Helm charts'
+        timeoutInMinutes: 5
+        pool:
+          vmImage: '${{ parameters.pool_x86 }}'
+        steps:
+          - checkout: self
+
+          # -- Install Helm, ct, kubeconform --
+          - bash: |
+              set -euo pipefail
+              HELM_VER="${{ parameters.helm_version }}"
+              CT_VER="${{ parameters.ct_version }}"
+              KUBECONFORM_VER="${{ parameters.kubeconform_version }}"
+
+              # Install yamale (required by ct)
+              pip3 install -U yamale
+
+              # Install Helm
+              curl -fsSL "https://get.helm.sh/helm-v${HELM_VER}-linux-amd64.tar.gz" \
+                | tar xz -C /tmp
+              sudo mv /tmp/linux-amd64/helm /usr/local/bin/helm
+              helm version
+
+              # Install chart-testing (ct)
+              curl -fsSL "https://github.com/helm/chart-testing/releases/download/v${CT_VER}/chart-testing_${CT_VER}_linux_amd64.tar.gz" \
+                | tar xz -C /tmp
+              sudo mv /tmp/ct /usr/local/bin/ct
+              ct version
+
+              # Configure ct lintconf
+              if [ -f /tmp/etc/lintconf.yaml ]; then
+                sed -i -e 's/new-line-at-end-of-file: enable/new-line-at-end-of-file: disable/' /tmp/etc/lintconf.yaml
+                sed -i -e 's/max: 2/max: 100/' /tmp/etc/lintconf.yaml
+                sed -i -e 's/max-start: 0/max-start: 100/' /tmp/etc/lintconf.yaml
+                sed -i -e 's/max-end: 0/max-end: 100/' /tmp/etc/lintconf.yaml
+              fi
+
+              # Install kubeconform
+              curl -fsSL "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VER}/kubeconform-linux-amd64.tar.gz" \
+                | tar xz -C /tmp
+              sudo mv /tmp/kubeconform /usr/local/bin/kubeconform
+              kubeconform -v
+
+              # Install helm kubeconform plugin
+              helm plugin install https://github.com/jtyr/kubeconform-helm || true
+            displayName: 'Install Helm, ct, kubeconform'
+
+          # -- Cache installed binaries --
+          # NOTE: Azure Pipelines Cache@2 could be used here for /usr/local/bin
+          # binaries, but since installation is fast and idempotent, caching is
+          # omitted for simplicity. Add Cache@2 if build times become a concern.
+
+          # -- Lint and validate Helm charts --
+          - bash: |
+              set -euo pipefail
+              CHART_DIR="${{ parameters.chart_dir }}"
+              K8S_VER="${{ parameters.kubernetes_version }}"
+
+              subdirs=$(ls -d ${CHART_DIR}/*/ 2>/dev/null || true)
+
+              # Check if chart dir contains the chart itself (has templates/)
+              # rather than separate sub-charts as subdirs
+              if [[ "${subdirs}" =~ "${CHART_DIR}/templates/" ]]; then
+                for VALUES_FILE in ./${CHART_DIR}/values-*.yaml; do
+                  [ -f "${VALUES_FILE}" ] || continue
+                  echo "========================================"
+                  echo "Linting ${VALUES_FILE}"
+                  echo "========================================"
+                  ct lint \
+                    --charts "${CHART_DIR}" \
+                    --chart-yaml-schema /tmp/etc/chart_schema.yaml \
+                    --lint-conf /tmp/etc/lintconf.yaml \
+                    --validate-maintainers=false \
+                    --helm-lint-extra-args "-f ${VALUES_FILE}" \
+                    --github-groups \
+                    --chart-repos bitnami=https://charts.bitnami.com/bitnami
+
+                  echo "Kubeconform check ${VALUES_FILE}"
+                  helm kubeconform --verbose --summary "${CHART_DIR}" \
+                    --kubernetes-version "${K8S_VER}" \
+                    -f "${VALUES_FILE}" \
+                    --schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+                    --schema-location default \
+                    --ignore-missing-schemas
+                done
+              else
+                for SUBDIR in ${subdirs}; do
+                  for VALUES_FILE in ${SUBDIR}values-*.yaml; do
+                    [ -f "${VALUES_FILE}" ] || continue
+                    echo "========================================"
+                    echo "Linting ${VALUES_FILE}"
+                    echo "========================================"
+                    ct lint \
+                      --charts "${SUBDIR}" \
+                      --chart-yaml-schema /tmp/etc/chart_schema.yaml \
+                      --lint-conf /tmp/etc/lintconf.yaml \
+                      --validate-maintainers=false \
+                      --helm-lint-extra-args "-f ${VALUES_FILE}" \
+                      --github-groups \
+                      --chart-repos bitnami=https://charts.bitnami.com/bitnami
+
+                    echo "Kubeconform check ${VALUES_FILE}"
+                    helm kubeconform --verbose --summary "${SUBDIR}" \
+                      --kubernetes-version "${K8S_VER}" \
+                      -f "${SUBDIR}/${VALUES_FILE}" \
+                      --schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+                      --schema-location default \
+                      --ignore-missing-schemas
+                  done
+                done
+              fi
+
+              echo "All Helm chart linting and validation complete."
+            displayName: 'Lint and validate Helm charts'

@@ -1,0 +1,31 @@
+# =============================================================================
+# Sample Azure Pipeline that consumes the ghcr-build-push template
+# =============================================================================
+# This is the equivalent of a GitHub Actions workflow that calls the reusable
+# workflow via `uses: org/shared-workflows/.github/workflows/ghcr-build-push.yml`.
+#
+# Place this file in the consuming repository as `azure-pipelines.yml` and
+# adjust the resource reference to point to your shared templates repo.
+# =============================================================================
+
+trigger:
+  tags:
+    include:
+      - '*'
+
+resources:
+  repositories:
+    - repository: shared-templates
+      type: git
+      name: 'YourProject/shared-workflows'
+      ref: refs/heads/main
+      # endpoint: 'your-github-service-connection'  # Only needed for GitHub repos
+
+extends:
+  template: shared/ghcr-build-push.yml@shared-templates
+  parameters:
+    docker_build_context: './app'
+    # docker_build_target: ''                                    # Default: no target
+    ghcr_repository: 'your-org/your-repo'
+    # pool_x86: 'ubuntu-24.04'                                  # Default
+    # secrets_variable_group: 'moya-ghcr-build-push-secrets'    # Default

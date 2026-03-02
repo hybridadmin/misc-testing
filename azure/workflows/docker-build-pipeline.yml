@@ -1,0 +1,45 @@
+# =============================================================================
+# Sample Azure Pipeline that consumes the docker-build template
+# =============================================================================
+# This is the equivalent of a GitHub Actions workflow that calls the reusable
+# workflow via `uses: org/shared-workflows/.github/workflows/docker-build.yml`.
+#
+# Place this file in the consuming repository as `azure-pipelines.yml` and
+# adjust the resource reference to point to your shared templates repo.
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - 'feature/*'
+  tags:
+    include:
+      - '*'
+
+pr:
+  branches:
+    include:
+      - main
+
+resources:
+  repositories:
+    - repository: shared-templates
+      type: git
+      name: 'YourProject/shared-workflows'
+      ref: refs/heads/main
+      # endpoint: 'your-github-service-connection'  # Only needed for GitHub repos
+
+extends:
+  template: shared/docker-build.yml@shared-templates
+  parameters:
+    docker_build_context: './'
+    # docker_build_target: ''                              # Default: no target
+    # post_startup: ''                                     # Default: no post-startup commands
+    tag_docker_image: false
+    push_to_ghcr: false
+    ghcr_repository: 'your-org/your-repo'
+    # pool_x86: 'ubuntu-24.04'                             # Default
+    # pool_arm: 'arm64-pool'                               # Set to your ARM pool
+    # secrets_variable_group: 'moya-docker-build-secrets'  # Default
+    # vars_variable_group: 'moya-docker-build-vars'        # Default

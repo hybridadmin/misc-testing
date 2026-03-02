@@ -1,0 +1,434 @@
+# =============================================================================
+# Azure Pipelines Template: docker-build
+# =============================================================================
+# Ported from: .github/workflows/docker-build.yml (GitHub Actions reusable workflow)
+#
+# This is an Azure Pipelines *template* file. It is the equivalent of a GitHub
+# Actions "workflow_call" reusable workflow. Consuming pipelines reference it
+# via `extends` or `template` from a shared repository resource.
+#
+# Purpose: Builds Docker test images on both amd64 and arm64, runs optional
+# post-startup commands, and optionally pushes multi-arch images to GHCR on
+# tag events (via QEMU on the amd64 runner).
+#
+# ----- PREREQUISITES / SETUP -----
+#
+# 1. Variable Group: "moya-docker-build-secrets"
+#    Create a variable group (or link an Azure Key Vault) containing:
+#      - REPO_USER_PAT      : GitHub PAT for private submodule cloning
+#      - REPO_PRIVATE_KEY    : Base64-encoded SSH private key for Docker SSH builds
+#      - DOCKER_USER         : Docker Hub username
+#      - DOCKER_PASS         : Docker Hub password/token
+#      - GHCR_USERNAME       : GitHub Container Registry username
+#      - GHCR_TOKEN          : GitHub PAT with packages:write scope
+#      - AWS_ACCESS_KEY_ID   : AWS credentials for ECR
+#      - AWS_SECRET_ACCESS_KEY : AWS credentials for ECR
+#      - AWS_ROLE_TO_ASSUME  : IAM role ARN (if using assume-role)
+#
+# 2. Variable Group: "moya-docker-build-vars"
+#    Non-secret variables:
+#      - DOCKER_HUB_URL     : ECR pull-through cache URL
+#
+# 3. Agent Pools:
+#    - For x86 builds: Microsoft-hosted "ubuntu-24.04" (default)
+#    - For ARM builds: Self-hosted ARM64 pool (parameter `pool_arm`)
+#
+# 4. Tools required on agents: docker, docker buildx, jq, curl, aws CLI,
+#    ssh-keyscan
+#
+# ----- DIFFERENCES FROM GITHUB ACTIONS VERSION -----
+#
+# - The amd64+arm64 matrix is split into two parallel stages (different pools).
+# - `docker/build-push-action` is replaced with `docker buildx build`.
+# - `docker/login-action` is replaced with `docker login` via bash.
+# - `aws-actions/configure-aws-credentials` + `amazon-ecr-login` are replaced
+#   with `aws ecr get-login-password` via bash.
+# - `timheuer/base64-to-file` is replaced with `base64 -d`.
+# - `docker/setup-qemu-action` is replaced with
+#   `docker run --privileged multiarch/qemu-user-static`.
+# - `jwalton/gh-docker-logs@v2` is replaced with `docker ps -a && docker
+#   compose logs` on failure.
+# - The optional GHCR push (multi-arch via QEMU) only runs on the amd64 stage.
+# =============================================================================
+
+parameters:
+  # --- Equivalent to GitHub Actions workflow_call inputs ---
+  - name: docker_build_context
+    type: string
+    displayName: 'Docker build context directory'
+    default: './'
+
+  - name: docker_build_target
+    type: string
+    displayName: 'Docker build target (leave empty for default)'
+    default: ''
+
+  - name: post_startup
+    type: string
+    displayName: 'Commands to run after infrastructure containers start'
+    default: ''
+
+  - name: tag_docker_image
+    type: boolean
+    displayName: 'Load built image into Docker (available as repo:cicd)'
+    default: false
+
+  - name: push_to_ghcr
+    type: boolean
+    displayName: 'Push multi-arch image to GHCR on tag events'
+    default: false
+
+  # --- Additional parameters (Azure-specific) ---
+  - name: pool_x86
+    type: string
+    displayName: 'Agent pool (or vmImage) for x86 builds'
+    default: 'ubuntu-24.04'
+
+  - name: pool_arm
+    type: string
+    displayName: 'Agent pool name for ARM64 builds (must be self-hosted)'
+    default: 'arm64-pool'
+
+  - name: ghcr_repository
+    type: string
+    displayName: 'GHCR image path (e.g. myorg/myrepo)'
+    default: ''
+
+  - name: secrets_variable_group
+    type: string
+    displayName: 'Variable group name containing secrets'
+    default: 'moya-docker-build-secrets'
+
+  - name: vars_variable_group
+    type: string
+    displayName: 'Variable group name containing non-secret variables'
+    default: 'moya-docker-build-vars'
+
+variables:
+  - group: ${{ parameters.secrets_variable_group }}
+  - group: ${{ parameters.vars_variable_group }}
+  - name: GHCR_REPO
+    ${{ if ne(parameters.ghcr_repository, '') }}:
+      value: ${{ parameters.ghcr_repository }}
+    ${{ else }}:
+      value: '$(Build.Repository.Name)'
+
+stages:
+  # ===========================================================================
+  # Stage 1: build_x86
+  # Builds Docker test image on amd64, runs post-startup, optionally pushes
+  # multi-arch to GHCR (via QEMU).
+  # ===========================================================================
+  - stage: build_x86
+    displayName: 'Build Docker (amd64)'
+    jobs:
+      - job: build_amd64
+        displayName: 'Build Docker image for amd64'
+        timeoutInMinutes: 15
+        pool:
+          vmImage: '${{ parameters.pool_x86 }}'
+        steps:
+          - checkout: self
+            submodules: recursive
+            persistCredentials: true
+
+          # -- Determine ref type --
+          - bash: |
+              set -euo pipefail
+
+              SOURCE_BRANCH="$(Build.SourceBranch)"
+              if [[ "${SOURCE_BRANCH}" == refs/tags/* ]]; then
+                ref_type="tag"
+                tag_name=$(echo "${SOURCE_BRANCH#refs/tags/}" | sed 's,/,_,g')
+              else
+                ref_type="branch"
+                tag_name=$(echo "${SOURCE_BRANCH#refs/heads/}" | sed 's,/,_,g')
+              fi
+              branch_name=$(echo "${SOURCE_BRANCH#refs/heads/}" | sed 's,/,_,g')
+
+              echo "ref_type=${ref_type}"
+              echo "tag_name=${tag_name}"
+
+              echo "##vso[task.setvariable variable=ref_type;isOutput=true]${ref_type}"
+              echo "##vso[task.setvariable variable=tag_name;isOutput=true]${tag_name}"
+              echo "##vso[task.setvariable variable=branch_name;isOutput=true]${branch_name}"
+            name: check_tag
+            displayName: 'Determine ref type, tag name, branch name'
+
+          # -- Login to GHCR --
+          - bash: |
+              set -euo pipefail
+              echo "${GHCR_TOKEN}" | docker login ghcr.io \
+                -u "${GHCR_USERNAME}" --password-stdin
+            displayName: 'Login to GitHub Container Registry'
+            env:
+              GHCR_USERNAME: $(GHCR_USERNAME)
+              GHCR_TOKEN: $(GHCR_TOKEN)
+
+          # -- Login to Docker Hub --
+          - bash: |
+              set -euo pipefail
+              echo "${DOCKER_PASS}" | docker login \
+                -u "${DOCKER_USER}" --password-stdin
+            displayName: 'Login to Docker Hub'
+            env:
+              DOCKER_USER: $(DOCKER_USER)
+              DOCKER_PASS: $(DOCKER_PASS)
+
+          # -- Set up Docker Buildx --
+          - bash: |
+              set -euo pipefail
+              docker buildx create --use --name multiarch-builder || true
+              docker buildx inspect --bootstrap
+            displayName: 'Set up Docker Buildx'
+
+          # -- Configure AWS credentials and login to ECR --
+          - bash: |
+              set -euo pipefail
+              aws ecr get-login-password --region eu-west-1 \
+                | docker login --username AWS --password-stdin \
+                "$(DOCKER_HUB_URL)"
+              echo "Logged in to ECR."
+            displayName: 'Configure AWS and login to ECR'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # -- Decode SSH private key --
+          - bash: |
+              set -euo pipefail
+              mkdir -p /tmp/ssh-keys
+              echo "${REPO_PRIVATE_KEY}" | base64 -d > /tmp/ssh-keys/id_rsa
+              chmod 600 /tmp/ssh-keys/id_rsa
+            displayName: 'Decode private key'
+            env:
+              REPO_PRIVATE_KEY: $(REPO_PRIVATE_KEY)
+
+          # -- Update known hosts --
+          - bash: |
+              set -euo pipefail
+              mkdir -p ~/.ssh
+              ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+            displayName: 'Update known hosts'
+
+          # -- Build test image --
+          - bash: |
+              set -euo pipefail
+              GHCR_REPO="$(GHCR_REPO)"
+              BUILD_CONTEXT="${{ parameters.docker_build_context }}"
+              BUILD_TARGET="${{ parameters.docker_build_target }}"
+              TAG_IMAGE="${{ parameters.tag_docker_image }}"
+              DOCKER_HUB_URL="$(DOCKER_HUB_URL)"
+
+              BUILD_ARGS=(
+                --cache-from "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-amd64"
+                --cache-to "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-amd64,mode=max"
+                --ssh "default=/tmp/ssh-keys/id_rsa"
+                --build-arg "DOCKER_HUB_URL=${DOCKER_HUB_URL}"
+                --tag "${GHCR_REPO}:cicd"
+              )
+
+              if [[ -n "${BUILD_TARGET}" ]]; then
+                BUILD_ARGS+=(--target "${BUILD_TARGET}")
+              fi
+
+              # Load image into local Docker if tag_docker_image is true
+              TAG_IMAGE_LOWER=$(echo "${TAG_IMAGE}" | tr '[:upper:]' '[:lower:]')
+              if [[ "${TAG_IMAGE_LOWER}" == "true" ]]; then
+                BUILD_ARGS+=(--load)
+              fi
+
+              docker buildx build "${BUILD_ARGS[@]}" "${BUILD_CONTEXT}"
+            displayName: 'Build test image'
+
+          # -- Post-startup commands --
+          - bash: |
+              set -euo pipefail
+              docker ps -a
+              ${{ parameters.post_startup }}
+            displayName: 'Post-startup commands'
+            env:
+              DOCKER_HUB_URL: $(DOCKER_HUB_URL)
+
+          # -- Optional: Push multi-arch to GHCR via QEMU (amd64 only, tags only) --
+          - ${{ if eq(parameters.push_to_ghcr, true) }}:
+            # -- Set up QEMU --
+            - bash: |
+                set -euo pipefail
+                docker run --rm --privileged \
+                  multiarch/qemu-user-static --reset -p yes
+                echo "QEMU binfmt handlers registered."
+              displayName: 'Set up QEMU for multi-platform builds'
+              condition: eq(variables['check_tag.ref_type'], 'tag')
+
+            # -- Build and push multi-arch image --
+            - bash: |
+                set -euo pipefail
+                GHCR_REPO="$(GHCR_REPO)"
+                TAG_NAME="$(check_tag.tag_name)"
+                BUILD_CONTEXT="${{ parameters.docker_build_context }}"
+                DOCKER_HUB_URL="$(DOCKER_HUB_URL)"
+
+                docker buildx build \
+                  --platform "linux/amd64,linux/arm64" \
+                  --tag "ghcr.io/${GHCR_REPO}:${TAG_NAME}" \
+                  --cache-from "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-amd64" \
+                  --ssh "default=/tmp/ssh-keys/id_rsa" \
+                  --build-arg "DOCKER_HUB_URL=${DOCKER_HUB_URL}" \
+                  --push \
+                  "${BUILD_CONTEXT}"
+              displayName: 'Build and push multi-arch image to GHCR'
+              condition: eq(variables['check_tag.ref_type'], 'tag')
+
+          # -- Dump docker logs on failure --
+          - bash: |
+              set -euo pipefail
+              echo "=== Docker containers ==="
+              docker ps -a
+              echo "=== Docker logs ==="
+              docker compose logs --no-color 2>/dev/null || docker logs $(docker ps -aq) 2>/dev/null || true
+            displayName: 'Dump docker logs on failure'
+            condition: failed()
+
+  # ===========================================================================
+  # Stage 2: build_arm64
+  # Builds Docker test image on ARM64 (self-hosted).
+  # Runs in parallel with build_x86 (no dependsOn between them).
+  # Does NOT do the GHCR multi-arch push (that is handled by the x86 stage
+  # via QEMU).
+  # ===========================================================================
+  - stage: build_arm64
+    displayName: 'Build Docker (arm64)'
+    jobs:
+      - job: build_arm
+        displayName: 'Build Docker image for arm64'
+        timeoutInMinutes: 15
+        pool:
+          name: '${{ parameters.pool_arm }}'
+        steps:
+          - checkout: self
+            submodules: recursive
+            persistCredentials: true
+
+          # -- Determine ref type --
+          - bash: |
+              set -euo pipefail
+
+              SOURCE_BRANCH="$(Build.SourceBranch)"
+              if [[ "${SOURCE_BRANCH}" == refs/tags/* ]]; then
+                ref_type="tag"
+                tag_name=$(echo "${SOURCE_BRANCH#refs/tags/}" | sed 's,/,_,g')
+              else
+                ref_type="branch"
+                tag_name=$(echo "${SOURCE_BRANCH#refs/heads/}" | sed 's,/,_,g')
+              fi
+              branch_name=$(echo "${SOURCE_BRANCH#refs/heads/}" | sed 's,/,_,g')
+
+              echo "##vso[task.setvariable variable=ref_type;isOutput=true]${ref_type}"
+              echo "##vso[task.setvariable variable=tag_name;isOutput=true]${tag_name}"
+              echo "##vso[task.setvariable variable=branch_name;isOutput=true]${branch_name}"
+            name: check_tag
+            displayName: 'Determine ref type, tag name, branch name'
+
+          # -- Login to GHCR --
+          - bash: |
+              set -euo pipefail
+              echo "${GHCR_TOKEN}" | docker login ghcr.io \
+                -u "${GHCR_USERNAME}" --password-stdin
+            displayName: 'Login to GitHub Container Registry'
+            env:
+              GHCR_USERNAME: $(GHCR_USERNAME)
+              GHCR_TOKEN: $(GHCR_TOKEN)
+
+          # -- Login to Docker Hub --
+          - bash: |
+              set -euo pipefail
+              echo "${DOCKER_PASS}" | docker login \
+                -u "${DOCKER_USER}" --password-stdin
+            displayName: 'Login to Docker Hub'
+            env:
+              DOCKER_USER: $(DOCKER_USER)
+              DOCKER_PASS: $(DOCKER_PASS)
+
+          # -- Set up Docker Buildx --
+          - bash: |
+              set -euo pipefail
+              docker buildx create --use --name builder || true
+              docker buildx inspect --bootstrap
+            displayName: 'Set up Docker Buildx'
+
+          # -- Configure AWS credentials and login to ECR --
+          - bash: |
+              set -euo pipefail
+              aws ecr get-login-password --region eu-west-1 \
+                | docker login --username AWS --password-stdin \
+                "$(DOCKER_HUB_URL)"
+            displayName: 'Configure AWS and login to ECR'
+            env:
+              AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+              AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+
+          # -- Decode SSH private key --
+          - bash: |
+              set -euo pipefail
+              mkdir -p /tmp/ssh-keys
+              echo "${REPO_PRIVATE_KEY}" | base64 -d > /tmp/ssh-keys/id_rsa
+              chmod 600 /tmp/ssh-keys/id_rsa
+            displayName: 'Decode private key'
+            env:
+              REPO_PRIVATE_KEY: $(REPO_PRIVATE_KEY)
+
+          # -- Update known hosts --
+          - bash: |
+              set -euo pipefail
+              mkdir -p ~/.ssh
+              ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+            displayName: 'Update known hosts'
+
+          # -- Build test image --
+          - bash: |
+              set -euo pipefail
+              GHCR_REPO="$(GHCR_REPO)"
+              BUILD_CONTEXT="${{ parameters.docker_build_context }}"
+              BUILD_TARGET="${{ parameters.docker_build_target }}"
+              TAG_IMAGE="${{ parameters.tag_docker_image }}"
+              DOCKER_HUB_URL="$(DOCKER_HUB_URL)"
+
+              BUILD_ARGS=(
+                --cache-from "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-arm64"
+                --cache-to "type=registry,ref=ghcr.io/${GHCR_REPO}:buildcache-arm64,mode=max"
+                --ssh "default=/tmp/ssh-keys/id_rsa"
+                --build-arg "DOCKER_HUB_URL=${DOCKER_HUB_URL}"
+                --tag "${GHCR_REPO}:cicd"
+              )
+
+              if [[ -n "${BUILD_TARGET}" ]]; then
+                BUILD_ARGS+=(--target "${BUILD_TARGET}")
+              fi
+
+              TAG_IMAGE_LOWER=$(echo "${TAG_IMAGE}" | tr '[:upper:]' '[:lower:]')
+              if [[ "${TAG_IMAGE_LOWER}" == "true" ]]; then
+                BUILD_ARGS+=(--load)
+              fi
+
+              docker buildx build "${BUILD_ARGS[@]}" "${BUILD_CONTEXT}"
+            displayName: 'Build test image'
+
+          # -- Post-startup commands --
+          - bash: |
+              set -euo pipefail
+              docker ps -a
+              ${{ parameters.post_startup }}
+            displayName: 'Post-startup commands'
+            env:
+              DOCKER_HUB_URL: $(DOCKER_HUB_URL)
+
+          # -- Dump docker logs on failure --
+          - bash: |
+              set -euo pipefail
+              echo "=== Docker containers ==="
+              docker ps -a
+              echo "=== Docker logs ==="
+              docker compose logs --no-color 2>/dev/null || docker logs $(docker ps -aq) 2>/dev/null || true
+            displayName: 'Dump docker logs on failure'
+            condition: failed()
