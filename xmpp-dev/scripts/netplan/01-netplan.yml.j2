@@ -1,0 +1,8 @@
+network:
+    version: 2
+    ethernets:
+        eth1:
+            addresses:
+{%- for i in range( START | int, END | int) %}
+                - {{ IP_RANGE }}.{{ i }}/24
+{%- endfor %}
