@@ -1,0 +1,126 @@
+# ---------------------------------------------------------------
+# Wrapper chart values
+# Top-level keys are for our custom templates (networkpolicy, ingress).
+# Keys under `nominatim:` are passed to the upstream nominatim subchart.
+# ---------------------------------------------------------------
+
+# -- Project / environment metadata used by custom templates
+project: "geocoding"
+env:
+  name: "default"
+cidr_range: "10.0"
+
+# -- Custom NetworkPolicy (our template)
+networkpolicy:
+  enabled: false
+
+# -- Optional prometheus ports for NetworkPolicy
+# network:
+#   prometheus:
+#     - 9090
+
+# ---------------------------------------------------------------
+# Upstream nominatim subchart values
+# ref: https://artifacthub.io/packages/helm/robjuz/nominatim
+# ---------------------------------------------------------------
+nominatim:
+  # IMPORTANT: disable the upstream ingress since we use our own custom template
+  ingress:
+    enabled: false
+
+  replicaCount: 1
+
+  updateStrategy:
+    type: Recreate
+
+  image:
+    registry: docker.io
+    repository: mediagis/nominatim
+    # tag defaults to appVersion (5.1.0) in the subchart; set explicitly to override
+    pullPolicy: IfNotPresent
+
+  nameOverride: ""
+  fullnameOverride: ""
+
+  service:
+    type: ClusterIP
+    ports:
+      http: 80
+
+  initJob:
+    enabled: false
+    pbfUrl: https://download.geofabrik.de/europe/germany/sachsen-latest.osm.pbf
+    importWikipedia: false
+    importGB_Postcode: false
+    importUS_Postcode: false
+    importStyle: full
+    threads: 16
+    freeze: false
+    wikipediaUrl: https://nominatim.org/data/wikimedia-importance.sql.gz
+    resources: {}
+
+  updates:
+    enabled: false
+    replicationUrl: https://download.geofabrik.de/europe/germany/sachsen-updates/
+
+  nominatimUi:
+    enabled: false
+
+  serviceAccount:
+    create: true
+
+  flatnode:
+    enabled: false
+
+  postgresql:
+    enabled: true
+    auth:
+      postgresPassword: nominatim
+    primary:
+      persistence:
+        size: 500Gi
+      extendedConfiguration: |
+        shared_buffers = 2GB
+        maintenance_work_mem = 10GB
+        autovacuum_work_mem = 2GB
+        work_mem = 50MB
+        effective_cache_size = 24GB
+        synchronous_commit = off
+        max_wal_size = 1GB
+        checkpoint_timeout = 10min
+        checkpoint_completion_target = 0.9
+
+  externalDatabase:
+    existingSecretDsn: ""
+    existingSecretDsnKey: POSTGRESQL_DSN
+    host: localhost
+    port: 5432
+    user: nominatim
+    password: ""
+
+  resources: {}
+  autoscaling:
+    enabled: false
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  networkPolicy:
+    egressRules:
+      customRules:
+        - to:
+            - ipBlock:
+                cidr: 0.0.0.0/0
+          ports:
+            - protocol: TCP
+              port: 443
+            - protocol: TCP
+              port: 80
+            - protocol: UDP
+              port: 53
+            - protocol: TCP
+              port: 5432
+
+  # Required by the template for the metrics guard on line 32
+  metrics:
+    enabled: true
