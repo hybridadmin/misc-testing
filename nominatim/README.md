@@ -31,10 +31,10 @@ Values are split into two scopes:
 
 | Scope | Keys | Purpose |
 |-------|------|---------|
-| **Wrapper chart** (top-level) | `project`, `env`, `cidr_range`, `networkpolicy`, `customIngress`, `network` | Drive the custom NetworkPolicy and Ingress templates |
+| **Wrapper chart** (top-level) | `project`, `env`, `cidr_range`, `networkpolicy`, `network` | Drive the custom NetworkPolicy and Ingress templates |
 | **Upstream subchart** | `nominatim.*` | Passed directly to the `robjuz/nominatim` subchart |
 
-The upstream subchart's own ingress is **always disabled** (`nominatim.ingress.enabled: false`). The custom `customIngress` template replaces it, providing AWS ALB annotations and multi-host support.
+The upstream subchart's own ingress is **always disabled** (`nominatim.ingress.enabled: false`).
 
 ## Environments
 
@@ -99,15 +99,6 @@ ArgoCD will layer the environment-specific values file on top of the defaults us
 
 ## Custom templates
 
-### Ingress (`templates/ingress.yaml`)
-
-Controlled by the `customIngress` values key. Supports:
-- AWS ALB annotations (certificate ARN, target type, health checks, etc.)
-- Multiple host rules via `customIngress.extraHosts`
-- Optional TLS with auto-generated secret names
-
-Enabled per environment by setting `customIngress.enabled: true`.
-
 ### NetworkPolicy (`templates/networkpolicy.yml`)
 
 Controlled by the `networkpolicy` values key. Creates a policy that:
@@ -139,7 +130,7 @@ This chart is based on the upstream nominatim chart **v5.2.0**, which has signif
 | `nominatimReplications.*` | `nominatim.updates.*` (CronJob-based) |
 | `nominatim.extraEnv` | `nominatim.extraEnvVars` |
 | Replication threads as a dedicated field | Inline in `nominatim.updates.args` |
-| Bundled ingress template | Custom `customIngress` template (upstream ingress disabled) |
+| Bundled ingress template | Custom ingress template (upstream ingress disabled) |
 
 ## Notes
 

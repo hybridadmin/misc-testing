@@ -14,22 +14,6 @@ env:
 networkpolicy:
   enabled: true
 
-customIngress:
-  enabled: true
-  hostname: geocode-ire.moya.app
-  tls: false
-  annotations:
-    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:eu-west-1:140714644961:certificate/f31c46df-3af6-4b3a-b2f8-cd3c72e10d2b"
-    alb.ingress.kubernetes.io/backend-protocol-version: HTTP1
-    alb.ingress.kubernetes.io/group.name: "alb-external"
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}, {"HTTPS":443}]'
-    alb.ingress.kubernetes.io/scheme: internet-facing
-    alb.ingress.kubernetes.io/target-type: ip
-    kubernetes.io/ingress.class: alb
-    alb.ingress.kubernetes.io/healthcheck-path: /
-    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
-  extraHosts: []
-
 # -- Upstream nominatim subchart overrides
 nominatim:
   ingress:
@@ -77,3 +61,42 @@ nominatim:
   extraEnvVars:
     - name: NOMINATIM_REPLICATION_MAX_DIFF
       value: "5000"
+
+  ingress:
+    enabled: true
+    hostname: geocode-ire.moya.app
+    tls: false
+    pathType: Prefix
+    annotations:
+      alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:eu-west-1:140714644961:certificate/f31c46df-3af6-4b3a-b2f8-cd3c72e10d2b"
+      alb.ingress.kubernetes.io/backend-protocol-version: HTTP1
+      alb.ingress.kubernetes.io/group.name: "alb-external"
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}, {"HTTPS":443}]'
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+      kubernetes.io/ingress.class: alb
+      alb.ingress.kubernetes.io/healthcheck-path: /
+      alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    extraHosts: []
+
+  networkPolicy:
+    enabled: true
+    # Generic "access only from" rules
+    ingressRules:
+      accessOnlyFrom:
+        enabled: true
+      # Arbitrary custom ingress rules (list of raw NetworkPolicy ingress rules)
+      customRules:
+        - from:
+            - ipBlock:
+                cidr: "10.141.0.0/20"
+            - ipBlock:
+                cidr: "10.141.16.0/20"
+            - ipBlock:
+                cidr: "10.141.32.0/20"
+            - namespaceSelector:
+                matchLabels:
+                  kubernetes.io/metadata.name: "geocoding-prodire"
+          ports:
+            - protocol: TCP
+              port: 8080

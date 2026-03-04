@@ -19,18 +19,6 @@ networkpolicy:
 #   prometheus:
 #     - 9090
 
-# -- Custom Ingress (our template, replaces upstream ingress)
-customIngress:
-  enabled: false
-  certManager: false
-  annotations: {}
-  hostname: nominatim.local
-  tls: false
-  # Extra host rules (e.g. geocode.moya.app)
-  extraHosts: []
-  #  - name: geocode.moya.app
-  #    path: /
-
 # ---------------------------------------------------------------
 # Upstream nominatim subchart values
 # ref: https://artifacthub.io/packages/helm/robjuz/nominatim
@@ -116,3 +104,23 @@ nominatim:
   nodeSelector: {}
   tolerations: []
   affinity: {}
+
+  networkPolicy:
+    egressRules:
+      customRules:
+        - to:
+            - ipBlock:
+                cidr: 0.0.0.0/0
+          ports:
+            - protocol: TCP
+              port: 443
+            - protocol: TCP
+              port: 80
+            - protocol: UDP
+              port: 53
+            - protocol: TCP
+              port: 5432
+
+  # Required by the template for the metrics guard on line 32
+  metrics:
+    enabled: true
