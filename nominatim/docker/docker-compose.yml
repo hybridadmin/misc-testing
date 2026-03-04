@@ -1,7 +1,8 @@
 services:
-  # ---------- External PostgreSQL 16 with PostGIS ----------
+  # ---------- External PostgreSQL 18 with PostGIS 3.6 ----------
   postgres:
-    image: postgis/postgis:16-3.4
+    image: postgis/postgis:18-3.6
+    platform: linux/amd64
     container_name: nominatim-postgres
     restart: unless-stopped
     environment:
@@ -9,7 +10,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nominatim_password}
       # Do NOT set POSTGRES_DB here. Nominatim's import creates the database itself.
     volumes:
-      - nominatim-pgdata:/var/lib/postgresql/data
+      - nominatim-pgdata:/var/lib/postgresql
       - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
     ports:
       - "${POSTGRES_PORT:-5432}:5432"

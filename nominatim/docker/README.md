@@ -1,13 +1,13 @@
-# Nominatim with External PostgreSQL 16
+# Nominatim with External PostgreSQL 18
 
-Docker Compose setup for [Nominatim 5.2](https://github.com/mediagis/nominatim-docker) using an **external PostgreSQL 16 + PostGIS** database instead of the bundled internal database.
+Docker Compose setup for [Nominatim 5.2](https://github.com/mediagis/nominatim-docker) using an **external PostgreSQL 18 + PostGIS 3.6** database instead of the bundled internal database.
 
 ## Architecture
 
 ```
 ┌─────────────────────┐      ┌──────────────────────────┐
 │  nominatim           │─────▶│  postgres                 │
-│  mediagis/nominatim  │      │  postgis/postgis:16-3.4   │
+│  mediagis/nominatim  │      │  postgis/postgis:18-3.6   │
 │  :5.2                │      │                            │
 │  Port 8080 (API)     │      │  Port 5432                 │
 └─────────────────────┘      └──────────────────────────┘
@@ -18,7 +18,7 @@ Docker Compose setup for [Nominatim 5.2](https://github.com/mediagis/nominatim-d
 ```
 
 - **Nominatim** handles the OSM data import, geocoding API (search, reverse, lookup), and replication updates. A custom `start.sh` replaces the image's default entrypoint to bypass the internal PostgreSQL management.
-- **PostgreSQL 16 + PostGIS 3.4** is the external database. Data persists in a named Docker volume (`nominatim-pgdata`).
+- **PostgreSQL 18 + PostGIS 3.6** is the external database. Data persists in a named Docker volume (`nominatim-pgdata`).
 - The two services communicate over an internal Docker bridge network (`nominatim-net`).
 
 ## Files
@@ -268,13 +268,13 @@ The import marker is stored at `/nominatim/import-finished` (inside the `nominat
 
 2. **First import only**: The import runs only once. On subsequent container starts, Nominatim detects the existing import marker and skips re-import.
 
-3. **PostGIS requirement**: PostgreSQL must have the PostGIS and hstore extensions. The `init-db.sql` script handles this automatically for the bundled `postgis/postgis:16-3.4` image.
+3. **PostGIS requirement**: PostgreSQL must have the PostGIS and hstore extensions. The `init-db.sql` script handles this automatically for the bundled `postgis/postgis:18-3.6` image.
 
 4. **www-data role**: Nominatim requires a `www-data` database role for web query access. The `start.sh` script ensures this role exists before import.
 
 5. **Do NOT set `POSTGRES_DB`**: The Nominatim import creates its own `nominatim` database. If it already exists, the import will fail.
 
-6. **ARM / Apple Silicon**: The `postgis/postgis:16-3.4` image is amd64-only and runs under emulation on ARM Macs. The default memory settings are conservative to avoid shared memory allocation failures under emulation.
+6. **ARM / Apple Silicon**: The `postgis/postgis:18-3.6` image is amd64-only and runs under emulation on ARM Macs. The default memory settings are conservative to avoid shared memory allocation failures under emulation.
 
 7. **Geofabrik rate limits**: Geofabrik limits download speeds. For planet-scale imports, use a [mirror](https://wiki.openstreetmap.org/wiki/Planet.osm#Planet.osm_mirrors).
 
