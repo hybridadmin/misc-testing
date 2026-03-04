@@ -1,0 +1,117 @@
+services:
+  # ---------- External PostgreSQL 16 with PostGIS ----------
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: nominatim-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-nominatim}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nominatim_password}
+      # Do NOT set POSTGRES_DB here. Nominatim's import creates the database itself.
+    volumes:
+      - nominatim-pgdata:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    shm_size: ${POSTGRES_SHM_SIZE:-512m}
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=${POSTGRES_SHARED_BUFFERS:-256MB}"
+      - "-c"
+      - "maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-256MB}"
+      - "-c"
+      - "autovacuum_work_mem=${POSTGRES_AUTOVACUUM_WORK_MEM:-128MB}"
+      - "-c"
+      - "work_mem=${POSTGRES_WORK_MEM:-32MB}"
+      - "-c"
+      - "effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-1GB}"
+      - "-c"
+      - "synchronous_commit=${POSTGRES_SYNCHRONOUS_COMMIT:-off}"
+      - "-c"
+      - "max_wal_size=${POSTGRES_MAX_WAL_SIZE:-1GB}"
+      - "-c"
+      - "checkpoint_timeout=${POSTGRES_CHECKPOINT_TIMEOUT:-10min}"
+      - "-c"
+      - "checkpoint_completion_target=${POSTGRES_CHECKPOINT_COMPLETION_TARGET:-0.9}"
+      - "-c"
+      - "max_connections=${POSTGRES_MAX_CONNECTIONS:-200}"
+      - "-c"
+      - "random_page_cost=1.0"
+      - "-c"
+      - "wal_level=minimal"
+      - "-c"
+      - "max_wal_senders=0"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nominatim}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - nominatim-net
+
+  # ---------- Nominatim ----------
+  nominatim:
+    image: mediagis/nominatim:5.2
+    container_name: nominatim
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/custom/start.sh"]
+    environment:
+      # --- Data source (choose one) ---
+      PBF_URL: ${PBF_URL:-https://download.geofabrik.de/europe/monaco-latest.osm.pbf}
+      REPLICATION_URL: ${REPLICATION_URL:-https://download.geofabrik.de/europe/monaco-updates/}
+
+      # --- External database connection ---
+      NOMINATIM_DATABASE_DSN: "pgsql:dbname=nominatim;host=postgres;user=${POSTGRES_USER:-nominatim};password=${POSTGRES_PASSWORD:-nominatim_password}"
+      NOMINATIM_PASSWORD: ${POSTGRES_PASSWORD:-nominatim_password}
+      POSTGRES_USER: ${POSTGRES_USER:-nominatim}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nominatim_password}
+      EXTERNAL_PG_HOST: postgres
+      EXTERNAL_PG_PORT: "5432"
+
+      # --- Replication / update ---
+      UPDATE_MODE: ${UPDATE_MODE:-none}
+      REPLICATION_UPDATE_INTERVAL: ${REPLICATION_UPDATE_INTERVAL:-86400}
+      REPLICATION_RECHECK_INTERVAL: ${REPLICATION_RECHECK_INTERVAL:-900}
+      FREEZE: ${FREEZE:-false}
+
+      # --- Import options ---
+      IMPORT_STYLE: ${IMPORT_STYLE:-full}
+      IMPORT_WIKIPEDIA: ${IMPORT_WIKIPEDIA:-false}
+      IMPORT_US_POSTCODES: ${IMPORT_US_POSTCODES:-false}
+      IMPORT_GB_POSTCODES: ${IMPORT_GB_POSTCODES:-false}
+      IMPORT_TIGER_ADDRESSES: ${IMPORT_TIGER_ADDRESSES:-false}
+      REVERSE_ONLY: ${REVERSE_ONLY:-false}
+      THREADS: ${THREADS:-4}
+
+      # --- API / runtime ---
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-4}
+      WARMUP_ON_STARTUP: ${WARMUP_ON_STARTUP:-false}
+    ports:
+      - "${NOMINATIM_PORT:-8080}:8080"
+    shm_size: ${NOMINATIM_SHM_SIZE:-1g}
+    volumes:
+      - ./start.sh:/custom/start.sh:ro
+      - nominatim-data:/nominatim
+      # Uncomment the line below ONLY for planet-scale imports.
+      # The flatnode file can grow to 50+ GB but significantly speeds up planet imports.
+      # For country/region extracts, leave this commented out.
+      # - nominatim-flatnode:/nominatim/flatnode
+    networks:
+      - nominatim-net
+
+volumes:
+  nominatim-pgdata:
+    driver: local
+  nominatim-data:
+    driver: local
+  # nominatim-flatnode:
+  #   driver: local
+
+networks:
+  nominatim-net:
+    driver: bridge
