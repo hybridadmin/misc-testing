@@ -1,0 +1,52 @@
+{{- if .Values.networkpolicy.enabled -}}
+kind: NetworkPolicy
+apiVersion: networking.k8s.io/v1
+metadata:
+  namespace: "{{ .Values.project }}-{{ .Values.env.name }}"
+  name: allow-from-{{ .Values.project }}-{{ .Values.env.name }}-api-{{ .Chart.Name }}-public
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Values.project }}-{{ .Values.env.name }}-api
+  ingress:
+  #allow from public subnet for ingress
+    - from:
+        - ipBlock:
+            cidr: "{{ .Values.cidr_range }}.0.0/20"
+        - ipBlock:
+            cidr: "{{ .Values.cidr_range }}.16.0/20"
+        - ipBlock:
+            cidr: "{{ .Values.cidr_range }}.32.0/20"
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: "{{ .Values.project }}-{{ .Values.env.name }}"
+      ports:
+        - protocol: TCP
+          port: {{ .Values.nominatim.service.ports.http }}
+  {{- if .Values.network }}
+  {{- if .Values.network.prometheus }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: "prometheus"
+      ports:
+        {{- range $vprom := .Values.network.prometheus }}
+        - protocol: TCP
+          port: {{ $vprom }}
+        {{- end }}
+  {{- end }}
+  {{- end }}
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 5432
+{{- end }}

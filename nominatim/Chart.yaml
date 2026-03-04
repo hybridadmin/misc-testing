@@ -1,0 +1,11 @@
+apiVersion: v2
+name: geocoding
+description: Umbrella chart wrapping nominatim with custom NetworkPolicy and Ingress
+type: application
+version: 1.0.0
+appVersion: "5.1.0"
+
+dependencies:
+  - name: nominatim
+    version: 5.2.0
+    repository: https://robjuz.github.io/helm-charts/

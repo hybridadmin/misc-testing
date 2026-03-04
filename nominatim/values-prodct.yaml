@@ -1,0 +1,81 @@
+# ---------------------------------------------------------------
+# values-prodct.yaml — Production Cape Town overrides
+# ---------------------------------------------------------------
+
+# -- Wrapper chart values (custom templates)
+project: "geocoding"
+account: "2222222222222"
+region: "af-south-1"
+cidr_range: "10.135"
+
+env:
+  name: "prodct"
+
+networkpolicy:
+  enabled: true
+
+customIngress:
+  enabled: true
+  hostname: geocode-cpt.moya.app
+  tls: false
+  annotations:
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:af-south-1:140714644961:certificate/08566bf3-4c2d-4ca3-aab9-25b8d7ffcb85"
+    alb.ingress.kubernetes.io/backend-protocol-version: HTTP1
+    alb.ingress.kubernetes.io/group.name: "alb-external"
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}, {"HTTPS":443}]'
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+  extraHosts:
+    - name: geocode.moya.app
+      path: /
+
+# -- Upstream nominatim subchart overrides
+nominatim:
+  ingress:
+    enabled: false
+
+  replicaCount: 1
+
+  service:
+    type: ClusterIP
+    ports:
+      http: 8080
+
+  postgresql:
+    enabled: false
+
+  externalDatabase:
+    existingSecretDsn: geocoding-prodct-dbcreds-secrets
+    host: geocoding-prodct-psql-primary.geocoding-prodct.svc
+    user: nominatim_user
+
+  initJob:
+    enabled: false
+    pbfUrl: https://download.geofabrik.de/africa/south-africa-latest.osm.pbf
+    wikipediaUrl: https://nominatim.org/data/wikimedia-importance.sql.gz
+
+  updates:
+    enabled: true
+    replicationUrl: https://download.geofabrik.de/africa/south-africa-updates/
+    args:
+      - |
+        NOMINATIM_REPLICATION_MAX_DIFF=5000 nominatim replication --catch-up --threads 8
+
+  nominatimUi:
+    enabled: false
+
+  serviceAccount:
+    create: true
+
+  flatnode:
+    enabled: false
+
+  autoscaling:
+    enabled: false
+
+  extraEnvVars:
+    - name: NOMINATIM_REPLICATION_MAX_DIFF
+      value: "5000"

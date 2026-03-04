@@ -1,0 +1,34 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: geocoding-prodct
+  namespace: argocd
+  # Optional: add to an ArgoCD project
+  # finalizers:
+  #   - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+
+  source:
+    # Point to the directory containing Chart.yaml in your repo
+    repoURL: https://github.com/<your-org>/moya-geocoding-api.git
+    targetRevision: main
+    path: chart                       # path to the umbrella chart in the repo
+
+    helm:
+      # Layer environment-specific values on top of defaults
+      valueFiles:
+        - values.yaml
+        - values-prodct.yaml
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: geocoding-prodct       # target namespace
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
