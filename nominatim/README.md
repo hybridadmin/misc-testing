@@ -1,6 +1,6 @@
 # Geocoding Helm Chart
 
-Umbrella (wrapper) Helm chart that deploys [Nominatim](https://nominatim.org/) using the upstream [robjuz/nominatim](https://artifacthub.io/packages/helm/robjuz/nominatim) chart (v5.2.0) as a subchart dependency, with custom **NetworkPolicy** and **Ingress** templates managed locally.
+Umbrella (wrapper) Helm chart that deploys [Nominatim](https://nominatim.org/) using the upstream [robjuz/nominatim](https://artifacthub.io/packages/helm/robjuz/nominatim) chart (v5.2.0) as a subchart dependency. Ingress and NetworkPolicy are handled by the subchart's built-in templates.
 
 Designed for deployment via **ArgoCD** as a single application per environment.
 
@@ -13,9 +13,7 @@ Designed for deployment via **ArgoCD** as a single application per environment.
 ├── charts/
 │   └── nominatim-5.2.0.tgz   # Downloaded subchart
 ├── templates/
-│   ├── _helpers.tpl           # Template helpers (chart.nominatim.fullname, chart.namespace)
-│   ├── ingress.yaml           # Custom Ingress (AWS ALB)
-│   └── networkpolicy.yml      # Custom NetworkPolicy
+│   └── _helpers.tpl           # Template helpers (chart.nominatim.fullname, chart.namespace)
 ├── values.yaml                # Default values
 ├── values-prodct.yaml         # Production Cape Town (af-south-1)
 ├── values-prodire.yaml        # Production Ireland (eu-west-1)
@@ -27,14 +25,20 @@ Designed for deployment via **ArgoCD** as a single application per environment.
 
 ## How values are organized
 
-Values are split into two scopes:
+All configuration is passed to the upstream subchart under the `nominatim.*` key. A small number of top-level keys (`project`, `env`, `cidr_range`) are retained for metadata purposes.
 
 | Scope | Keys | Purpose |
 |-------|------|---------|
-| **Wrapper chart** (top-level) | `project`, `env`, `cidr_range`, `networkpolicy`, `network` | Drive the custom NetworkPolicy and Ingress templates |
-| **Upstream subchart** | `nominatim.*` | Passed directly to the `robjuz/nominatim` subchart |
+| **Wrapper chart** (top-level) | `project`, `env`, `cidr_range` | Environment metadata |
+| **Upstream subchart** | `nominatim.*` | Passed directly to the `robjuz/nominatim` subchart (ingress, networkPolicy, etc.) |
 
-The upstream subchart's own ingress is **always disabled** (`nominatim.ingress.enabled: false`).
+### Ingress
+
+Configured per environment via `nominatim.ingress.*`. Each environment values file sets the hostname, ALB annotations, and optional extra hosts. The subchart renders the Ingress resource directly.
+
+### NetworkPolicy
+
+Configured via `nominatim.networkPolicy.*`. Common egress rules (ports 443, 80, 53, 5432) are defined in the base `values.yaml`. Each environment values file adds ingress `customRules` scoped to its CIDR range and namespace.
 
 ## Environments
 
@@ -97,26 +101,13 @@ kubectl apply -f argocd/application.yaml
 
 ArgoCD will layer the environment-specific values file on top of the defaults using the `valueFiles` list in the Helm source configuration.
 
-## Custom templates
-
-### NetworkPolicy (`templates/networkpolicy.yml`)
-
-Controlled by the `networkpolicy` values key. Creates a policy that:
-- Allows ingress from three `/20` public subnets derived from `cidr_range`
-- Allows ingress from the same namespace
-- Allows ingress on the service port (`nominatim.service.ports.http`)
-- Optionally allows Prometheus scraping (`network.prometheus` port list)
-- Allows egress to ports 443, 80, 53 (DNS), and 5432 (PostgreSQL)
-
-Enabled per environment by setting `networkpolicy.enabled: true`.
-
 ## Template helpers
 
 Defined in `templates/_helpers.tpl`:
 
 | Helper | Purpose |
 |--------|---------|
-| `chart.nominatim.fullname` | Computes the fullname for subchart resources, matching the upstream naming logic. Used by the Ingress to point its backend at the correct Service. |
+| `chart.nominatim.fullname` | Computes the fullname for subchart resources, matching the upstream naming logic. |
 | `chart.namespace` | Returns the release namespace (or `namespaceOverride` if set). |
 
 ## Key differences from the old v3.x chart
@@ -130,10 +121,9 @@ This chart is based on the upstream nominatim chart **v5.2.0**, which has signif
 | `nominatimReplications.*` | `nominatim.updates.*` (CronJob-based) |
 | `nominatim.extraEnv` | `nominatim.extraEnvVars` |
 | Replication threads as a dedicated field | Inline in `nominatim.updates.args` |
-| Bundled ingress template | Custom ingress template (upstream ingress disabled) |
+| Custom wrapper ingress/networkpolicy templates | Subchart built-in ingress and networkPolicy |
 
 ## Notes
 
 - Do **not** set `nominatim.image.tag: ""` — this causes a render error. Omit the `tag` key entirely to use the subchart's default (`appVersion: 5.1.0`).
 - The subchart uses [bitnami/common](https://github.com/bitnami/charts/tree/main/bitnami/common) v2.21.0 for its templates.
-- LSP warnings on `.yaml` template files containing Go template syntax (`{{ }}`) are expected and harmless.
