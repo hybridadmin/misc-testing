@@ -222,9 +222,9 @@ services:
       - "-c"
       - "log_checkpoints=on"
       - "-c"
-      - "log_connections=on"
+      - "log_connections=off"
       - "-c"
-      - "log_disconnections=on"
+      - "log_disconnections=off"
       - "-c"
       - "log_lock_waits=on"
       # -- Locale ---------------------------------------------------------------
