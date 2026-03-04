@@ -1,0 +1,8 @@
+# Secrets - NEVER commit
+.env
+
+# Runtime data (if using bind mounts instead of named volumes)
+forgejo/
+postgres/
+valkey/
+backups/
