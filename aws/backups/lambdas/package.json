@@ -1,0 +1,27 @@
+{
+  "name": "backup-lambdas",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc && npm run package",
+    "package": "cd dist && zip -r ../lambda.zip . && cd .."
+  },
+  "dependencies": {
+    "@aws-sdk/client-backup": "^3.379.1",
+    "@aws-sdk/client-codebuild": "^3.363.0",
+    "@aws-sdk/client-ec2": "^3.367.0",
+    "@aws-sdk/client-ecr": "^3.363.0",
+    "@aws-sdk/client-route-53": "^3.363.0",
+    "@aws-sdk/client-s3": "^3.367.0",
+    "@aws-sdk/client-sns": "^3.363.0",
+    "@aws-sdk/client-sqs": "^3.363.0",
+    "@aws-sdk/client-sts": "^3.363.0",
+    "source-map-support": "^0.5.21"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.119",
+    "@types/node": "20.4.1",
+    "@types/source-map-support": "^0.5.6",
+    "typescript": "~5.1.6"
+  }
+}
