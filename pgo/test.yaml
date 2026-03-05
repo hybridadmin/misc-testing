@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: test-pvc-direct
+  namespace: reference-systest
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 500Gi
+  volumeName: pvc-e7e2cf52-f0d8-4151-aaf5-6acd1bf9186a
+#  storageClassName: ""
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pv-test-pod
+  namespace: reference-systest
+  labels:
+    app: pv-test
+spec:
+  containers:
+    - name: test
+      image: busybox:latest
+      command: ["sleep", "infinity"]
+      volumeMounts:
+        - name: test-vol
+          mountPath: /data
+  volumes:
+    - name: test-vol
+      persistentVolumeClaim:
+        claimName: test-pvc-direct
