@@ -1,0 +1,178 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rapidpro-systest-psql2-restore-pvc
+  namespace: rapidpro-systest
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  volumeName: pvc-e7e2cf52-f0d8-4151-aaf5-6acd1bf9186a
+---
+apiVersion: postgres-operator.crunchydata.com/v1beta1
+kind: PostgresCluster
+metadata:
+  name: rapidpro-systest-psql2
+  namespace: rapidpro-systest
+spec:
+  # https://www.crunchydata.com/developers/download-postgres/containers/
+  image: "registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi9-16.11-2550"
+  postgresVersion: 16
+  instances:
+    - dataVolumeClaimSpec:
+        accessModes:
+          - 'ReadWriteOnce'
+        resources:
+          requests:
+            storage: 5Gi
+
+      minAvailable: 1
+      name: pgha1
+      replicas: 1
+      resources:
+        limits:
+          cpu: "1"
+          memory: 1Gi
+        requests:
+          cpu: 10m
+          memory: 256Mi
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: eks.amazonaws.com/compute-type
+                operator: NotIn
+                values:
+                - hybrid
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  postgres-operator.crunchydata.com/cluster: rapidpro-systest-psq2
+                  postgres-operator.crunchydata.com/instance-set: pgha1
+              topologyKey: kubernetes.io/hostname
+            weight: 1
+
+  disableDefaultPodScheduling: true
+
+  dataSource:
+    volumes:
+      pgDataVolume:
+        pvcName: rapidpro-systest-psql2-restore-pvc
+        directory: /pgdata/pg16
+
+#  backups:
+#    pgbackrest:
+#      global:
+#        repo2-path: "/pgbackrest/rapidpro-systest-psql2/repo2"
+#        repo2-s3-key-type: web-id
+#        spool-path: "/pgdata/backups"
+#        repo2-retention-full: "14"
+#        repo2-retention-full-type: time
+#      manual:
+#        repoName: repo2
+#        options:
+#          - --type=full
+#      repos:
+#        - name: repo2
+#          s3:
+#            bucket: postgres-operator-systest-backups-597684347793
+#            endpoint: s3.eu-west-1.amazonaws.com
+#            region: eu-west-1
+
+  metadata:
+    annotations:
+      eks.amazonaws.com/role-arn: "arn:aws:iam::597684347793:role/RAPIDPRO-SYSTEST-PSQL-EKS-EKSServiceIamRole"
+
+  instrumentation:
+    config:
+      detectors:
+      - name: env
+      environmentVariables:
+      - name: OTEL_RESOURCE_ATTRIBUTES
+        value: service.name=RAPIDPRO-SYSTEST-PSQL2,service.namespace=rapidpro-systest,deployment.environment=ATLAS-SYSTEST
+      exporters:
+        otlp:
+          endpoint: http://otel-collector-daemonset-collector.otel-collector.svc.cluster.local:4317
+          tls:
+            insecure: true
+    logs:
+      exporters:
+      - otlp
+      retentionPeriod: 7d
+    metrics:
+      exporters:
+      - otlp
+
+  patroni:
+    dynamicConfiguration:
+      failsafe_mode: true
+      postgresql:
+        parameters:
+          compute_query_id: true
+          effective_cache_size: 1024MB
+          effective_io_concurrency: 16
+          log_autovacuum_min_duration: 0
+          log_destination: stderr
+          log_min_duration_statement: 1000
+          logging_collector: "off"
+          maintenance_work_mem: 52428
+          max_connections: 2000
+          max_parallel_workers: 3
+          max_parallel_workers_per_gather: 2
+          max_wal_size: 10GB
+          max_worker_processes: 4
+          min_wal_size: 1GB
+          pg_stat_statements.max: 10000
+          pg_stat_statements.track: top
+          random_page_cost: 4
+          shared_buffers: 256MB
+          synchronous_commit: "on"
+          track_commit_timestamp: true
+          track_io_timing: true
+          vacuum_cost_page: 5
+          wal_buffers: 64MB
+          wal_compression: "on"
+          wal_keep_size: 2048
+          wal_level: logical
+          wal_log_hints: "on"
+          wal_segment_size: 64MB
+          work_mem: 52428
+      synchronous_mode: true
+    leaderLeaseDurationSeconds: 30
+    port: 8008
+    switchover:
+      enabled: true
+      type: Switchover
+    syncPeriodSeconds: 10
+
+  service:
+    type: NodePort
+  shutdown: false
+  users:
+  - name: admin
+    options: SUPERUSER
+    password:
+      type: AlphaNumeric
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  labels:
+    moyamonitor: prometheus
+  name: rapidpro-systest-psql2-podmonitor
+  namespace: rapidpro-systest
+spec:
+  podMetricsEndpoints:
+  - interval: 15s
+    port: otel-metrics
+  selector:
+    matchLabels:
+      postgres-operator.crunchydata.com/crunchy-otel-collector: "true"
+      postgres-operator.crunchydata.com/cluster: rapidpro-systest-psql2
