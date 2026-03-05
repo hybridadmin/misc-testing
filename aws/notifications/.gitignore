@@ -1,0 +1,20 @@
+# Terraform / OpenTofu
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+
+# Terragrunt
+.terragrunt-cache/
+
+# Build artifacts
+build/
+
+# Lambda zip packages
+*.zip
+
+# OS files
+.DS_Store
+
+# Ruff cache
+.ruff_cache/
