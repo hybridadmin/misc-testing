@@ -4,6 +4,8 @@ kind: PersistentVolumeClaim
 metadata:
   name: rapidpro-systest-psql2-restore-pvc
   namespace: rapidpro-systest
+  labels:
+    step: prep
 spec:
   accessModes:
     - ReadWriteOnce
@@ -12,7 +14,79 @@ spec:
       storage: 50Gi
   volumeName: pvc-e7e2cf52-f0d8-4151-aaf5-6acd1bf9186a
 ---
-apiVersion: postgres-operator.crunchydata.com/v1beta1
+# Apply the PVC and this Job first, wait for completion, then apply the PostgresCluster.
+# kubectl apply -f this-file.yaml -l step=prep
+# kubectl wait --for=condition=complete job/fix-pg-wal -n rapidpro-systest --timeout=120s
+# kubectl apply -f this-file.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fix-pg-wal
+  namespace: rapidpro-systest
+  labels:
+    step: prep
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 26
+        runAsGroup: 26
+        fsGroup: 26
+      containers:
+        - name: fix-pg-wal
+          image: "registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi9-16.11-2550"
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              PGDATA="/pgdata/pg16"
+              WAL_DIR="/pgdata/pg16_wal"
+
+              # Fix pg_wal inside PGDATA (symlink or missing)
+              echo "Checking pg_wal at ${PGDATA}/pg_wal ..."
+              if [ -L "${PGDATA}/pg_wal" ]; then
+                echo "pg_wal is a symlink ($(readlink "${PGDATA}/pg_wal" 2>/dev/null || echo 'dangling')), removing and creating real directory"
+                rm -f "${PGDATA}/pg_wal"
+                mkdir -p "${PGDATA}/pg_wal"
+                echo "Created real pg_wal directory"
+              elif [ ! -d "${PGDATA}/pg_wal" ]; then
+                echo "pg_wal does not exist, creating directory"
+                mkdir -p "${PGDATA}/pg_wal"
+              else
+                echo "pg_wal is already a real directory"
+              fi
+
+              # Remove stale pg16_wal directory from original cluster layout.
+              # The startup script does: mv /pgdata/pg16/pg_wal /pgdata/pg16_wal
+              # This fails if /pgdata/pg16_wal already exists from the source volume.
+              # Merge any restored WAL files into pg_wal first so they are preserved
+              # for recovery, then remove the directory so the mv can succeed.
+              if [ -d "${WAL_DIR}" ]; then
+                echo "Merging WAL files from ${WAL_DIR} into ${PGDATA}/pg_wal ..."
+                cp -a --no-clobber "${WAL_DIR}/"* "${PGDATA}/pg_wal/" 2>/dev/null || true
+                echo "Merged $(ls "${PGDATA}/pg_wal/" | wc -l) WAL files"
+                rm -rf "${WAL_DIR}"
+                echo "Removed ${WAL_DIR}"
+              elif [ -L "${WAL_DIR}" ]; then
+                echo "Removing dangling symlink ${WAL_DIR}"
+                rm -f "${WAL_DIR}"
+              fi
+
+              ls -la "${PGDATA}/pg_wal"
+              echo "Done."
+          volumeMounts:
+            - name: pgdata
+              mountPath: /pgdata
+      volumes:
+        - name: pgdata
+          persistentVolumeClaim:
+            claimName: rapidpro-systest-psql2-restore-pvc
+---
+apiVersion: postgres-operator.crunchydata.com/v1
 kind: PostgresCluster
 metadata:
   name: rapidpro-systest-psql2
@@ -27,7 +101,7 @@ spec:
           - 'ReadWriteOnce'
         resources:
           requests:
-            storage: 5Gi
+            storage: 500Gi
 
       minAvailable: 1
       name: pgha1
@@ -65,7 +139,7 @@ spec:
     volumes:
       pgDataVolume:
         pvcName: rapidpro-systest-psql2-restore-pvc
-        directory: /pgdata/pg16
+#        directory: /pgdata/pg16
 
 #  backups:
 #    pgbackrest:
