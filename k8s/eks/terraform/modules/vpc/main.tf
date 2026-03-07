@@ -16,6 +16,10 @@ resource "aws_vpc" "this" {
   tags = merge(var.tags, {
     Name = "${var.name}-vpc"
   })
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -28,6 +32,10 @@ resource "aws_internet_gateway" "this" {
   tags = merge(var.tags, {
     Name = "${var.name}-igw"
   })
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -48,6 +56,10 @@ resource "aws_subnet" "public" {
     "kubernetes.io/role/elb"                      = "1"
     "kubernetes.io/cluster/${var.cluster_name}"    = "shared"
   })
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -67,6 +79,10 @@ resource "aws_subnet" "private" {
     "kubernetes.io/role/internal-elb"             = "1"
     "kubernetes.io/cluster/${var.cluster_name}"    = "shared"
   })
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -82,6 +98,10 @@ resource "aws_eip" "nat" {
   })
 
   depends_on = [aws_internet_gateway.this]
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -100,6 +120,10 @@ resource "aws_nat_gateway" "this" {
   })
 
   depends_on = [aws_internet_gateway.this]
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -177,6 +201,10 @@ resource "aws_cloudwatch_log_group" "flow_log" {
   retention_in_days = var.flow_log_retention_days
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_role" "flow_log" {
@@ -194,6 +222,10 @@ resource "aws_iam_role" "flow_log" {
   })
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_role_policy" "flow_log" {

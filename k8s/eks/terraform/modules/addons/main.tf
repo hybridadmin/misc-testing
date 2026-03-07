@@ -52,6 +52,10 @@ resource "aws_iam_role" "lb_controller" {
   assume_role_policy = data.aws_iam_policy_document.lb_controller_assume[0].json
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_policy" "lb_controller" {
@@ -62,6 +66,10 @@ resource "aws_iam_policy" "lb_controller" {
   policy      = file("${path.module}/policies/alb-controller-policy.json")
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "lb_controller" {
@@ -163,6 +171,10 @@ resource "aws_iam_role" "cluster_autoscaler" {
   assume_role_policy = data.aws_iam_policy_document.cluster_autoscaler_assume[0].json
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_policy" "cluster_autoscaler" {
@@ -208,6 +220,10 @@ resource "aws_iam_policy" "cluster_autoscaler" {
   })
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "cluster_autoscaler" {
@@ -344,6 +360,10 @@ resource "aws_iam_role" "s3_csi" {
   assume_role_policy = data.aws_iam_policy_document.s3_csi_assume[0].json
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_policy" "s3_csi" {
@@ -378,6 +398,10 @@ resource "aws_iam_policy" "s3_csi" {
   })
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "s3_csi" {
@@ -458,6 +482,10 @@ resource "aws_iam_role" "efs_csi" {
   assume_role_policy = data.aws_iam_policy_document.efs_csi_assume[0].json
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_policy" "efs_csi" {
@@ -519,6 +547,10 @@ resource "aws_iam_policy" "efs_csi" {
   })
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "efs_csi" {
@@ -602,6 +634,10 @@ resource "aws_iam_role" "secrets_store" {
   assume_role_policy = data.aws_iam_policy_document.secrets_store_assume[0].json
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_policy" "secrets_store" {
@@ -633,6 +669,10 @@ resource "aws_iam_policy" "secrets_store" {
   })
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "secrets_store" {

@@ -32,6 +32,10 @@ resource "aws_iam_role" "cluster" {
   })
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "cluster_policy" {
@@ -59,6 +63,7 @@ resource "aws_security_group" "cluster" {
 
   lifecycle {
     create_before_destroy = true
+    prevent_destroy       = true
   }
 }
 
@@ -81,6 +86,10 @@ resource "aws_cloudwatch_log_group" "cluster" {
   retention_in_days = var.cluster_log_retention_days
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -116,6 +125,10 @@ resource "aws_eks_cluster" "this" {
   ]
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -124,10 +137,14 @@ resource "aws_eks_cluster" "this" {
 
 resource "aws_kms_key" "cluster" {
   description             = "KMS key for EKS cluster ${local.cluster_name} secret encryption"
-  deletion_window_in_days = 7
+  deletion_window_in_days = 30
   enable_key_rotation     = true
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_kms_alias" "cluster" {
@@ -149,6 +166,10 @@ resource "aws_iam_openid_connect_provider" "cluster" {
   url             = aws_eks_cluster.this.identity[0].oidc[0].issuer
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # -----------------------------------------------------------------------------
@@ -170,6 +191,10 @@ resource "aws_iam_role" "node_group" {
   })
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "node_worker" {
@@ -208,6 +233,7 @@ resource "aws_security_group" "node" {
 
   lifecycle {
     create_before_destroy = true
+    prevent_destroy       = true
   }
 }
 
@@ -306,7 +332,8 @@ resource "aws_eks_node_group" "this" {
   ]
 
   lifecycle {
-    ignore_changes = [scaling_config[0].desired_size]
+    ignore_changes  = [scaling_config[0].desired_size]
+    prevent_destroy = true
   }
 }
 
@@ -384,6 +411,10 @@ resource "aws_iam_role" "ebs_csi" {
   assume_role_policy = data.aws_iam_policy_document.ebs_csi_assume[0].json
 
   tags = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "ebs_csi" {
