@@ -1,0 +1,63 @@
+---
+# =============================================================================
+# Longhorn role - Distributed block storage for Kubernetes
+# Provides persistent volumes replicated across worker nodes.
+# Prerequisites: open-iscsi (installed by common role)
+# =============================================================================
+
+- name: Enable and start iscsid
+  ansible.builtin.systemd:
+    name: iscsid
+    state: started
+    enabled: true
+  delegate_to: "{{ item }}"
+  loop: "{{ groups['k8s_cluster'] }}"
+
+- name: Add Longhorn Helm repo
+  ansible.builtin.command: helm repo add longhorn https://charts.longhorn.io
+  register: helm_repo
+  changed_when: "'has been added' in helm_repo.stdout"
+  failed_when:
+    - helm_repo.rc != 0
+    - "'already exists' not in helm_repo.stderr"
+
+- name: Update Helm repos
+  ansible.builtin.command: helm repo update
+  changed_when: false
+
+- name: Create longhorn-system namespace
+  ansible.builtin.command: kubectl create namespace longhorn-system
+  register: ns_result
+  changed_when: ns_result.rc == 0
+  failed_when:
+    - ns_result.rc != 0
+    - "'already exists' not in ns_result.stderr"
+
+- name: Render Longhorn values
+  ansible.builtin.template:
+    src: values.yml.j2
+    dest: /tmp/longhorn-values.yml
+    mode: "0644"
+
+- name: Install Longhorn via Helm
+  ansible.builtin.command: >
+    helm upgrade --install longhorn longhorn/longhorn
+    --namespace longhorn-system
+    --version {{ longhorn_version }}
+    --values /tmp/longhorn-values.yml
+    --wait
+    --timeout 10m
+  register: longhorn_install
+  changed_when: "'has been upgraded' in longhorn_install.stdout or 'has been installed' in longhorn_install.stdout"
+
+- name: Remove temporary values file
+  ansible.builtin.file:
+    path: /tmp/longhorn-values.yml
+    state: absent
+
+- name: Wait for Longhorn manager to be ready
+  ansible.builtin.command: >
+    kubectl -n longhorn-system wait --for=condition=Ready pod
+    -l app=longhorn-manager
+    --timeout=300s
+  changed_when: false

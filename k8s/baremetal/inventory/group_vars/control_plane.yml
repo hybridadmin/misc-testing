@@ -1,0 +1,3 @@
+---
+# Control plane specific vars
+node_role: control-plane

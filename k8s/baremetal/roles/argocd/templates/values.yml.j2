@@ -1,0 +1,106 @@
+---
+# =============================================================================
+# ArgoCD Helm values - Production settings
+# =============================================================================
+
+# HA mode disabled for small clusters (enable for 3+ CP nodes)
+global:
+  image:
+    tag: ""    # Use chart default
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+server:
+  replicas: 1
+
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+
+  # Ingress (optional - uncomment and configure domain)
+  # ingress:
+  #   enabled: true
+  #   ingressClassName: nginx
+  #   annotations:
+  #     cert-manager.io/cluster-issuer: letsencrypt-production
+  #     nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+  #     nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+  #   hosts:
+  #     - argocd.example.com
+  #   tls:
+  #     - secretName: argocd-server-tls
+  #       hosts:
+  #         - argocd.example.com
+
+  # Extra args
+  extraArgs:
+    - --insecure    # Terminate TLS at ingress level
+
+# ---------------------------------------------------------------------------
+# Repo Server
+# ---------------------------------------------------------------------------
+repoServer:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+# ---------------------------------------------------------------------------
+# Application Controller
+# ---------------------------------------------------------------------------
+controller:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: false    # Enable if kube-prometheus-stack is installed
+
+# ---------------------------------------------------------------------------
+# Redis
+# ---------------------------------------------------------------------------
+redis:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+# ---------------------------------------------------------------------------
+# ApplicationSet Controller
+# ---------------------------------------------------------------------------
+applicationSet:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 128Mi
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+configs:
+  params:
+    # Timeout for application sync
+    timeout.reconciliation: 180s
+  cm:
+    # Enable status badge
+    statusbadge.enabled: "true"
+    # Resource tracking method
+    application.resourceTrackingMethod: annotation

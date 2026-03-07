@@ -1,0 +1,172 @@
+---
+# =============================================================================
+# Kubeadm Control Plane role
+# Installs kubeadm/kubelet/kubectl, initialises the control plane,
+# and fetches the join command for workers.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Install kubeadm, kubelet, kubectl
+# ---------------------------------------------------------------------------
+- name: Add Kubernetes apt GPG key
+  ansible.builtin.get_url:
+    url: "https://pkgs.k8s.io/core:/stable:/v{{ kube_version }}/deb/Release.key"
+    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+    mode: "0644"
+
+- name: Add Kubernetes apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc]
+      https://pkgs.k8s.io/core:/stable:/v{{ kube_version }}/deb/ /
+    filename: kubernetes
+    state: present
+
+- name: Install kubeadm, kubelet, kubectl
+  ansible.builtin.apt:
+    name:
+      - "kubeadm={{ kube_package_version }}"
+      - "kubelet={{ kube_package_version }}"
+      - "kubectl={{ kube_package_version }}"
+    state: present
+    update_cache: true
+
+- name: Hold Kubernetes packages at current version
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubeadm
+    - kubelet
+    - kubectl
+
+- name: Enable kubelet service (it will wait for kubeadm init)
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: true
+
+# ---------------------------------------------------------------------------
+# Kubeadm init
+# ---------------------------------------------------------------------------
+- name: Check if cluster is already initialised
+  ansible.builtin.stat:
+    path: /etc/kubernetes/admin.conf
+  register: kubeadm_already_init
+
+- name: Render kubeadm config
+  ansible.builtin.template:
+    src: kubeadm-config.yml.j2
+    dest: /tmp/kubeadm-config.yml
+    mode: "0600"
+  when: not kubeadm_already_init.stat.exists
+
+- name: Initialise Kubernetes control plane
+  ansible.builtin.command: >
+    kubeadm init
+    --config /tmp/kubeadm-config.yml
+    --upload-certs
+  register: kubeadm_init
+  when: not kubeadm_already_init.stat.exists
+  changed_when: kubeadm_init.rc == 0
+
+- name: Remove kubeadm config from /tmp
+  ansible.builtin.file:
+    path: /tmp/kubeadm-config.yml
+    state: absent
+
+# ---------------------------------------------------------------------------
+# Set up kubeconfig for the ansible user and root
+# ---------------------------------------------------------------------------
+- name: Create .kube directory for user
+  ansible.builtin.file:
+    path: "/home/{{ ansible_user }}/.kube"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0700"
+
+- name: Copy admin kubeconfig for user
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: "/home/{{ ansible_user }}/.kube/config"
+    remote_src: true
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0600"
+
+- name: Create .kube directory for root
+  ansible.builtin.file:
+    path: /root/.kube
+    state: directory
+    mode: "0700"
+
+- name: Copy admin kubeconfig for root
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: /root/.kube/config
+    remote_src: true
+    mode: "0600"
+
+# ---------------------------------------------------------------------------
+# Generate join command for workers
+# ---------------------------------------------------------------------------
+- name: Generate join command
+  ansible.builtin.command: kubeadm token create --print-join-command
+  register: join_command_raw
+  changed_when: false
+
+- name: Store join command as fact
+  ansible.builtin.set_fact:
+    kubeadm_join_command: "{{ join_command_raw.stdout }}"
+
+# ---------------------------------------------------------------------------
+# Install Helm (needed for addon deployments)
+# ---------------------------------------------------------------------------
+- name: Check if Helm is installed
+  ansible.builtin.command: helm version --short
+  register: helm_check
+  changed_when: false
+  failed_when: false
+
+- name: Download Helm install script
+  ansible.builtin.get_url:
+    url: https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+    dest: /tmp/get_helm.sh
+    mode: "0700"
+  when: helm_check.rc != 0
+
+- name: Install Helm
+  ansible.builtin.command: /tmp/get_helm.sh --version "v{{ helm_version }}"
+  environment:
+    DESIRED_VERSION: "v{{ helm_version }}"
+  when: helm_check.rc != 0
+  changed_when: true
+
+- name: Remove Helm install script
+  ansible.builtin.file:
+    path: /tmp/get_helm.sh
+    state: absent
+
+# ---------------------------------------------------------------------------
+# Enable kubectl bash completion
+# ---------------------------------------------------------------------------
+- name: Enable kubectl bash completion
+  ansible.builtin.shell: kubectl completion bash > /etc/bash_completion.d/kubectl
+  changed_when: false
+
+- name: Enable helm bash completion
+  ansible.builtin.shell: helm completion bash > /etc/bash_completion.d/helm
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# Wait for control plane to be ready
+# ---------------------------------------------------------------------------
+- name: Wait for control plane node to be Ready
+  ansible.builtin.command: kubectl get nodes --no-headers
+  register: node_status
+  until: "'NotReady' not in node_status.stdout"
+  retries: 30
+  delay: 10
+  changed_when: false
+  # Node won't be Ready until CNI is installed, so we just verify the API works
+  failed_when: node_status.rc != 0

@@ -1,0 +1,65 @@
+---
+# =============================================================================
+# MetalLB role - Bare-metal LoadBalancer implementation
+# Uses L2 advertisement mode (ARP-based, works on any L2 network).
+# =============================================================================
+
+- name: Add MetalLB Helm repo
+  ansible.builtin.command: helm repo add metallb https://metallb.github.io/metallb
+  register: helm_repo
+  changed_when: "'has been added' in helm_repo.stdout"
+  failed_when:
+    - helm_repo.rc != 0
+    - "'already exists' not in helm_repo.stderr"
+
+- name: Update Helm repos
+  ansible.builtin.command: helm repo update
+  changed_when: false
+
+- name: Create metallb-system namespace
+  ansible.builtin.command: kubectl create namespace metallb-system
+  register: ns_result
+  changed_when: ns_result.rc == 0
+  failed_when:
+    - ns_result.rc != 0
+    - "'already exists' not in ns_result.stderr"
+
+- name: Install MetalLB via Helm
+  ansible.builtin.command: >
+    helm upgrade --install metallb metallb/metallb
+    --namespace metallb-system
+    --version {{ metallb_version }}
+    --wait
+    --timeout 5m
+  register: metallb_install
+  changed_when: "'has been upgraded' in metallb_install.stdout or 'has been installed' in metallb_install.stdout"
+
+- name: Wait for MetalLB controller to be ready
+  ansible.builtin.command: >
+    kubectl -n metallb-system wait --for=condition=Ready pod
+    -l app.kubernetes.io/component=controller
+    --timeout=120s
+  changed_when: false
+
+- name: Wait for MetalLB speaker to be ready
+  ansible.builtin.command: >
+    kubectl -n metallb-system wait --for=condition=Ready pod
+    -l app.kubernetes.io/component=speaker
+    --timeout=120s
+  changed_when: false
+
+- name: Render MetalLB IP address pool config
+  ansible.builtin.template:
+    src: metallb-config.yml.j2
+    dest: /tmp/metallb-config.yml
+    mode: "0644"
+
+- name: Apply MetalLB IP address pool and L2 advertisement
+  ansible.builtin.command: kubectl apply -f /tmp/metallb-config.yml
+  register: metallb_config
+  changed_when: "'configured' in metallb_config.stdout or 'created' in metallb_config.stdout"
+
+- name: Remove temporary MetalLB config
+  ansible.builtin.file:
+    path: /tmp/metallb-config.yml
+    state: absent

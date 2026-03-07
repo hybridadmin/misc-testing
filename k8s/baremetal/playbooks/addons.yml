@@ -1,0 +1,48 @@
+---
+# =============================================================================
+# addons.yml - Deploy only the addon layer (skip k8s bootstrap)
+# =============================================================================
+# Use this when the cluster is already running and you want to
+# add/reconfigure addons without touching the base cluster.
+#
+# Usage:
+#   ansible-playbook playbooks/addons.yml
+#   ansible-playbook playbooks/addons.yml --tags "monitoring"
+#   ansible-playbook playbooks/addons.yml --tags "metallb,ingress"
+# =============================================================================
+
+- name: "Deploy cluster addons"
+  hosts: control_plane
+  become: true
+
+  pre_tasks:
+    - name: Verify cluster is accessible
+      ansible.builtin.command: kubectl cluster-info
+      register: cluster_info
+      changed_when: false
+      failed_when: cluster_info.rc != 0
+
+    - name: Verify all nodes are Ready
+      ansible.builtin.shell: >
+        kubectl get nodes --no-headers | grep -c ' Ready '
+      register: ready_count
+      changed_when: false
+      failed_when: ready_count.stdout | int < 1
+
+    - name: Display cluster status
+      ansible.builtin.debug:
+        msg: "Cluster has {{ ready_count.stdout }} Ready node(s). Proceeding with addon deployment."
+
+  roles:
+    - role: metallb
+      tags: [metallb]
+    - role: ingress-nginx
+      tags: [ingress]
+    - role: longhorn
+      tags: [longhorn, storage]
+    - role: cert-manager
+      tags: [cert-manager, certs]
+    - role: monitoring
+      tags: [monitoring]
+    - role: argocd
+      tags: [argocd, gitops]

@@ -1,0 +1,80 @@
+---
+# =============================================================================
+# Global Variables - Shared across all roles
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Kubernetes version
+# Pin to a specific minor version. Patch versions are resolved automatically.
+# https://kubernetes.io/releases/
+# -----------------------------------------------------------------------------
+kube_version: "1.31"
+kube_package_version: "1.31.*"
+
+# -----------------------------------------------------------------------------
+# Container runtime
+# -----------------------------------------------------------------------------
+containerd_version: "1.7.*"
+
+# -----------------------------------------------------------------------------
+# Networking
+# -----------------------------------------------------------------------------
+# Pod network CIDR - must not overlap with your node/host network
+pod_network_cidr: "10.244.0.0/16"
+
+# Service network CIDR
+service_cidr: "10.96.0.0/12"
+
+# Calico version
+calico_version: "3.28.2"
+
+# -----------------------------------------------------------------------------
+# MetalLB
+# IP range MetalLB can assign to LoadBalancer services.
+# MUST be a range of unused IPs on your node network (same L2 segment).
+# Example: if nodes are on 192.168.1.0/24, reserve a block for MetalLB.
+# -----------------------------------------------------------------------------
+metallb_version: "0.14.9"
+metallb_ip_range: "192.168.1.200-192.168.1.220"
+
+# -----------------------------------------------------------------------------
+# Ingress
+# -----------------------------------------------------------------------------
+ingress_nginx_version: "4.11.3"
+
+# -----------------------------------------------------------------------------
+# Storage
+# -----------------------------------------------------------------------------
+longhorn_version: "1.7.2"
+
+# -----------------------------------------------------------------------------
+# Cert-Manager
+# -----------------------------------------------------------------------------
+cert_manager_version: "1.16.2"
+# Set to your email for Let's Encrypt ACME registration
+acme_email: "admin@example.com"
+
+# -----------------------------------------------------------------------------
+# Monitoring
+# -----------------------------------------------------------------------------
+kube_prometheus_stack_version: "67.4.0"
+# Grafana admin password - override in vault or at runtime
+grafana_admin_password: "changeme"
+
+# -----------------------------------------------------------------------------
+# ArgoCD
+# -----------------------------------------------------------------------------
+argocd_version: "7.7.5"
+
+# -----------------------------------------------------------------------------
+# Cluster API endpoint
+# For a single control plane, this is the CP node's IP.
+# For HA, point this at a load balancer (HAProxy/keepalived) VIP.
+# -----------------------------------------------------------------------------
+control_plane_endpoint: "{{ hostvars[groups['control_plane'][0]]['ansible_host'] }}"
+control_plane_port: 6443
+
+# -----------------------------------------------------------------------------
+# Helm binary
+# -----------------------------------------------------------------------------
+helm_version: "3.16.3"

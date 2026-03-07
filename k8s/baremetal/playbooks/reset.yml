@@ -1,0 +1,141 @@
+---
+# =============================================================================
+# reset.yml - Tear down the Kubernetes cluster
+# =============================================================================
+# WARNING: This will destroy the cluster and all data on it.
+# Persistent volumes will be lost unless backed up first.
+#
+# Usage:
+#   ansible-playbook playbooks/reset.yml
+# =============================================================================
+
+- name: "Reset worker nodes"
+  hosts: workers
+  become: true
+  any_errors_fatal: false
+
+  tasks:
+    - name: Run kubeadm reset on workers
+      ansible.builtin.command: kubeadm reset -f
+      register: reset_result
+      changed_when: reset_result.rc == 0
+      failed_when: false
+
+    - name: Remove CNI configuration
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/cni/net.d
+        - /opt/cni/bin
+
+    - name: Remove Kubernetes directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/kubelet
+        - /var/lib/etcd
+
+    - name: Flush iptables rules
+      ansible.builtin.shell: |
+        iptables -F
+        iptables -t nat -F
+        iptables -t mangle -F
+        iptables -X
+        ip6tables -F
+        ip6tables -t nat -F
+        ip6tables -t mangle -F
+        ip6tables -X
+      changed_when: true
+
+    - name: Remove IPVS tables
+      ansible.builtin.command: ipvsadm --clear
+      changed_when: true
+      failed_when: false
+
+- name: "Reset control plane"
+  hosts: control_plane
+  become: true
+  any_errors_fatal: false
+
+  tasks:
+    - name: Uninstall Helm releases
+      ansible.builtin.shell: |
+        helm ls -A --short | xargs -r -L1 helm uninstall -n
+      changed_when: true
+      failed_when: false
+
+    - name: Run kubeadm reset on control plane
+      ansible.builtin.command: kubeadm reset -f
+      register: reset_result
+      changed_when: reset_result.rc == 0
+      failed_when: false
+
+    - name: Remove CNI configuration
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/cni/net.d
+        - /opt/cni/bin
+
+    - name: Remove Kubernetes directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - /root/.kube
+        - "/home/{{ ansible_user }}/.kube"
+
+    - name: Remove Longhorn data
+      ansible.builtin.file:
+        path: /var/lib/longhorn
+        state: absent
+
+    - name: Flush iptables rules
+      ansible.builtin.shell: |
+        iptables -F
+        iptables -t nat -F
+        iptables -t mangle -F
+        iptables -X
+        ip6tables -F
+        ip6tables -t nat -F
+        ip6tables -t mangle -F
+        ip6tables -X
+      changed_when: true
+
+    - name: Remove IPVS tables
+      ansible.builtin.command: ipvsadm --clear
+      changed_when: true
+      failed_when: false
+
+- name: "Final cleanup on all nodes"
+  hosts: k8s_cluster
+  become: true
+  any_errors_fatal: false
+
+  tasks:
+    - name: Restart containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+      failed_when: false
+
+    - name: Display reset complete message
+      ansible.builtin.debug:
+        msg: |
+          ===================================================
+          CLUSTER RESET COMPLETE
+          ===================================================
+          All Kubernetes components have been removed.
+          containerd is still installed and running.
+
+          To fully remove containerd and kubeadm packages:
+            apt purge -y kubeadm kubelet kubectl containerd.io
+            apt autoremove -y
+          ===================================================

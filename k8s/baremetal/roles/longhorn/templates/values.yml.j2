@@ -1,0 +1,52 @@
+---
+# =============================================================================
+# Longhorn Helm values - Production settings
+# =============================================================================
+persistence:
+  # Set Longhorn as the default StorageClass
+  defaultClass: true
+  defaultClassReplicaCount: 2    # 2 replicas for small clusters (3 for larger)
+  reclaimPolicy: Retain          # Don't delete data on PVC deletion
+
+defaultSettings:
+  # Backup target (optional - configure S3 or NFS for backups)
+  # backupTarget: "s3://longhorn-backup@us-east-1/"
+  # backupTargetCredentialSecret: longhorn-backup-secret
+
+  # Storage: data path on nodes
+  defaultDataPath: /var/lib/longhorn
+
+  # Replica settings
+  defaultReplicaCount: 2
+  replicaSoftAntiAffinity: true    # Allow replicas on same node if needed
+
+  # Automatic salvage - recover volumes from failed replicas
+  autoSalvage: true
+
+  # Guaranteed engine manager CPU
+  guaranteedEngineManagerCPU: 12
+  guaranteedReplicaManagerCPU: 12
+
+  # Storage over-provisioning (allow 200% overcommit)
+  storageOverProvisioningPercentage: 200
+  storageMinimalAvailablePercentage: 15
+
+  # Upgrade checker (disable in air-gapped environments)
+  upgradeChecker: false
+
+  # Snapshot and backup retention
+  recurringSuccessfulJobsHistoryLimit: 5
+  recurringFailedJobsHistoryLimit: 5
+
+longhornUI:
+  replicas: 1
+
+ingress:
+  enabled: false    # Configure separately via your Ingress resources if needed
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi

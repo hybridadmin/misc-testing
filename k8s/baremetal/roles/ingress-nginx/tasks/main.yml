@@ -1,0 +1,54 @@
+---
+# =============================================================================
+# NGINX Ingress Controller role
+# Deployed via Helm with MetalLB LoadBalancer service type.
+# =============================================================================
+
+- name: Add ingress-nginx Helm repo
+  ansible.builtin.command: helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+  register: helm_repo
+  changed_when: "'has been added' in helm_repo.stdout"
+  failed_when:
+    - helm_repo.rc != 0
+    - "'already exists' not in helm_repo.stderr"
+
+- name: Update Helm repos
+  ansible.builtin.command: helm repo update
+  changed_when: false
+
+- name: Create ingress-nginx namespace
+  ansible.builtin.command: kubectl create namespace ingress-nginx
+  register: ns_result
+  changed_when: ns_result.rc == 0
+  failed_when:
+    - ns_result.rc != 0
+    - "'already exists' not in ns_result.stderr"
+
+- name: Render ingress-nginx values
+  ansible.builtin.template:
+    src: values.yml.j2
+    dest: /tmp/ingress-nginx-values.yml
+    mode: "0644"
+
+- name: Install ingress-nginx via Helm
+  ansible.builtin.command: >
+    helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx
+    --namespace ingress-nginx
+    --version {{ ingress_nginx_version }}
+    --values /tmp/ingress-nginx-values.yml
+    --wait
+    --timeout 5m
+  register: ingress_install
+  changed_when: "'has been upgraded' in ingress_install.stdout or 'has been installed' in ingress_install.stdout"
+
+- name: Remove temporary values file
+  ansible.builtin.file:
+    path: /tmp/ingress-nginx-values.yml
+    state: absent
+
+- name: Wait for ingress-nginx controller to be ready
+  ansible.builtin.command: >
+    kubectl -n ingress-nginx wait --for=condition=Ready pod
+    -l app.kubernetes.io/component=controller
+    --timeout=180s
+  changed_when: false

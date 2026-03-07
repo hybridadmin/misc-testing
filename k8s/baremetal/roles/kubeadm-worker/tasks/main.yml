@@ -1,0 +1,73 @@
+---
+# =============================================================================
+# Kubeadm Worker role
+# Installs kubeadm/kubelet and joins the worker to the cluster.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Install kubeadm and kubelet (kubectl optional but useful for debugging)
+# ---------------------------------------------------------------------------
+- name: Add Kubernetes apt GPG key
+  ansible.builtin.get_url:
+    url: "https://pkgs.k8s.io/core:/stable:/v{{ kube_version }}/deb/Release.key"
+    dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+    mode: "0644"
+
+- name: Add Kubernetes apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc]
+      https://pkgs.k8s.io/core:/stable:/v{{ kube_version }}/deb/ /
+    filename: kubernetes
+    state: present
+
+- name: Install kubeadm and kubelet
+  ansible.builtin.apt:
+    name:
+      - "kubeadm={{ kube_package_version }}"
+      - "kubelet={{ kube_package_version }}"
+      - "kubectl={{ kube_package_version }}"
+    state: present
+    update_cache: true
+
+- name: Hold Kubernetes packages at current version
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubeadm
+    - kubelet
+    - kubectl
+
+- name: Enable kubelet service
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: true
+
+# ---------------------------------------------------------------------------
+# Join the cluster
+# ---------------------------------------------------------------------------
+- name: Check if node is already joined to the cluster
+  ansible.builtin.stat:
+    path: /etc/kubernetes/kubelet.conf
+  register: kubelet_conf
+
+- name: Join the Kubernetes cluster
+  ansible.builtin.command: >
+    {{ hostvars[groups['control_plane'][0]]['kubeadm_join_command'] }}
+  when: not kubelet_conf.stat.exists
+  register: join_result
+  changed_when: join_result.rc == 0
+
+# ---------------------------------------------------------------------------
+# Wait for node to register with the API server
+# ---------------------------------------------------------------------------
+- name: Wait for node to appear in kubectl get nodes
+  ansible.builtin.command: >
+    kubectl get node {{ inventory_hostname }} --no-headers
+  delegate_to: "{{ groups['control_plane'][0] }}"
+  register: node_status
+  until: node_status.rc == 0
+  retries: 30
+  delay: 10
+  changed_when: false

@@ -1,0 +1,32 @@
+---
+# =============================================================================
+# Calico Installation custom resource
+# https://docs.tigera.io/calico/latest/reference/installation/api
+# =============================================================================
+apiVersion: operator.tigera.io/v1
+kind: Installation
+metadata:
+  name: default
+spec:
+  calicoNetwork:
+    ipPools:
+      - name: default-ipv4-pool
+        blockSize: 26
+        cidr: "{{ pod_network_cidr }}"
+        encapsulation: VXLANCrossSubnet
+        natOutgoing: Enabled
+        nodeSelector: all()
+    # Enable BGP for bare-metal (can be changed to VXLAN if needed)
+    bgp: Disabled
+    # Use iptables dataplane (stable, well-tested)
+    linuxDataplane: Iptables
+  # Enable Typha for clusters > 50 nodes (no-op for small clusters)
+  typhaDeployment:
+    spec:
+      minReadySeconds: 0
+---
+apiVersion: operator.tigera.io/v1
+kind: APIServer
+metadata:
+  name: default
+spec: {}

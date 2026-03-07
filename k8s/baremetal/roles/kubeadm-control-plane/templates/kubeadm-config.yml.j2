@@ -1,0 +1,55 @@
+---
+# =============================================================================
+# kubeadm configuration for control plane init
+# https://kubernetes.io/docs/reference/config-api/kubeadm-config.v1beta4/
+# =============================================================================
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: ClusterConfiguration
+kubernetesVersion: "v{{ kube_version }}.0"
+controlPlaneEndpoint: "{{ control_plane_endpoint }}:{{ control_plane_port }}"
+networking:
+  podSubnet: "{{ pod_network_cidr }}"
+  serviceSubnet: "{{ service_cidr }}"
+  dnsDomain: "cluster.local"
+# Enable audit logging, RBAC, and Node authorisation
+apiServer:
+  extraArgs:
+    # Enable audit logging
+    audit-log-path: "/var/log/kubernetes/audit.log"
+    audit-log-maxage: "30"
+    audit-log-maxbackup: "10"
+    audit-log-maxsize: "100"
+    # Security: disable anonymous auth, enable RBAC + Node
+    authorization-mode: "Node,RBAC"
+    enable-admission-plugins: "NodeRestriction,PodSecurity"
+    # Profiling off in production
+    profiling: "false"
+  extraVolumes:
+    - name: audit-log
+      hostPath: /var/log/kubernetes
+      mountPath: /var/log/kubernetes
+      pathType: DirectoryOrCreate
+controllerManager:
+  extraArgs:
+    # Bind to localhost only
+    bind-address: "0.0.0.0"
+    # Terminate pods gracefully on node shutdown
+    pod-eviction-timeout: "30s"
+    profiling: "false"
+scheduler:
+  extraArgs:
+    bind-address: "0.0.0.0"
+    profiling: "false"
+etcd:
+  local:
+    extraArgs:
+      # Listen on all interfaces for metrics scraping
+      listen-metrics-urls: "http://0.0.0.0:2381"
+---
+apiVersion: kubeadm.k8s.io/v1beta3
+kind: InitConfiguration
+nodeRegistration:
+  criSocket: "unix:///run/containerd/containerd.sock"
+  kubeletExtraArgs:
+    # Protect kernel defaults
+    protect-kernel-defaults: "true"

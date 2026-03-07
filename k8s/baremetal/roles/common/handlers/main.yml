@@ -1,0 +1,5 @@
+---
+- name: Reboot node
+  ansible.builtin.reboot:
+    reboot_timeout: 300
+    msg: "Reboot triggered by Ansible - Kubernetes prerequisites changed"

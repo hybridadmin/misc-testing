@@ -1,0 +1,138 @@
+---
+# =============================================================================
+# site.yml - Full cluster deployment playbook
+# =============================================================================
+# Deploys a complete production-ready Kubernetes cluster on bare-metal:
+#   1. OS prerequisites on all nodes
+#   2. Container runtime (containerd) on all nodes
+#   3. Control plane initialisation
+#   4. Worker nodes join
+#   5. CNI networking (Calico)
+#   6. All addons (MetalLB, Ingress, Storage, Certs, Monitoring, GitOps)
+#
+# Usage:
+#   ansible-playbook playbooks/site.yml
+#   ansible-playbook playbooks/site.yml --tags "common,containerd,control-plane"
+#   ansible-playbook playbooks/site.yml --skip-tags "monitoring,argocd"
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Phase 1: Prepare all nodes (OS, kernel, containerd)
+# ---------------------------------------------------------------------------
+- name: "Phase 1: Prepare all Kubernetes nodes"
+  hosts: k8s_cluster
+  become: true
+  any_errors_fatal: true
+  tags: [prepare]
+
+  roles:
+    - role: common
+      tags: [common]
+    - role: containerd
+      tags: [containerd]
+
+# ---------------------------------------------------------------------------
+# Phase 2: Initialise control plane
+# ---------------------------------------------------------------------------
+- name: "Phase 2: Initialise Kubernetes control plane"
+  hosts: control_plane
+  become: true
+  any_errors_fatal: true
+  tags: [control-plane]
+
+  roles:
+    - role: kubeadm-control-plane
+
+# ---------------------------------------------------------------------------
+# Phase 3: Join worker nodes
+# ---------------------------------------------------------------------------
+- name: "Phase 3: Join worker nodes to the cluster"
+  hosts: workers
+  become: true
+  any_errors_fatal: true
+  tags: [workers]
+
+  roles:
+    - role: kubeadm-worker
+
+# ---------------------------------------------------------------------------
+# Phase 4: Install CNI (must happen before addons)
+# ---------------------------------------------------------------------------
+- name: "Phase 4: Install Calico CNI"
+  hosts: control_plane
+  become: true
+  any_errors_fatal: true
+  tags: [cni]
+
+  roles:
+    - role: cni-calico
+
+# ---------------------------------------------------------------------------
+# Phase 5: Deploy cluster addons
+# ---------------------------------------------------------------------------
+- name: "Phase 5: Deploy cluster addons"
+  hosts: control_plane
+  become: true
+  tags: [addons]
+
+  roles:
+    - role: metallb
+      tags: [metallb]
+    - role: ingress-nginx
+      tags: [ingress]
+    - role: longhorn
+      tags: [longhorn, storage]
+    - role: cert-manager
+      tags: [cert-manager, certs]
+    - role: monitoring
+      tags: [monitoring]
+    - role: argocd
+      tags: [argocd, gitops]
+
+# ---------------------------------------------------------------------------
+# Phase 6: Final validation
+# ---------------------------------------------------------------------------
+- name: "Phase 6: Cluster validation"
+  hosts: control_plane
+  become: true
+  tags: [validate]
+  tasks:
+    - name: Display cluster nodes
+      ansible.builtin.command: kubectl get nodes -o wide
+      register: nodes_output
+      changed_when: false
+
+    - name: Display all pods
+      ansible.builtin.command: kubectl get pods -A -o wide
+      register: pods_output
+      changed_when: false
+
+    - name: Display storage classes
+      ansible.builtin.command: kubectl get storageclass
+      register: sc_output
+      changed_when: false
+
+    - name: Show cluster summary
+      ansible.builtin.debug:
+        msg: |
+          ===================================================
+          CLUSTER DEPLOYMENT COMPLETE
+          ===================================================
+
+          NODES:
+          {{ nodes_output.stdout }}
+
+          STORAGE CLASSES:
+          {{ sc_output.stdout }}
+
+          ALL PODS:
+          {{ pods_output.stdout }}
+
+          NEXT STEPS:
+          1. Update metallb_ip_range in group_vars/all.yml
+             with IPs from your network
+          2. Update acme_email for Let's Encrypt
+          3. Configure Ingress resources for your services
+          4. Change default passwords (Grafana, ArgoCD)
+          5. Set up ArgoCD to sync from your Git repos
+          ===================================================

@@ -1,0 +1,51 @@
+---
+# =============================================================================
+# Calico CNI role
+# Installs Calico as the pod network CNI using the Tigera operator.
+# Runs on the control plane node only.
+# =============================================================================
+
+- name: Install Tigera Calico operator
+  ansible.builtin.command: >
+    kubectl create -f
+    https://raw.githubusercontent.com/projectcalico/calico/v{{ calico_version }}/manifests/tigera-operator.yaml
+  register: calico_operator
+  changed_when: calico_operator.rc == 0
+  failed_when:
+    - calico_operator.rc != 0
+    - "'already exists' not in calico_operator.stderr"
+
+- name: Render Calico custom resource
+  ansible.builtin.template:
+    src: calico-installation.yml.j2
+    dest: /tmp/calico-installation.yml
+    mode: "0644"
+
+- name: Apply Calico custom resource
+  ansible.builtin.command: kubectl apply -f /tmp/calico-installation.yml
+  register: calico_cr
+  changed_when: "'configured' in calico_cr.stdout or 'created' in calico_cr.stdout"
+
+- name: Remove temporary Calico manifest
+  ansible.builtin.file:
+    path: /tmp/calico-installation.yml
+    state: absent
+
+- name: Wait for Calico pods to be ready
+  ansible.builtin.command: >
+    kubectl -n calico-system wait --for=condition=Ready pod -l k8s-app=calico-node
+    --timeout=300s
+  register: calico_ready
+  changed_when: false
+  retries: 5
+  delay: 15
+  until: calico_ready.rc == 0
+
+- name: Wait for all nodes to become Ready
+  ansible.builtin.shell: >
+    kubectl get nodes --no-headers | grep -v ' Ready ' || true
+  register: nodes_not_ready
+  until: nodes_not_ready.stdout == ""
+  retries: 30
+  delay: 10
+  changed_when: false
