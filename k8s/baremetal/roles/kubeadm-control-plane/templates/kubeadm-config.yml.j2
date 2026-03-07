@@ -3,7 +3,7 @@
 # kubeadm configuration for control plane init
 # https://kubernetes.io/docs/reference/config-api/kubeadm-config.v1beta4/
 # =============================================================================
-apiVersion: kubeadm.k8s.io/v1beta3
+apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 kubernetesVersion: "v{{ kube_version }}.0"
 controlPlaneEndpoint: "{{ control_plane_endpoint }}:{{ control_plane_port }}"
@@ -14,16 +14,22 @@ networking:
 # Enable audit logging, RBAC, and Node authorisation
 apiServer:
   extraArgs:
-    # Enable audit logging
-    audit-log-path: "/var/log/kubernetes/audit.log"
-    audit-log-maxage: "30"
-    audit-log-maxbackup: "10"
-    audit-log-maxsize: "100"
+    - name: "audit-log-path"
+      value: "/var/log/kubernetes/audit.log"
+    - name: "audit-log-maxage"
+      value: "30"
+    - name: "audit-log-maxbackup"
+      value: "10"
+    - name: "audit-log-maxsize"
+      value: "100"
     # Security: disable anonymous auth, enable RBAC + Node
-    authorization-mode: "Node,RBAC"
-    enable-admission-plugins: "NodeRestriction,PodSecurity"
+    - name: "authorization-mode"
+      value: "Node,RBAC"
+    - name: "enable-admission-plugins"
+      value: "NodeRestriction,PodSecurity"
     # Profiling off in production
-    profiling: "false"
+    - name: "profiling"
+      value: "false"
   extraVolumes:
     - name: audit-log
       hostPath: /var/log/kubernetes
@@ -31,25 +37,31 @@ apiServer:
       pathType: DirectoryOrCreate
 controllerManager:
   extraArgs:
-    # Bind to localhost only
-    bind-address: "0.0.0.0"
+    # Bind for metrics scraping
+    - name: "bind-address"
+      value: "0.0.0.0"
     # Terminate pods gracefully on node shutdown
-    pod-eviction-timeout: "30s"
-    profiling: "false"
+    - name: "pod-eviction-timeout"
+      value: "30s"
+    - name: "profiling"
+      value: "false"
 scheduler:
   extraArgs:
-    bind-address: "0.0.0.0"
-    profiling: "false"
+    - name: "bind-address"
+      value: "0.0.0.0"
+    - name: "profiling"
+      value: "false"
 etcd:
   local:
     extraArgs:
       # Listen on all interfaces for metrics scraping
-      listen-metrics-urls: "http://0.0.0.0:2381"
+      - name: "listen-metrics-urls"
+        value: "http://0.0.0.0:2381"
 ---
-apiVersion: kubeadm.k8s.io/v1beta3
+apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 nodeRegistration:
   criSocket: "unix:///run/containerd/containerd.sock"
   kubeletExtraArgs:
-    # Protect kernel defaults
-    protect-kernel-defaults: "true"
+    - name: "protect-kernel-defaults"
+      value: "true"

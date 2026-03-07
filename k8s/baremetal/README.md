@@ -30,7 +30,7 @@ Production-ready Kubernetes cluster deployment on bare-metal hardware using Ansi
 |-------|-----------|---------|
 | OS | Ubuntu 22.04/24.04 | Base operating system |
 | Runtime | containerd | Container runtime (CRI) |
-| K8s | kubeadm v1.31 | Cluster bootstrapping |
+| K8s | kubeadm v1.35 | Cluster bootstrapping |
 | CNI | Calico | Pod networking + network policy |
 | LB | MetalLB | Bare-metal LoadBalancer (L2 mode) |
 | Ingress | NGINX Ingress | HTTP routing + TLS termination |

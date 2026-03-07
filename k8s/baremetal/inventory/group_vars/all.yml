@@ -8,8 +8,8 @@
 # Pin to a specific minor version. Patch versions are resolved automatically.
 # https://kubernetes.io/releases/
 # -----------------------------------------------------------------------------
-kube_version: "1.31"
-kube_package_version: "1.31.*"
+kube_version: "1.35"
+kube_package_version: "1.35.*"
 
 # -----------------------------------------------------------------------------
 # Container runtime
@@ -26,7 +26,7 @@ pod_network_cidr: "10.244.0.0/16"
 service_cidr: "10.96.0.0/12"
 
 # Calico version
-calico_version: "3.28.2"
+calico_version: "3.31.4"
 
 # -----------------------------------------------------------------------------
 # MetalLB
@@ -34,23 +34,23 @@ calico_version: "3.28.2"
 # MUST be a range of unused IPs on your node network (same L2 segment).
 # Example: if nodes are on 192.168.1.0/24, reserve a block for MetalLB.
 # -----------------------------------------------------------------------------
-metallb_version: "0.14.9"
+metallb_version: "0.15.3"
 metallb_ip_range: "192.168.1.200-192.168.1.220"
 
 # -----------------------------------------------------------------------------
 # Ingress
 # -----------------------------------------------------------------------------
-ingress_nginx_version: "4.11.3"
+ingress_nginx_version: "4.14.3"
 
 # -----------------------------------------------------------------------------
 # Storage
 # -----------------------------------------------------------------------------
-longhorn_version: "1.7.2"
+longhorn_version: "1.11.0"
 
 # -----------------------------------------------------------------------------
 # Cert-Manager
 # -----------------------------------------------------------------------------
-cert_manager_version: "1.16.2"
+cert_manager_version: "1.19.4"
 # Set to your email for Let's Encrypt ACME registration
 acme_email: "admin@example.com"
 
