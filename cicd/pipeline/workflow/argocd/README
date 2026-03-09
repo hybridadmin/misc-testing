@@ -1,0 +1,14 @@
+# Argo CD Application definitions for pipeline-app
+#
+# Prerequisites:
+#   1. Argo CD installed on your K8s cluster
+#   2. GitHub repo registered in Argo CD (Settings > Repositories)
+#   3. Target namespaces created (pipeline-dev, pipeline-staging, pipeline-production)
+#
+# Apply with:
+#   kubectl apply -f argocd/dev.yaml
+#   kubectl apply -f argocd/staging.yaml
+#   kubectl apply -f argocd/production.yaml
+#
+# Or apply the AppProject + all apps at once:
+#   kubectl apply -f argocd/

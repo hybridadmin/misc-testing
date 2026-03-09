@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pipeline-app
+  labels:
+    app: pipeline-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pipeline-app
+  template:
+    metadata:
+      labels:
+        app: pipeline-app
+    spec:
+      containers:
+        - name: app
+          # This image tag gets overridden by Kustomize overlays
+          image: ghcr.io/OWNER/pipeline:latest
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true

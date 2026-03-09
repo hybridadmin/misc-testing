@@ -1,0 +1,20 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: pipeline-app
+  namespace: argocd
+spec:
+  description: "Pipeline demo application project"
+  sourceRepos:
+    # Replace with your actual repo URL
+    - "https://github.com/OWNER/pipeline.git"
+  destinations:
+    - namespace: pipeline-dev
+      server: https://kubernetes.default.svc
+    - namespace: pipeline-staging
+      server: https://kubernetes.default.svc
+    - namespace: pipeline-production
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace

@@ -1,0 +1,35 @@
+name: Promote to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: "Image tag to deploy (e.g. sha-abc1234)"
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  promote:
+    name: Promote to Production
+    runs-on: ubuntu-latest
+    environment: production  # Requires approval in GitHub settings
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update production overlay
+        run: |
+          cd k8s/overlays/production
+          kustomize edit set image ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.image-tag }}
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/
+          git diff --staged --quiet && echo "No changes" && exit 0
+          git commit -m "chore: promote ${{ inputs.image-tag }} to production"
+          git push

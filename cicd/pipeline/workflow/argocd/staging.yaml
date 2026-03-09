@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: pipeline-app-staging
+  namespace: argocd
+  labels:
+    app.kubernetes.io/environment: staging
+spec:
+  project: pipeline-app
+  source:
+    # Replace with your actual repo URL
+    repoURL: https://github.com/OWNER/pipeline.git
+    targetRevision: main
+    path: k8s/overlays/staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: pipeline-staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
