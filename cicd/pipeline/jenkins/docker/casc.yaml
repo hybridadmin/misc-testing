@@ -1,0 +1,163 @@
+# =================================================================
+# Jenkins Configuration as Code (JCasC)
+# Production-hardened, dark-themed, fully automated setup
+# =================================================================
+
+# ─────────────────────────────────────────────────────────────
+# Core Jenkins Settings
+# ─────────────────────────────────────────────────────────────
+jenkins:
+  systemMessage: >-
+    Jenkins CI/CD Pipeline Server — configured via JCasC.
+    Managed instance — do not make manual changes; they will be overwritten.
+
+  # Controller should not run builds — delegate to agents
+  # Set to 2 for local testing; set to 0 in production with dedicated agents
+  numExecutors: 2
+  mode: NORMAL
+  quietPeriod: 5
+  scmCheckoutRetryCount: 3
+
+  labelString: "controller"
+
+  # ── Security Realm ──────────────────────────────────────────
+  # Uses env vars so passwords are not stored in the YAML file.
+  # JENKINS_ADMIN_ID and JENKINS_ADMIN_PASSWORD come from .env
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: "${JENKINS_ADMIN_ID:-admin}"
+          password: "${JENKINS_ADMIN_PASSWORD:-admin}"
+
+  # ── Authorization — Matrix-based (granular permissions) ────
+  authorizationStrategy:
+    globalMatrix:
+      entries:
+        # Admin gets everything
+        - user:
+            name: "${JENKINS_ADMIN_ID:-admin}"
+            permissions:
+              - "Overall/Administer"
+        # Authenticated users can read and build
+        - group:
+            name: "authenticated"
+            permissions:
+              - "Overall/Read"
+              - "Job/Read"
+              - "Job/Build"
+              - "Job/Cancel"
+              - "Job/Discover"
+              - "View/Read"
+
+  # ── Security Hardening ─────────────────────────────────────
+  crumbIssuer:
+    standard:
+      excludeClientIPFromCrumb: false
+
+  remotingSecurity:
+    enabled: true
+
+  # ── Global Environment Variables ───────────────────────────
+  globalNodeProperties:
+    - envVars:
+        env:
+          - key: "DOCKER_HOST"
+            value: "tcp://docker:2376"
+          - key: "DOCKER_TLS_VERIFY"
+            value: "1"
+          - key: "DOCKER_CERT_PATH"
+            value: "/certs/client"
+          - key: "LANG"
+            value: "en_US.UTF-8"
+
+# ─────────────────────────────────────────────────────────────
+# Security Settings
+# ─────────────────────────────────────────────────────────────
+security:
+  apiToken:
+    creationOfLegacyTokenEnabled: false
+    tokenGenerationOnCreationEnabled: false
+    usageStatisticsEnabled: true
+  globalJobDslSecurityConfiguration:
+    useScriptSecurity: true
+
+# ─────────────────────────────────────────────────────────────
+# Appearance — Dark Theme
+# ─────────────────────────────────────────────────────────────
+appearance:
+  themeManager:
+    disableUserThemes: false
+    theme: "darkSystem"
+
+# ─────────────────────────────────────────────────────────────
+# Unclassified (plugin-level) settings
+# ─────────────────────────────────────────────────────────────
+unclassified:
+  # ── Instance URL ────────────────────────────────────────────
+  location:
+    url: "${JENKINS_URL:-http://localhost:8080/}"
+    adminAddress: "${JENKINS_ADMIN_EMAIL:-jenkins-admin@example.com}"
+
+  # ── Timestamps on all pipeline output ──────────────────────
+  timestamper:
+    allPipelines: true
+
+  # ── Pipeline speed / durability ────────────────────────────
+  globalDefaultFlowDurabilityLevel:
+    durabilityHint: PERFORMANCE_OPTIMIZED
+
+  # ── Slack (optional — uncomment and configure) ─────────────
+  # slackNotifier:
+  #   teamDomain: "your-workspace"
+  #   tokenCredentialId: "slack-token"
+  #   room: "#deployments"
+  #   botUser: true
+
+  # ── Email (optional — uncomment and configure) ─────────────
+  # email-ext:
+  #   defaultSuffix: "@example.com"
+  #   mailAccount:
+  #     smtpHost: "smtp.example.com"
+  #     smtpPort: "587"
+  #     useSsl: false
+  #     useTls: true
+
+# ─────────────────────────────────────────────────────────────
+# Tool Installations
+# ─────────────────────────────────────────────────────────────
+tool:
+  git:
+    installations:
+      - name: "git"
+        home: "/usr/bin/git"
+
+# ─────────────────────────────────────────────────────────────
+# Seed Job — auto-creates the pipeline-deploy job on boot
+# ─────────────────────────────────────────────────────────────
+jobs:
+  - script: |
+      pipelineJob('pipeline-deploy') {
+        description('CI/CD Pipeline — build, push, and deploy to any environment')
+
+        logRotator {
+          numToKeep(20)
+          artifactNumToKeep(5)
+        }
+
+        parameters {
+          choiceParam('ENVIRONMENT', ['dev', 'staging', 'production'], 'Target deployment environment')
+          stringParam('IMAGE_TAG', '', 'Image tag to build and deploy (e.g. v1.2.3). Leave blank to auto-generate.')
+        }
+
+        properties {
+          disableConcurrentBuilds()
+        }
+
+        definition {
+          cps {
+            script(new File('/var/jenkins_home/Jenkinsfile').text)
+            sandbox(true)
+          }
+        }
+      }

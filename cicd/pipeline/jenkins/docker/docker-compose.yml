@@ -1,0 +1,111 @@
+services:
+  # ─────────────────────────────────────────────────────────────
+  # Jenkins Controller
+  # ─────────────────────────────────────────────────────────────
+  jenkins:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: jenkins
+    restart: unless-stopped
+    ports:
+      - "${JENKINS_HTTP_PORT:-8080}:8080"
+      - "${JENKINS_AGENT_PORT:-50000}:50000"
+    env_file:
+      - .env
+    environment:
+      # JVM tuning — override via .env if needed
+      JAVA_OPTS: >-
+        -Djenkins.install.runSetupWizard=false
+        -Djava.awt.headless=true
+        -Xms${JENKINS_HEAP_MIN:-512m}
+        -Xmx${JENKINS_HEAP_MAX:-1024m}
+        -XX:+UseG1GC
+        -XX:+UseStringDeduplication
+        -Dorg.apache.commons.jelly.tags.fmt.timeZone=${TZ:-UTC}
+        -Dhudson.plugins.git.GitSCM.RECYCLE_TIMEOUT=1
+      # JCasC config path
+      CASC_JENKINS_CONFIG: /var/jenkins_home/casc.yaml
+      # Docker connection — points at the DinD sidecar
+      DOCKER_HOST: tcp://docker:2376
+      DOCKER_CERT_PATH: /certs/client
+      DOCKER_TLS_VERIFY: "1"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      - docker_certs:/certs/client:ro
+      # Mount the Jenkinsfile so the seed job can load it
+      - ../Jenkinsfile:/var/jenkins_home/Jenkinsfile:ro
+    depends_on:
+      docker:
+        condition: service_healthy
+    networks:
+      - jenkins
+    deploy:
+      resources:
+        limits:
+          cpus: "${JENKINS_CPU_LIMIT:-2.0}"
+          memory: "${JENKINS_MEM_LIMIT:-2G}"
+        reservations:
+          cpus: "0.5"
+          memory: "512M"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsSL http://localhost:8080/login || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ─────────────────────────────────────────────────────────────
+  # Docker-in-Docker — lets Jenkins build Docker images
+  # ─────────────────────────────────────────────────────────────
+  docker:
+    image: docker:27-dind
+    container_name: jenkins-docker
+    restart: unless-stopped
+    privileged: true
+    environment:
+      DOCKER_TLS_CERTDIR: /certs
+    volumes:
+      - docker_certs:/certs/client
+      - docker_data:/var/lib/docker
+    networks:
+      jenkins:
+        aliases:
+          - docker
+    deploy:
+      resources:
+        limits:
+          cpus: "${DIND_CPU_LIMIT:-2.0}"
+          memory: "${DIND_MEM_LIMIT:-2G}"
+        reservations:
+          cpus: "0.25"
+          memory: "256M"
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  jenkins_home:
+    name: jenkins_home
+  docker_certs:
+    name: jenkins_docker_certs
+  docker_data:
+    name: jenkins_docker_data
+
+networks:
+  jenkins:
+    driver: bridge
+    name: jenkins_network

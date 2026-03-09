@@ -1,0 +1,65 @@
+# =================================================================
+# Jenkins Plugins — production-hardened, curated list
+# =================================================================
+
+# ── Core Pipeline ───────────────────────────────────────────
+workflow-aggregator
+pipeline-stage-view
+pipeline-graph-view
+pipeline-utility-steps
+
+# ── Git & GitHub ────────────────────────────────────────────
+git
+github
+github-branch-source
+
+# ── Credentials & Secrets ───────────────────────────────────
+credentials-binding
+ssh-agent
+ssh-credentials
+hashicorp-vault-plugin
+
+# ── Docker ──────────────────────────────────────────────────
+docker-workflow
+docker-commons
+
+# ── Configuration as Code ───────────────────────────────────
+configuration-as-code
+
+# ── UI / Theme ──────────────────────────────────────────────
+dark-theme
+theme-manager
+timestamper
+ansicolor
+
+# ── Blue Ocean (modern pipeline UI) ────────────────────────
+blueocean
+
+# ── Security & Hardening ───────────────────────────────────
+matrix-auth
+role-strategy
+authorize-project
+script-security
+
+# ── Audit & Compliance ─────────────────────────────────────
+audit-trail
+
+# ── Build Management ───────────────────────────────────────
+ws-cleanup
+build-timeout
+throttle-concurrents
+rebuild
+build-name-setter
+
+# ── Notifications ──────────────────────────────────────────
+mailer
+email-ext
+slack
+
+# ── Utilities ──────────────────────────────────────────────
+job-dsl
+managed-scripts
+locale
+antisamy-markup-formatter
+cloudbees-disk-usage-simple
+prometheus
