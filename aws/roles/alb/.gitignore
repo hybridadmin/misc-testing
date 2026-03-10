@@ -1,0 +1,12 @@
+# Terragrunt/Terraform generated files
+.terragrunt-cache/
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+backend.tf
+provider.tf
+versions.tf
+
+# OS
+.DS_Store
