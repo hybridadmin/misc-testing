@@ -26,6 +26,8 @@ services:
         -Dhudson.plugins.git.GitSCM.RECYCLE_TIMEOUT=1
       # JCasC config path
       CASC_JENKINS_CONFIG: /var/jenkins_home/casc.yaml
+      # JCasC secrets — file-based secret resolution (each file = one secret)
+      SECRETS: /run/jenkins-secrets
       # Docker connection — points at the DinD sidecar
       DOCKER_HOST: tcp://docker:2376
       DOCKER_CERT_PATH: /certs/client
@@ -35,6 +37,8 @@ services:
       - docker_certs:/certs/client:ro
       # Mount the Jenkinsfile so the seed job can load it
       - ../Jenkinsfile:/var/jenkins_home/Jenkinsfile:ro
+      # Mount secrets directory for JCasC file-based secret resolution
+      - ${JENKINS_SECRETS_DIR:-./secrets}:/run/jenkins-secrets:ro
     depends_on:
       docker:
         condition: service_healthy

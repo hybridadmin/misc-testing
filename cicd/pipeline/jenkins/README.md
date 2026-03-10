@@ -12,11 +12,11 @@ pushes, and deploys a Docker image to any environment (`dev`, `staging`,
 │                     Jenkins Pipeline                        │
 │                                                             │
 │  ┌──────────┐   ┌─────────────┐   ┌──────────┐            │
-│  │  1. Test  │──▶│ 2. Build &  │──▶│ 3. Gate  │ (prod only)│
+│  │  1. Test  │──>│ 2. Build &  │──>│ 3. Gate  │ (prod only)│
 │  │  (pytest) │   │    Push     │   │ Approval │            │
 │  └──────────┘   │  (GHCR)     │   └────┬─────┘            │
 │                  └─────────────┘        │                   │
-│                                         ▼                   │
+│                                         v                   │
 │                              ┌───────────────────┐          │
 │                              │ 4. Update GitOps  │          │
 │                              │   Repo (kustomize │          │
@@ -24,13 +24,27 @@ pushes, and deploys a Docker image to any environment (`dev`, `staging`,
 │                              └─────────┬─────────┘          │
 └────────────────────────────────────────┼────────────────────┘
                                          │ git push
-                                         ▼
+                                         v
                                ┌──────────────────┐
                                │   Argo CD picks   │
                                │   up the change   │
                                │   and syncs K8s   │
                                └──────────────────┘
 ```
+
+## Job Structure
+
+The pipeline job is organized under a Jenkins folder:
+
+```
+Jenkins
+└── owner-project-service/          <-- folder
+    └── pipeline-deploy             <-- pipeline job
+```
+
+The job uses **Pipeline script from SCM** — the Git repository URL, branch, and
+Jenkinsfile path are all configurable from the Jenkins UI via
+**Job > Configure > Pipeline**.
 
 ## Parameters
 
@@ -72,37 +86,114 @@ Pre-installed in the Docker image:
 
 ### Jenkins Credentials
 
-Create these in **Jenkins > Manage Jenkins > Credentials**:
+The following credentials are required. The SSH deploy key (`github-ssh-key`) is
+provisioned automatically via JCasC from the `secrets/` directory (see
+[SSH Deploy Key Setup](#ssh-deploy-key-setup) below). The GHCR credential must
+be created manually in **Jenkins > Manage Jenkins > Credentials**.
 
-| ID                | Type              | Purpose                                         |
-|-------------------|-------------------|-------------------------------------------------|
-| `ghcr-credentials`| Username/Password | GitHub username + PAT with `write:packages` scope |
-| `github-ssh-key`  | SSH Private Key   | SSH key with push access to the GitOps repo     |
+| ID                | Type              | Purpose                                          | Provisioning |
+|-------------------|-------------------|--------------------------------------------------|--------------|
+| `github-ssh-key`  | SSH Private Key   | Pulls the source repo and pushes to the GitOps repo | Automatic (JCasC) |
+| `ghcr-credentials`| Username/Password | GitHub username + PAT with `write:packages` scope  | Manual       |
 
 ## Setup
 
-1. **Edit the `Jenkinsfile`** — replace the `TODO` placeholders:
+### 1. Clone and configure
 
-   ```groovy
-   IMAGE_NAME  = 'OWNER/pipeline'                            // your GitHub org/repo
-   GITOPS_REPO = 'git@github.com:OWNER/pipeline-gitops.git'  // your GitOps repo
+```bash
+cd docker/
+cp .env.example .env
+vi .env                    # set JENKINS_ADMIN_PASSWORD at minimum
+```
+
+### 2. SSH Deploy Key Setup
+
+The pipeline needs an SSH key to pull from GitHub (SCM checkout) and push to the
+GitOps repo. Jenkins provisions this credential automatically on boot using
+JCasC file-based secrets.
+
+**Generate the key:**
+
+```bash
+ssh-keygen -t ed25519 -C "jenkins-deploy" -f docker/secrets/GITHUB_SSH_PRIVATE_KEY -N ""
+```
+
+**Register the public key on GitHub:**
+
+1. Copy the public key:
+   ```bash
+   cat docker/secrets/GITHUB_SSH_PRIVATE_KEY.pub
    ```
+2. Go to your GitHub repo > **Settings > Deploy keys > Add deploy key**
+3. Paste the public key and give it a descriptive title
+4. For the source repo (SCM checkout), **read-only** access is sufficient
+5. For the GitOps repo, enable **Allow write access** (the deploy stage pushes commits)
 
-2. **Create a Jenkins Pipeline job** pointing at this repo:
-   - New Item > Pipeline
-   - Pipeline > Definition: **Pipeline script from SCM**
-   - SCM: Git > Repository URL: your app repo
-   - Script Path: `Jenkinsfile`
+> If the source repo and GitOps repo are different, you need to add the public
+> key to both repos, or use a machine user's SSH key with access to both.
 
-3. **Add credentials** as described above.
+**How it works under the hood:**
 
-4. **Run the pipeline** — use "Build with Parameters" to pick an environment and tag.
+- `docker-compose.yml` mounts `./secrets/` into the container at `/run/jenkins-secrets/` (read-only)
+- The `SECRETS` environment variable tells JCasC to look in `/run/jenkins-secrets/` for file-based secrets
+- JCasC resolves `${GITHUB_SSH_PRIVATE_KEY}` in `casc.yaml` by reading the file `/run/jenkins-secrets/GITHUB_SSH_PRIVATE_KEY`
+- The credential is registered globally with ID `github-ssh-key` and is available to all jobs
+
+> **Important:** Never commit private keys to git. The `docker/.gitignore` file
+> excludes `secrets/*` (except the README) and `.env`.
+
+### 3. Edit the Jenkinsfile
+
+Replace the `TODO` placeholders with your actual values:
+
+```groovy
+IMAGE_NAME  = 'OWNER/pipeline'                            // your GitHub org/repo
+GITOPS_REPO = 'git@github.com:OWNER/pipeline-gitops.git'  // your GitOps repo
+```
+
+### 4. Build and start
+
+```bash
+cd docker/
+docker compose up -d --build
+
+# Watch logs until Jenkins is ready
+docker compose logs -f jenkins
+```
+
+### 5. Log in and configure the repo
+
+Open **http://localhost:8080** and log in:
+
+| Field    | Value                                           |
+|----------|-------------------------------------------------|
+| Username | `admin` (or your `JENKINS_ADMIN_ID`)            |
+| Password | `admin` (or your `JENKINS_ADMIN_PASSWORD`)      |
+
+> Change the default password immediately. Set `JENKINS_ADMIN_PASSWORD` in `.env` before first boot.
+
+The `owner-project-service/pipeline-deploy` job is already created. To set the
+source repository:
+
+1. Navigate to **owner-project-service > pipeline-deploy > Configure**
+2. Scroll to **Pipeline > SCM**
+3. Set the **Repository URL** (e.g. `git@github.com:your-org/your-repo.git`)
+4. Verify **Credentials** is set to `github-ssh-key`
+5. Set the **Branch** (default: `*/main`)
+6. Set the **Script Path** (default: `Jenkinsfile`)
+7. Click **Save**
+
+### 6. Run the pipeline
+
+Click **Build with Parameters**, select an environment and optional image tag,
+then click **Build**.
 
 ## Production Deploys
 
 When `ENVIRONMENT = production`, an **approval gate** pauses the pipeline before
-the deploy stage. Only users in the `admin` or `release-managers` groups can approve.
-This mirrors the GitHub environment protection rules from the original workflow.
+the deploy stage. Only users in the `admin` or `release-managers` groups can
+approve. This mirrors the GitHub environment protection rules from the original
+workflow.
 
 ## Mapping from the Original GitHub Workflows
 
@@ -117,56 +208,33 @@ This mirrors the GitHub environment protection rules from the original workflow.
 
 ---
 
-## Local Testing with Docker Compose
+## Docker Setup Reference
 
-A fully self-contained, production-hardened Jenkins server lives in the `docker/`
-subdirectory. Everything is automated — dark theme, plugins, security, the
-pipeline job — via Configuration as Code.
-
-### Quick Start
-
-```bash
-cd docker/
-
-# (Optional) customize settings
-cp .env.example .env
-vi .env
-
-# Build and start
-docker compose up -d --build
-
-# Watch logs until Jenkins is ready
-docker compose logs -f jenkins
-```
-
-Then open **http://localhost:8080** and log in:
-
-| Field    | Value   |
-|----------|---------|
-| Username | `admin` |
-| Password | `admin` |
-
-> Change the password immediately in a real environment. Set
-> `JENKINS_ADMIN_PASSWORD` in `.env` before first boot.
-
-The `pipeline-deploy` job is already created. Click **Build with Parameters**.
-
-### What's Inside `docker/`
+### Directory Structure
 
 ```
-docker/
-├── docker-compose.yml   # Jenkins controller + Docker-in-Docker sidecar
-├── Dockerfile           # Custom Jenkins image (plugins, python, kustomize)
-├── plugins.txt          # 30+ curated Jenkins plugins
-├── casc.yaml            # JCasC — full server config, theme, security, seed job
-├── .env                 # Environment variables (passwords, ports, resources)
-└── .env.example         # Template — safe to commit
+jenkins/
+├── Jenkinsfile              # Pipeline script (fetched from SCM at runtime)
+├── README.md
+└── docker/
+    ├── .env                 # Environment variables — never committed
+    ├── .env.example         # Template — safe to commit
+    ├── .gitignore           # Excludes secrets/ and .env
+    ├── Dockerfile           # Custom Jenkins image (plugins, python, kustomize)
+    ├── casc.yaml            # JCasC — server config, credentials, theme, seed job
+    ├── docker-compose.yml   # Jenkins controller + Docker-in-Docker sidecar
+    ├── plugins.txt          # 30+ curated Jenkins plugins
+    └── secrets/             # JCasC file-based secrets (gitignored)
+        ├── README           # Setup instructions
+        └── GITHUB_SSH_PRIVATE_KEY   # <-- you create this
 ```
 
-| Service          | Purpose                                                   |
-|------------------|-----------------------------------------------------------|
-| `jenkins`        | Controller with all tools (python3, kustomize, docker CLI)|
-| `docker` (DinD)  | Docker daemon — Jenkins delegates `docker build/push` here|
+### Services
+
+| Service          | Image                              | Purpose                                                    |
+|------------------|------------------------------------|------------------------------------------------------------|
+| `jenkins`        | Custom (see `Dockerfile`)          | Controller with all tools (python3, kustomize, docker CLI) |
+| `docker` (DinD)  | `docker:27-dind`                   | Docker daemon — Jenkins delegates `docker build/push` here |
 
 ### Configuration via `.env`
 
@@ -186,7 +254,16 @@ All tunables are externalized so you never edit `docker-compose.yml` or `casc.ya
 | `JENKINS_MEM_LIMIT`       | `2G`               | Memory limit for Jenkins container|
 | `DIND_CPU_LIMIT`          | `2.0`              | CPU limit for DinD container     |
 | `DIND_MEM_LIMIT`          | `2G`               | Memory limit for DinD container  |
+| `JENKINS_SECRETS_DIR`     | `./secrets`        | Path to JCasC secrets directory  |
 | `TZ`                      | `UTC`              | Timezone                         |
+
+### Volumes
+
+| Volume                   | Purpose                                |
+|--------------------------|----------------------------------------|
+| `jenkins_home`           | Jenkins data (jobs, builds, config)    |
+| `jenkins_docker_certs`   | TLS certs shared between Jenkins and DinD |
+| `jenkins_docker_data`    | Docker daemon storage (images, layers) |
 
 ### Production Hardening Checklist
 
@@ -200,7 +277,7 @@ The Docker setup applies these best practices out of the box:
 - Script security and sandbox enabled for all pipeline scripts
 - Legacy API token creation disabled
 - Signup disabled
-- CSP headers set to prevent XSS
+- Secrets managed via file-based JCasC secrets (never in YAML or env files)
 
 **Theme & UX**
 - Dark theme (auto-switches based on OS preference via `darkSystem`)
@@ -255,11 +332,26 @@ docker compose down
 docker compose down -v
 ```
 
-### Notes
+### Troubleshooting
 
-- The Jenkinsfile is bind-mounted from `../Jenkinsfile` into the container, so
-  edits are picked up immediately — just re-run the job.
-- Jenkins data persists in the `jenkins_home` Docker volume across restarts.
-- The DinD sidecar uses TLS certs shared via the `docker_certs` volume.
-- To add more JCasC config, edit `casc.yaml` and restart:
-  `docker compose restart jenkins`
+**Jenkins fails to start with credential errors:**
+Ensure the `secrets/GITHUB_SSH_PRIVATE_KEY` file exists and contains a valid
+PEM-format SSH private key. JCasC will log a warning if it cannot resolve the
+`${GITHUB_SSH_PRIVATE_KEY}` variable, but Jenkins will still start — the
+credential will just be empty.
+
+**SCM checkout fails with "Permission denied (publickey)":**
+1. Verify the deploy key's public key is added to the GitHub repo
+2. Check the credential ID in the job config matches `github-ssh-key`
+3. Ensure the repo URL uses the SSH format (`git@github.com:...`), not HTTPS
+
+**Pipeline cannot push to the GitOps repo:**
+The deploy key needs **write access** on the GitOps repo. Edit the deploy key
+in GitHub and enable "Allow write access".
+
+**Changes to `casc.yaml` are not picked up:**
+The `casc.yaml` is baked into the Docker image at build time. After editing,
+rebuild the image:
+```bash
+docker compose up -d --build
+```

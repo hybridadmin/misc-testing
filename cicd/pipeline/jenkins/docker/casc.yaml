@@ -72,6 +72,22 @@ jenkins:
             value: "en_US.UTF-8"
 
 # ─────────────────────────────────────────────────────────────
+# Credentials
+# ─────────────────────────────────────────────────────────────
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - basicSSHUserPrivateKey:
+              scope: GLOBAL
+              id: "github-ssh-key"
+              username: "git"
+              description: "SSH deploy key for GitHub repo access"
+              privateKeySource:
+                directEntry:
+                  privateKey: "${GITHUB_SSH_PRIVATE_KEY}"
+
+# ─────────────────────────────────────────────────────────────
 # Security Settings
 # ─────────────────────────────────────────────────────────────
 security:
@@ -137,7 +153,11 @@ tool:
 # ─────────────────────────────────────────────────────────────
 jobs:
   - script: |
-      pipelineJob('pipeline-deploy') {
+      folder('owner-project-service') {
+        description('Jobs for the owner-project-service project')
+      }
+
+      pipelineJob('owner-project-service/pipeline-deploy') {
         description('CI/CD Pipeline — build, push, and deploy to any environment')
 
         logRotator {
@@ -155,9 +175,18 @@ jobs:
         }
 
         definition {
-          cps {
-            script(new File('/var/jenkins_home/Jenkinsfile').text)
-            sandbox(true)
+          cpsScm {
+            scm {
+              git {
+                remote {
+                  url('git@github.com:hybridadmin/owner-project-service.git')
+                  credentials('github-ssh-key')
+                }
+                branches('*/main')
+              }
+            }
+            scriptPath('Jenkinsfile')
+            lightweight(true)
           }
         }
       }

@@ -51,6 +51,14 @@ ARG KUSTOMIZE_VERSION=5.6.0
 RUN curl -sL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_$(dpkg --print-architecture).tar.gz" \
     | tar xz -C /usr/local/bin/
 
+# ── SSH known hosts (GitHub) ────────────────────────────────
+# Pre-seed GitHub's SSH host keys so git-over-SSH works without
+# manual host key acceptance inside the container.
+RUN mkdir -p /var/jenkins_home/.ssh \
+    && ssh-keyscan -t ed25519,rsa,ecdsa github.com >> /var/jenkins_home/.ssh/known_hosts 2>/dev/null \
+    && chmod 700 /var/jenkins_home/.ssh \
+    && chmod 644 /var/jenkins_home/.ssh/known_hosts
+
 # ── Copy JCasC config ──────────────────────────────────────
 COPY casc.yaml /var/jenkins_home/casc.yaml
 

@@ -1,0 +1,4 @@
+# Secrets — never commit private keys or credentials
+secrets/*
+!secrets/README
+.env
