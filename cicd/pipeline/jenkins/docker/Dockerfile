@@ -59,9 +59,6 @@ RUN mkdir -p /var/jenkins_home/.ssh \
     && chmod 700 /var/jenkins_home/.ssh \
     && chmod 644 /var/jenkins_home/.ssh/known_hosts
 
-# ── Copy JCasC config ──────────────────────────────────────
-COPY casc.yaml /var/jenkins_home/casc.yaml
-
 # ── Filesystem permissions ──────────────────────────────────
 RUN chown -R jenkins:jenkins /var/jenkins_home
 

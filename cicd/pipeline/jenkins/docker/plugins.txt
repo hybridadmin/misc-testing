@@ -63,3 +63,4 @@ locale
 antisamy-markup-formatter
 cloudbees-disk-usage-simple
 prometheus
+generic-webhook-trigger

@@ -35,8 +35,8 @@ services:
     volumes:
       - jenkins_home:/var/jenkins_home
       - docker_certs:/certs/client:ro
-      # Mount the Jenkinsfile so the seed job can load it
-      - ../Jenkinsfile:/var/jenkins_home/Jenkinsfile:ro
+      # JCasC config — volume-mounted for hot-reload without image rebuild
+      - ./casc.yaml:/var/jenkins_home/casc.yaml:ro
       # Mount secrets directory for JCasC file-based secret resolution
       - ${JENKINS_SECRETS_DIR:-./secrets}:/run/jenkins-secrets:ro
     depends_on:

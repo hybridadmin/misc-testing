@@ -86,6 +86,17 @@ credentials:
               privateKeySource:
                 directEntry:
                   privateKey: "${GITHUB_SSH_PRIVATE_KEY}"
+          - usernamePassword:
+              scope: GLOBAL
+              id: "ghcr-credentials"
+              username: "${GHCR_USERNAME}"
+              password: "${GHCR_TOKEN}"
+              description: "GHCR registry credentials (GitHub username + PAT with write:packages)"
+          - string:
+              scope: GLOBAL
+              id: "webhook-token"
+              secret: "${WEBHOOK_TOKEN}"
+              description: "Shared secret for Generic Webhook Trigger authentication"
 
 # ─────────────────────────────────────────────────────────────
 # Security Settings
@@ -166,8 +177,10 @@ jobs:
         }
 
         parameters {
+          stringParam('APP_REPO', 'git@github.com:hybridadmin/owner-project-service.git', 'SSH URL of the application repo to build and deploy')
+          stringParam('IMAGE_NAME', 'hybridadmin/owner-project-service', 'Container image name in the registry (e.g. org/repo). Pushed to ghcr.io/<IMAGE_NAME>:<tag>.')
+          stringParam('IMAGE_TAG', '', 'Git tag to check out and deploy (e.g. v1.2.3). Must match a tag pushed to the application repo.')
           choiceParam('ENVIRONMENT', ['dev', 'staging', 'production'], 'Target deployment environment')
-          stringParam('IMAGE_TAG', '', 'Image tag to build and deploy (e.g. v1.2.3). Leave blank to auto-generate.')
         }
 
         properties {
@@ -179,13 +192,13 @@ jobs:
             scm {
               git {
                 remote {
-                  url('git@github.com:hybridadmin/owner-project-service.git')
+                  url('git@github.com:hybridadmin/jenkins-infra-source.git')
                   credentials('github-ssh-key')
                 }
                 branches('*/main')
               }
             }
-            scriptPath('Jenkinsfile')
+            scriptPath('pipelines/Jenkinsfile')
             lightweight(true)
           }
         }
