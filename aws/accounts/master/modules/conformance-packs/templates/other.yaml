@@ -1,0 +1,24 @@
+---
+Resources:
+  S3BucketReplicationEnabled:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: S3BucketReplicationEnabled
+      Description: "Checks whether S3 buckets have cross-region replication enabled."
+      Scope:
+        ComplianceResourceTypes:
+          - "AWS::S3::Bucket"
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_REPLICATION_ENABLED
+  S3BucketSSLRequestsOnly:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: S3BucketSSLRequestsOnly
+      Description: "Checks whether S3 buckets have policies that require requests to use SSL."
+      Scope:
+        ComplianceResourceTypes:
+          - "AWS::S3::Bucket"
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_SSL_REQUESTS_ONLY

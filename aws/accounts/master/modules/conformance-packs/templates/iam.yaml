@@ -1,0 +1,106 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  AccessKeysRotatedParameterMaxAccessKeyAge:
+    Description: Maximum number of days without rotation. Default 90.
+    Type: String
+    Default: "90"
+  IAMUserUnusedCredentialsCheckParameterMaxCredentialUsageAge:
+    Description: Maximum number of days a credential cannot be used. Default 90.
+    Type: String
+    Default: "90"
+Resources:
+  AccessKeysRotated:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: AccessKeysRotated
+      Description: Checks whether the active access keys are rotated within the number of days specified in maxAccessKeyAge.
+      InputParameters:
+        maxAccessKeyAge:
+          Ref: AccessKeysRotatedParameterMaxAccessKeyAge
+      Source:
+        Owner: AWS
+        SourceIdentifier: ACCESS_KEYS_ROTATED
+  IAMGroupHasUsersCheck:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: IAMGroupHasUsersCheck
+      Description: Checks whether IAM groups have at least one IAM user.
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_GROUP_HAS_USERS_CHECK
+  IAMPasswordPolicy:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: IAMPasswordPolicy
+      Description: Checks whether the account password policy for IAM users meets the specified requirements.
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_PASSWORD_POLICY
+  IAMPolicyNoStatementsWithAdminAccess:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: IAMPolicyNoStatementsWithAdminAccess
+      Description: "Checks whether the default version of IAM policies do not have administrator access."
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_POLICY_NO_STATEMENTS_WITH_ADMIN_ACCESS
+  IAMRootAccessKeyCheck:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: IAMRootAccessKeyCheck
+      Description: Checks whether the root user access key is available. Compliant if key does not exist.
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_ROOT_ACCESS_KEY_CHECK
+  IAMUserGroupMembershipCheck:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: IAMUserGroupMembershipCheck
+      Description: Checks whether IAM users are members of at least one IAM group.
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_USER_GROUP_MEMBERSHIP_CHECK
+  IAMUserMFAEnabled:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: IAMUserMFAEnabled
+      Description: Checks whether the IAM users have multi-factor authentication (MFA) enabled.
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_USER_MFA_ENABLED
+  IAMUserNoPoliciesCheck:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: IAMUserNoPoliciesCheck
+      Description: Checks that none of your IAM users have policies attached. IAM users must inherit permissions from groups or roles.
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_USER_NO_POLICIES_CHECK
+  IAMUserUnusedCredentialsCheck:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: IAMUserUnusedCredentialsCheck
+      Description: Checks whether IAM users have passwords or access keys unused within the specified number of days.
+      InputParameters:
+        maxCredentialUsageAge:
+          Ref: IAMUserUnusedCredentialsCheckParameterMaxCredentialUsageAge
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_USER_UNUSED_CREDENTIALS_CHECK
+  MFAEnabledForIAMConsoleAccess:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: MFAEnabledForIAMConsoleAccess
+      Description: Checks whether MFA is enabled for all IAM users that use a console password.
+      Source:
+        Owner: AWS
+        SourceIdentifier: MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS
+  RootAccountMFAEnabled:
+    Type: "AWS::Config::ConfigRule"
+    Properties:
+      ConfigRuleName: RootAccountMFAEnabled
+      Description: Checks whether the root user of your AWS account requires MFA for console sign-in.
+      Source:
+        Owner: AWS
+        SourceIdentifier: ROOT_ACCOUNT_MFA_ENABLED

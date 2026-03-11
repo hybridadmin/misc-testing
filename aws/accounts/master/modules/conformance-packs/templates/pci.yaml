@@ -1,0 +1,180 @@
+---
+Resources:
+  DMSReplicationNotPublic:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: DMSReplicationNotPublic
+      Description: Checks whether DMS replication instances are public.
+      Source:
+        Owner: AWS
+        SourceIdentifier: DMS_REPLICATION_NOT_PUBLIC
+  EBSSnapshotPublicRestorableCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: EBSSnapshotPublicRestorableCheck
+      Description: Checks whether EBS snapshots are not publicly restorable.
+      Source:
+        Owner: AWS
+        SourceIdentifier: EBS_SNAPSHOT_PUBLIC_RESTORABLE_CHECK
+  EC2InstanceNoPublicIP:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: EC2InstanceNoPublicIP
+      Description: Checks whether EC2 instances have a public IP association.
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_INSTANCE_NO_PUBLIC_IP
+  ElasticsearchInVPCOnly:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: ElasticsearchInVPCOnly
+      Description: Checks whether Elasticsearch Service domains are in VPC.
+      Source:
+        Owner: AWS
+        SourceIdentifier: ELASTICSEARCH_IN_VPC_ONLY
+  IAMRootAccessKeyCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: IAMRootAccessKeyCheck
+      Description: Checks whether the root user access key is available.
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_ROOT_ACCESS_KEY_CHECK
+  IAMUserMFAEnabled:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: IAMUserMFAEnabled
+      Description: Checks whether IAM users have MFA enabled.
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_USER_MFA_ENABLED
+  IncomingSSHDisabled:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: IncomingSSHDisabled
+      Description: Checks whether security groups disallow unrestricted incoming SSH traffic.
+      Source:
+        Owner: AWS
+        SourceIdentifier: INCOMING_SSH_DISABLED
+  InstancesInVPC:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: InstancesInVPC
+      Description: Checks whether EC2 instances belong to a VPC.
+      Source:
+        Owner: AWS
+        SourceIdentifier: INSTANCES_IN_VPC
+  LambdaFunctionPublicAccessProhibited:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: LambdaFunctionPublicAccessProhibited
+      Description: Checks whether the Lambda function policy prohibits public access.
+      Source:
+        Owner: AWS
+        SourceIdentifier: LAMBDA_FUNCTION_PUBLIC_ACCESS_PROHIBITED
+  LambdaInsideVPC:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: LambdaInsideVPC
+      Description: Checks whether a Lambda function is in a VPC.
+      Source:
+        Owner: AWS
+        SourceIdentifier: LAMBDA_INSIDE_VPC
+  MFAEnabledForIAMConsoleAccess:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: MFAEnabledForIAMConsoleAccess
+      Description: Checks whether MFA is enabled for all IAM users that use a console password.
+      Source:
+        Owner: AWS
+        SourceIdentifier: MFA_ENABLED_FOR_IAM_CONSOLE_ACCESS
+  RDSInstancePublicAccessCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: RDSInstancePublicAccessCheck
+      Description: Checks whether RDS instances are not publicly accessible.
+      Source:
+        Owner: AWS
+        SourceIdentifier: RDS_INSTANCE_PUBLIC_ACCESS_CHECK
+  RDSSnapshotsPublicProhibited:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: RDSSnapshotsPublicProhibited
+      Description: Checks if RDS snapshots are public.
+      Source:
+        Owner: AWS
+        SourceIdentifier: RDS_SNAPSHOTS_PUBLIC_PROHIBITED
+  RedshiftClusterPublicAccessCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: RedshiftClusterPublicAccessCheck
+      Description: Checks whether Redshift clusters are not publicly accessible.
+      Source:
+        Owner: AWS
+        SourceIdentifier: REDSHIFT_CLUSTER_PUBLIC_ACCESS_CHECK
+  RestrictedIncomingTraffic:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: RestrictedIncomingTraffic
+      Description: Checks whether security groups disallow unrestricted incoming TCP traffic to specified ports.
+      Source:
+        Owner: AWS
+        SourceIdentifier: RESTRICTED_INCOMING_TRAFFIC
+  RootAccountHardwareMFAEnabled:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: RootAccountHardwareMFAEnabled
+      Description: Checks whether your account is enabled to use hardware MFA device for root credentials.
+      Source:
+        Owner: AWS
+        SourceIdentifier: ROOT_ACCOUNT_HARDWARE_MFA_ENABLED
+  RootAccountMFAEnabled:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: RootAccountMFAEnabled
+      Description: Checks whether the root user requires MFA for console sign-in.
+      Source:
+        Owner: AWS
+        SourceIdentifier: ROOT_ACCOUNT_MFA_ENABLED
+  S3BucketPublicReadProhibited:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: S3BucketPublicReadProhibited
+      Description: Checks that S3 buckets do not allow public read access.
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_READ_PROHIBITED
+  S3BucketPublicWriteProhibited:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: S3BucketPublicWriteProhibited
+      Description: Checks that S3 buckets do not allow public write access.
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_PUBLIC_WRITE_PROHIBITED
+  S3BucketVersioningEnabled:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: S3BucketVersioningEnabled
+      Description: Checks whether versioning is enabled for S3 buckets.
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_VERSIONING_ENABLED
+  VPCDefaultSecurityGroupClosed:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: VPCDefaultSecurityGroupClosed
+      Description: Checks that the default security group of any VPC does not allow inbound or outbound traffic.
+      Source:
+        Owner: AWS
+        SourceIdentifier: VPC_DEFAULT_SECURITY_GROUP_CLOSED
+  VPCSGOpenOnlyToAuthorizedPorts:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: VPCSGOpenOnlyToAuthorizedPorts
+      Description: Checks whether any security groups with inbound 0.0.0.0/0 have TCP or UDP ports accessible.
+      InputParameters:
+        authorizedTcpPorts: "2222,80,443"
+      Source:
+        Owner: AWS
+        SourceIdentifier: VPC_SG_OPEN_ONLY_TO_AUTHORIZED_PORTS
