@@ -20,7 +20,7 @@ include "envcommon" {
 # ---------------------------------------------------------------------------
 
 dependency "sso_config" {
-  config_path = "${get_repo_root()}/environments/master/us-east-1/sso-configuration"
+  config_path = "${get_repo_root()}/envs/master/eu-west-1/sso-configuration"
 
   mock_outputs = {
     sso_instance_arn  = "arn:aws:sso:::instance/ssoins-0000000000000000"
@@ -29,7 +29,7 @@ dependency "sso_config" {
 }
 
 dependency "permission_sets" {
-  config_path = "${get_repo_root()}/environments/master/us-east-1/sso-permission-sets"
+  config_path = "${get_repo_root()}/envs/master/eu-west-1/sso-permission-sets"
 
   mock_outputs = {
     permission_set_arns = {
@@ -49,7 +49,7 @@ generate "provider_override" {
   if_exists = "overwrite_terragrunt"
   contents  = <<-EOF
     provider "aws" {
-      region  = "us-east-1"
+      region  = "eu-west-1"
       profile = "master-admin"
 
       default_tags {

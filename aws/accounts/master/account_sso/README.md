@@ -123,10 +123,10 @@ This repository provides a complete Infrastructure-as-Code setup for configuring
 │       ├── main.tf
 │       ├── variables.tf
 │       └── outputs.tf
-└── environments/                           # Per-account Terragrunt configurations
+└── envs/                           # Per-account Terragrunt configurations
     ├── master/                             # AWS Organizations master account
     │   ├── account.hcl                     # Account-level vars (account ID, profile)
-    │   └── us-east-1/
+    │   └── eu-west-1/
     │       ├── region.hcl
     │       ├── sso-configuration/          # SSO setup (groups, users)
     │       │   └── terragrunt.hcl
@@ -134,19 +134,19 @@ This repository provides a complete Infrastructure-as-Code setup for configuring
     │           └── terragrunt.hcl
     ├── workload-dev/                       # Development account
     │   ├── account.hcl
-    │   └── us-east-1/
+    │   └── eu-west-1/
     │       ├── region.hcl
     │       └── sso-account-assignments/    # Dev account group assignments
     │           └── terragrunt.hcl
     ├── workload-staging/                   # Staging account
     │   ├── account.hcl
-    │   └── us-east-1/
+    │   └── eu-west-1/
     │       ├── region.hcl
     │       └── sso-account-assignments/
     │           └── terragrunt.hcl
     └── workload-prod/                      # Production account
         ├── account.hcl
-        └── us-east-1/
+        └── eu-west-1/
             ├── region.hcl
             └── sso-account-assignments/
                 └── terragrunt.hcl
@@ -176,7 +176,7 @@ These steps must be completed manually before running Terraform. They set up the
 1. Sign in to the **AWS Management Console** using your **master/management account**
 2. Go to **IAM Identity Center** (search for "IAM Identity Center" or "SSO")
 3. Click **Enable** if not already enabled
-4. Choose your preferred **region** (typically `us-east-1`) — this cannot be changed later
+4. Choose your preferred **region** (typically `eu-west-1`) — this cannot be changed later
 5. Under **Settings → Identity source**, note down:
    - **IAM Identity Center ARN** (e.g., `arn:aws:sso:::instance/ssoins-abc123def456`)
    - **Identity store ID** (e.g., `d-1234567890`)
@@ -232,7 +232,7 @@ These steps must be completed manually before running Terraform. They set up the
    - **IdP issuer URL**: The Entity ID from Google
    - **IdP certificate**: The certificate from Google
 6. Under **Provisioning**, note the:
-   - **SCIM endpoint URL** (e.g., `https://scim.us-east-1.amazonaws.com/abc123.../scim/v2`)
+   - **SCIM endpoint URL** (e.g., `https://scim.eu-west-1.amazonaws.com/abc123.../scim/v2`)
    - **Access token** — click **Generate token** and save this securely
 7. Click **Save changes**
 
@@ -298,29 +298,29 @@ Add the following to `~/.aws/config`:
 ```ini
 # Master/management account — used for all SSO operations
 [profile master-admin]
-region = us-east-1
+region = eu-west-1
 # Option A: Static credentials (for initial bootstrap only)
 # aws_access_key_id = AKIA...
 # aws_secret_access_key = ...
 # Option B: SSO (after SSO is set up)
 # sso_start_url = https://d-1234567890.awsapps.com/start
-# sso_region = us-east-1
+# sso_region = eu-west-1
 # sso_account_id = 111111111111
 # sso_role_name = AdministratorAccess
 
 # Workload accounts (for other Terraform work, not needed for SSO deployment)
 [profile workload-dev-admin]
-region = us-east-1
+region = eu-west-1
 role_arn = arn:aws:iam::222222222222:role/OrganizationAccountAccessRole
 source_profile = master-admin
 
 [profile workload-staging-admin]
-region = us-east-1
+region = eu-west-1
 role_arn = arn:aws:iam::333333333333:role/OrganizationAccountAccessRole
 source_profile = master-admin
 
 [profile workload-prod-admin]
-region = us-east-1
+region = eu-west-1
 role_arn = arn:aws:iam::444444444444:role/OrganizationAccountAccessRole
 source_profile = master-admin
 ```
@@ -335,20 +335,20 @@ Update the following files with your actual AWS account IDs and CLI profile name
 
 | File | What to Change |
 |---|---|
-| `environments/master/account.hcl` | `aws_account_id`, `aws_profile` |
-| `environments/workload-dev/account.hcl` | `aws_account_id`, `aws_profile` |
-| `environments/workload-staging/account.hcl` | `aws_account_id`, `aws_profile` |
-| `environments/workload-prod/account.hcl` | `aws_account_id`, `aws_profile` |
-| `environments/workload-dev/.../sso-account-assignments/terragrunt.hcl` | `dev_account_id`, provider profile |
-| `environments/workload-staging/.../sso-account-assignments/terragrunt.hcl` | `staging_account_id`, provider profile |
-| `environments/workload-prod/.../sso-account-assignments/terragrunt.hcl` | `prod_account_id`, provider profile |
+| `envs/master/account.hcl` | `aws_account_id`, `aws_profile` |
+| `envs/workload-dev/account.hcl` | `aws_account_id`, `aws_profile` |
+| `envs/workload-staging/account.hcl` | `aws_account_id`, `aws_profile` |
+| `envs/workload-prod/account.hcl` | `aws_account_id`, `aws_profile` |
+| `envs/workload-dev/.../sso-account-assignments/terragrunt.hcl` | `dev_account_id`, provider profile |
+| `envs/workload-staging/.../sso-account-assignments/terragrunt.hcl` | `staging_account_id`, provider profile |
+| `envs/workload-prod/.../sso-account-assignments/terragrunt.hcl` | `prod_account_id`, provider profile |
 
 ### Step 2: Deploy SSO Configuration (Master Account)
 
 This creates the SSO groups in the Identity Store. If you use SCIM and groups are already synced, you can skip this or use it as a safety net.
 
 ```bash
-cd environments/master/us-east-1/sso-configuration
+cd envs/master/eu-west-1/sso-configuration
 terragrunt init
 terragrunt plan
 terragrunt apply
@@ -359,7 +359,7 @@ terragrunt apply
 This creates all permission sets (AdministratorAccess, DeveloperAccess, ReadOnlyAccess, etc.):
 
 ```bash
-cd environments/master/us-east-1/sso-permission-sets
+cd envs/master/eu-west-1/sso-permission-sets
 terragrunt init
 terragrunt plan
 terragrunt apply
@@ -371,19 +371,19 @@ Deploy assignments for each target account. **All assignments are made from the 
 
 ```bash
 # Dev account assignments
-cd environments/workload-dev/us-east-1/sso-account-assignments
+cd envs/workload-dev/eu-west-1/sso-account-assignments
 terragrunt init
 terragrunt plan
 terragrunt apply
 
 # Staging account assignments
-cd environments/workload-staging/us-east-1/sso-account-assignments
+cd envs/workload-staging/eu-west-1/sso-account-assignments
 terragrunt init
 terragrunt plan
 terragrunt apply
 
 # Production account assignments
-cd environments/workload-prod/us-east-1/sso-account-assignments
+cd envs/workload-prod/eu-west-1/sso-account-assignments
 terragrunt init
 terragrunt plan
 terragrunt apply
@@ -507,13 +507,13 @@ This is the default configuration. Customize per your organization's needs.
 1. **Create the account directory structure:**
 
 ```bash
-mkdir -p environments/workload-newaccount/us-east-1/sso-account-assignments
+mkdir -p envs/workload-newaccount/eu-west-1/sso-account-assignments
 ```
 
 2. **Create `account.hcl`:**
 
 ```hcl
-# environments/workload-newaccount/account.hcl
+# envs/workload-newaccount/account.hcl
 locals {
   account_name   = "workload-newaccount"
   aws_account_id = "555555555555"
@@ -524,9 +524,9 @@ locals {
 3. **Create `region.hcl`:**
 
 ```hcl
-# environments/workload-newaccount/us-east-1/region.hcl
+# envs/workload-newaccount/eu-west-1/region.hcl
 locals {
-  aws_region = "us-east-1"
+  aws_region = "eu-west-1"
 }
 ```
 
@@ -535,7 +535,7 @@ locals {
 5. **Deploy:**
 
 ```bash
-cd environments/workload-newaccount/us-east-1/sso-account-assignments
+cd envs/workload-newaccount/eu-west-1/sso-account-assignments
 terragrunt apply
 ```
 
@@ -543,7 +543,7 @@ terragrunt apply
 
 ## Adding a New Permission Set
 
-1. Edit `environments/master/us-east-1/sso-permission-sets/terragrunt.hcl`
+1. Edit `envs/master/eu-west-1/sso-permission-sets/terragrunt.hcl`
 2. Add a new entry to the `permission_sets` list:
 
 ```hcl
@@ -559,7 +559,7 @@ terragrunt apply
 }
 ```
 
-3. Deploy: `cd environments/master/us-east-1/sso-permission-sets && terragrunt apply`
+3. Deploy: `cd envs/master/eu-west-1/sso-permission-sets && terragrunt apply`
 4. Add assignments using this permission set in the relevant account assignment configs
 
 ---
@@ -568,7 +568,7 @@ terragrunt apply
 
 1. **Create the group in Google Workspace** (Admin Console → Directory → Groups)
 2. **Wait for SCIM sync** (or trigger manual sync)
-3. If managing groups via Terraform (not SCIM), add to `environments/master/us-east-1/sso-configuration/terragrunt.hcl`:
+3. If managing groups via Terraform (not SCIM), add to `envs/master/eu-west-1/sso-configuration/terragrunt.hcl`:
 
 ```hcl
 {
@@ -577,7 +577,7 @@ terragrunt apply
 }
 ```
 
-4. Deploy sso-configuration: `cd environments/master/us-east-1/sso-configuration && terragrunt apply`
+4. Deploy sso-configuration: `cd envs/master/eu-west-1/sso-configuration && terragrunt apply`
 5. Add account assignments for the new group in the relevant account configs
 
 ---
@@ -630,28 +630,28 @@ Add SSO profiles to `~/.aws/config`:
 # Example: Developer access to dev account
 [profile dev-developer]
 sso_start_url = https://d-1234567890.awsapps.com/start
-sso_region = us-east-1
+sso_region = eu-west-1
 sso_account_id = 222222222222
 sso_role_name = DeveloperAccess
-region = us-east-1
+region = eu-west-1
 output = json
 
 # Example: Read-only access to production
 [profile prod-readonly]
 sso_start_url = https://d-1234567890.awsapps.com/start
-sso_region = us-east-1
+sso_region = eu-west-1
 sso_account_id = 444444444444
 sso_role_name = ReadOnlyAccess
-region = us-east-1
+region = eu-west-1
 output = json
 
 # Example: Admin access to production (break-glass)
 [profile prod-admin]
 sso_start_url = https://d-1234567890.awsapps.com/start
-sso_region = us-east-1
+sso_region = eu-west-1
 sso_account_id = 444444444444
 sso_role_name = AdministratorAccess
-region = us-east-1
+region = eu-west-1
 output = json
 ```
 
