@@ -2,7 +2,7 @@
 # _envcommon/pg_rds.hcl
 #
 # Shared Terragrunt configuration for the pg_rds component.
-# Included by each leaf-level terragrunt.hcl in environments/<env>/<region>/pg_rds/
+# Included by each leaf-level terragrunt.hcl in envs/<env>/<region>/pg_rds/
 # -----------------------------------------------------------------------------
 
 terraform {

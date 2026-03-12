@@ -10,8 +10,8 @@
 
 locals {
   # Parse the file path to extract environment and region from the directory structure.
-  # Layout: environments/<environment>/<region>/vpc/terragrunt.hcl
-  parsed      = regex(".+/environments/(?P<env>[^/]+)/(?P<region>[^/]+)/.*", get_terragrunt_dir())
+  # Layout: envs/<environment>/<region>/vpc/terragrunt.hcl
+  parsed      = regex(".+/envs/(?P<env>[^/]+)/(?P<region>[^/]+)/.*", get_terragrunt_dir())
   environment = local.parsed.env
   aws_region  = local.parsed.region
 

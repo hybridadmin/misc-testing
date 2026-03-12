@@ -74,16 +74,16 @@ vpc/
 │   ├── flow_logs.tf                                    # VPC flow logs (CloudWatch or S3)
 │   ├── endpoints.tf                                    # Gateway + interface VPC endpoints
 │   └── outputs.tf                                      # 30+ outputs
-├── environments/
+├── envs/
 │   ├── dev/
 │   │   ├── env.hcl                                     # Dev environment variables
-│   │   └── us-east-1/vpc/terragrunt.hcl                # Leaf deployment
+│   │   └── eu-west-1/vpc/terragrunt.hcl                # Leaf deployment
 │   ├── staging/
 │   │   ├── env.hcl                                     # Staging environment variables
-│   │   └── us-east-1/vpc/terragrunt.hcl                # Leaf deployment
+│   │   └── eu-west-1/vpc/terragrunt.hcl                # Leaf deployment
 │   └── prod/
 │       ├── env.hcl                                     # Production environment variables
-│       └── us-east-1/vpc/terragrunt.hcl                # Leaf deployment
+│       └── eu-west-1/vpc/terragrunt.hcl                # Leaf deployment
 ├── README.md
 └── PROMPT.md
 ```
@@ -114,13 +114,13 @@ Before deploying, ensure:
 Edit the `env.hcl` file for your target environment:
 
 ```hcl
-# environments/dev/env.hcl
+# envs/dev/env.hcl
 locals {
   project    = "myproject"
   account_id = "123456789012"          # Your AWS account ID
 
   cidr_block         = "10.0.0.0/16"
-  availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]
+  availability_zones = ["eu-west-1a", "eu-west-1b", "eu-west-1c"]
 
   public_subnet_cidrs   = ["10.0.0.0/20", "10.0.16.0/20", "10.0.32.0/20"]
   private_subnet_cidrs  = ["10.0.48.0/20", "10.0.64.0/20", "10.0.80.0/20"]
@@ -133,7 +133,7 @@ locals {
 ### 2. Deploy with Terragrunt
 
 ```bash
-cd environments/dev/us-east-1/vpc
+cd envs/dev/eu-west-1/vpc
 
 # Preview changes
 terragrunt plan
@@ -486,11 +486,11 @@ Gateway endpoints for S3 and DynamoDB are free and route traffic over the AWS ba
 
 ```bash
 # Create the region directory
-mkdir -p environments/prod/eu-west-1/vpc
+mkdir -p envs/prod/eu-west-1/vpc
 
 # Copy the leaf terragrunt.hcl
-cp environments/prod/us-east-1/vpc/terragrunt.hcl \
-   environments/prod/eu-west-1/vpc/terragrunt.hcl
+cp envs/prod/eu-west-1/vpc/terragrunt.hcl \
+   envs/prod/eu-west-1/vpc/terragrunt.hcl
 ```
 
 Override AZs in the leaf `terragrunt.hcl`:
@@ -509,7 +509,7 @@ inputs = {
 Add an `account.hcl` next to the region directory:
 
 ```
-environments/prod/us-east-1/account.hcl
+envs/prod/eu-west-1/account.hcl
 ```
 
 ```hcl
@@ -602,13 +602,13 @@ This prevents CIDR conflicts when peering VPCs across environments.
 │   - Module source path                                      │
 │   - Shared default inputs from env.hcl                      │
 ├─────────────────────────────────────────────────────────────┤
-│ environments/<env>/env.hcl                                  │
+│ envs/<env>/env.hcl                                          │
 │   - CIDR blocks, AZs, subnet CIDRs                         │
 │   - NAT gateway strategy (single vs multi)                  │
 │   - Flow log configuration                                  │
 │   - Endpoint and NACL settings                              │
 ├─────────────────────────────────────────────────────────────┤
-│ environments/<env>/<region>/vpc/terragrunt.hcl              │
+│ envs/<env>/<region>/vpc/terragrunt.hcl                      │
 │   - Includes root + envcommon                               │
 │   - Per-region overrides (AZs, CIDRs for multi-region)     │
 └─────────────────────────────────────────────────────────────┘

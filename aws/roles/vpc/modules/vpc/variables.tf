@@ -307,10 +307,10 @@ variable "interface_endpoints" {
 
   # Example:
   # interface_endpoints = {
-  #   ssm             = { service_name = "com.amazonaws.us-east-1.ssm" }
-  #   secretsmanager  = { service_name = "com.amazonaws.us-east-1.secretsmanager" }
-  #   ecr_api         = { service_name = "com.amazonaws.us-east-1.ecr.api" }
-  #   ecr_dkr         = { service_name = "com.amazonaws.us-east-1.ecr.dkr" }
+  #   ssm             = { service_name = "com.amazonaws.eu-west-1.ssm" }
+  #   secretsmanager  = { service_name = "com.amazonaws.eu-west-1.secretsmanager" }
+  #   ecr_api         = { service_name = "com.amazonaws.eu-west-1.ecr.api" }
+  #   ecr_dkr         = { service_name = "com.amazonaws.eu-west-1.ecr.dkr" }
   # }
 }
 

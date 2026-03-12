@@ -1,4 +1,4 @@
-# Root terragrunt.hcl - provides common configuration for all environments
+# Root terragrunt.hcl - provides common configuration for all envs
 #
 # This file is included by all child terragrunt.hcl files and provides:
 # - Remote state configuration (S3 + DynamoDB)
@@ -7,8 +7,8 @@
 
 locals {
   # Parse the file path to extract environment and region information
-  # Expected path structure: environments/<env>/<component>/<region>/terragrunt.hcl
-  # or: environments/<env>/<component>/terragrunt.hcl (when region is in the dir name)
+  # Expected path structure: envs/<env>/<component>/<region>/terragrunt.hcl
+  # or: envs/<env>/<component>/terragrunt.hcl (when region is in the dir name)
   env_vars = read_terragrunt_config(find_in_parent_folders("env.hcl"))
 
   project     = local.env_vars.locals.project

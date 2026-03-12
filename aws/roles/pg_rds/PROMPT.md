@@ -35,16 +35,16 @@ Create the following structure under `aws/roles/[ROLE_NAME]/`:
 │   ├── security.tf                                   # If networking/SG resources needed
 │   ├── monitoring.tf                                 # If CloudWatch alarms apply
 │   └── outputs.tf
-├── environments/
+├── envs/
 │   ├── dev/
 │   │   ├── env.hcl
-│   │   └── us-east-1/[ROLE_NAME]/terragrunt.hcl
+│   │   └── eu-west-1/[ROLE_NAME]/terragrunt.hcl
 │   ├── staging/
 │   │   ├── env.hcl
-│   │   └── us-east-1/[ROLE_NAME]/terragrunt.hcl
+│   │   └── eu-west-1/[ROLE_NAME]/terragrunt.hcl
 │   └── prod/
 │       ├── env.hcl
-│       └── us-east-1/[ROLE_NAME]/terragrunt.hcl
+│       └── eu-west-1/[ROLE_NAME]/terragrunt.hcl
 └── README.md
 ```
 
@@ -130,7 +130,7 @@ Create the following structure under `aws/roles/[ROLE_NAME]/`:
 
 **Root `terragrunt.hcl`:**
 - Parse the directory path with regex to extract environment and region:
-  `regex(".+/environments/(?P<env>[^/]+)/(?P<region>[^/]+)/.*", get_terragrunt_dir())`
+  `regex(".+/envs/(?P<env>[^/]+)/(?P<region>[^/]+)/.*", get_terragrunt_dir())`
 - Load `env.hcl` via `read_terragrunt_config(find_in_parent_folders("env.hcl"))`.
 - Optionally load `account.hcl` with `try()` for multi-account support.
 - Configure S3 remote state with DynamoDB locking (bucket:
@@ -145,7 +145,7 @@ Create the following structure under `aws/roles/[ROLE_NAME]/`:
 - Read `env.hcl` and pass shared inputs. Use `try()` with `[]` fallback for
   optional list values.
 
-**`environments/<env>/env.hcl`:**
+**`envs/<env>/env.hcl`:**
 - Pure `locals {}` block only -- no terraform or inputs blocks.
 - Define: project, service, environment, account_id, networking, and all
   environment-specific tunables.

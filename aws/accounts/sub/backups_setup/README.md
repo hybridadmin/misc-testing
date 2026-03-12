@@ -90,7 +90,7 @@ Member Accounts                       DevOps Account                 Backup Acco
 │       ├── ec2ImageCopy.ts        # SQS: deferred AMI copy, tag, and share
 │       └── ecrImageEventHandler.ts# EventBridge: handles ECR image push/delete events
 │
-└── environments/
+└── envs/
     ├── prod/
     │   ├── env.hcl                # Prod-wide variables (account IDs, org IDs, SNS topics)
     │   ├── backup-account/
@@ -182,22 +182,22 @@ This produces `lambdas/lambda.zip` containing compiled JavaScript and production
 
 ```bash
 # Deploy the backup account infrastructure
-cd environments/prod/backup-account/us-west-2
+cd envs/prod/backup-account/us-west-2
 terragrunt apply
 
 # Deploy member-account resources for eu-west-1
-cd environments/prod/member-accounts/eu-west-1
+cd envs/prod/member-accounts/eu-west-1
 terragrunt apply
 
 # Deploy the devops-central stack (auto-builds lambdas)
-cd environments/prod/devops-central/eu-west-1
+cd envs/prod/devops-central/eu-west-1
 terragrunt apply
 ```
 
 ### Deploying all components in an environment
 
 ```bash
-cd environments/prod
+cd envs/prod
 terragrunt run-all apply
 ```
 
@@ -205,11 +205,11 @@ terragrunt run-all apply
 
 ```bash
 # Single component
-cd environments/prod/devops-central/eu-west-1
+cd envs/prod/devops-central/eu-west-1
 terragrunt plan
 
 # All components
-cd environments/prod
+cd envs/prod
 terragrunt run-all plan
 ```
 
@@ -221,7 +221,7 @@ The member-account directory structure deploys to whichever AWS account your cre
 2. **Create per-account subdirectories** under the region directory:
 
 ```
-environments/prod/member-accounts/eu-west-1/
+envs/prod/member-accounts/eu-west-1/
 ├── account-111111111111/
 │   ├── env.hcl
 │   └── terragrunt.hcl
@@ -234,11 +234,11 @@ environments/prod/member-accounts/eu-west-1/
 
 ```bash
 # Single component
-cd environments/prod/backup-account/us-west-2
+cd envs/prod/backup-account/us-west-2
 terragrunt destroy
 
 # All components (respects dependency order)
-cd environments/prod
+cd envs/prod
 terragrunt run-all destroy
 ```
 
@@ -405,13 +405,13 @@ Reduced deployment for testing:
 ## Adding a New Member Account
 
 1. Ensure AWS credentials target the new member account.
-2. Navigate to the desired region directory under `environments/<env>/member-accounts/<region>/`.
+2. Navigate to the desired region directory under `envs/<env>/member-accounts/<region>/`.
 3. Run `terragrunt apply`.
 
 If you need per-account state isolation (recommended for production), create account-specific subdirectories:
 
 ```
-environments/prod/member-accounts/eu-west-1/
+envs/prod/member-accounts/eu-west-1/
 └── <account-id>/
     ├── env.hcl          # Same as parent env.hcl
     └── terragrunt.hcl   # Same as parent terragrunt.hcl, adjust source path
@@ -419,7 +419,7 @@ environments/prod/member-accounts/eu-west-1/
 
 ## Adding a New Region
 
-1. Create a new region directory under `environments/<env>/member-accounts/<new-region>/`.
+1. Create a new region directory under `envs/<env>/member-accounts/<new-region>/`.
 2. Create `env.hcl` with the `aws_region` set to the new region.
 3. Create `terragrunt.hcl` with appropriate feature toggles (use `af-south-1` or `us-west-2` as a template depending on the region's role).
 4. If the new region has org-level permission limitations (like Cape Town), set `is_cape_town = true`.

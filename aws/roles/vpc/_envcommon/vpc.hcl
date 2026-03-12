@@ -2,7 +2,7 @@
 # _envcommon/vpc.hcl
 #
 # Shared Terragrunt configuration for the VPC component.
-# Included by each leaf-level terragrunt.hcl in environments/<env>/<region>/vpc/
+# Included by each leaf-level terragrunt.hcl in envs/<env>/<region>/vpc/
 # -----------------------------------------------------------------------------
 
 terraform {

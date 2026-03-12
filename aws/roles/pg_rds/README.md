@@ -53,16 +53,16 @@ pg_rds/
 │   ├── security.tf                                 # Security group with CIDR and SG ingress rules
 │   ├── monitoring.tf                               # Enhanced Monitoring IAM role, CloudWatch alarms
 │   └── outputs.tf                                  # 20+ outputs
-├── environments/
+├── envs/
 │   ├── dev/
 │   │   ├── env.hcl                                 # Dev environment variables
-│   │   └── us-east-1/pg_rds/terragrunt.hcl         # Leaf deployment
+│   │   └── eu-west-1/pg_rds/terragrunt.hcl         # Leaf deployment
 │   ├── staging/
 │   │   ├── env.hcl                                 # Staging environment variables
-│   │   └── us-east-1/pg_rds/terragrunt.hcl         # Leaf deployment
+│   │   └── eu-west-1/pg_rds/terragrunt.hcl         # Leaf deployment
 │   └── prod/
 │       ├── env.hcl                                 # Production environment variables
-│       └── us-east-1/pg_rds/terragrunt.hcl         # Leaf deployment
+│       └── eu-west-1/pg_rds/terragrunt.hcl         # Leaf deployment
 └── README.md
 ```
 
@@ -92,7 +92,7 @@ Before deploying, ensure:
 Edit the `env.hcl` file for your target environment. At minimum, replace the placeholder values:
 
 ```hcl
-# environments/dev/env.hcl
+# envs/dev/env.hcl
 locals {
   project    = "myproject"
   account_id = "123456789012"          # Your AWS account ID
@@ -108,7 +108,7 @@ locals {
 ### 2. Deploy with Terragrunt
 
 ```bash
-cd environments/dev/us-east-1/pg_rds
+cd envs/dev/eu-west-1/pg_rds
 
 # Preview changes
 terragrunt plan
@@ -243,7 +243,7 @@ inputs = {
 read_replicas = {
   reader1 = {
     instance_class      = "db.r6g.large"    # Optional, inherits from primary
-    availability_zone   = "us-east-1b"      # Optional
+    availability_zone   = "eu-west-1b"      # Optional
     storage_encrypted   = true              # Default: true
     kms_key_id          = ""                # Default: inherits from primary
     publicly_accessible = false             # Default: false
@@ -447,14 +447,14 @@ parameter_group_parameters = [
 Create a new directory under the environment with the region name:
 
 ```bash
-mkdir -p environments/prod/eu-west-1/pg_rds
+mkdir -p envs/prod/eu-west-1/pg_rds
 ```
 
 Copy an existing leaf `terragrunt.hcl` and adjust as needed:
 
 ```bash
-cp environments/prod/us-east-1/pg_rds/terragrunt.hcl \
-   environments/prod/eu-west-1/pg_rds/terragrunt.hcl
+cp envs/prod/eu-west-1/pg_rds/terragrunt.hcl \
+   envs/prod/eu-west-1/pg_rds/terragrunt.hcl
 ```
 
 The root `terragrunt.hcl` automatically extracts the region from the directory path.
@@ -464,7 +464,7 @@ The root `terragrunt.hcl` automatically extracts the region from the directory p
 Add an `account.hcl` file next to the region directory:
 
 ```
-environments/prod/us-east-1/account.hcl
+envs/prod/eu-west-1/account.hcl
 ```
 
 ```hcl
@@ -477,7 +477,7 @@ This overrides the `account_id` from `env.hcl` for that specific deployment.
 
 ### Adding a new environment
 
-1. Create the directory: `mkdir -p environments/uat`
+1. Create the directory: `mkdir -p envs/uat`
 2. Copy and customize `env.hcl` from an existing environment.
 3. Create region/deployment directories as above.
 4. Add the environment name to the `environment` variable validation in `variables.tf` if not already listed.
@@ -546,12 +546,12 @@ Set `auto_minor_version_upgrade = true` (default) and the upgrade applies during
 │   - Module source path                                      │
 │   - Shared default inputs from env.hcl                      │
 ├─────────────────────────────────────────────────────────────┤
-│ environments/<env>/env.hcl                                  │
+│ envs/<env>/env.hcl                                          │
 │   - Account ID, VPC, subnets                                │
 │   - Instance sizing, HA, backup settings                    │
 │   - Monitoring and alarm configuration                      │
 ├─────────────────────────────────────────────────────────────┤
-│ environments/<env>/<region>/pg_rds/terragrunt.hcl           │
+│ envs/<env>/<region>/pg_rds/terragrunt.hcl                   │
 │   - Includes root + envcommon                               │
 │   - Per-deployment overrides (db_name, blue/green, etc.)    │
 └─────────────────────────────────────────────────────────────┘
