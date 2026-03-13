@@ -110,6 +110,8 @@ This repository provides a complete Infrastructure-as-Code setup for configuring
 │   ├── sso-configuration.hcl
 │   ├── sso-permission-sets.hcl
 │   └── sso-account-assignments.hcl
+├── scripts/
+│   └── generate_account_dirs.sh            # Auto-generate workload account directories from AWS OUs
 ├── modules/                                # Terraform modules
 │   ├── sso-configuration/                  # Creates SSO groups/users in Identity Store
 │   │   ├── main.tf
@@ -503,6 +505,51 @@ This is the default configuration. Customize per your organization's needs.
 ---
 
 ## Adding a New AWS Account
+
+### Automated (recommended)
+
+The `generate_account_dirs.sh` script queries AWS Organizations to discover accounts in the target OUs and auto-generates the correct directory structure with a default set of SSO account assignments.
+
+1. **Edit the script** to configure your target OUs in the `TARGET_OUS` array at the top of `scripts/generate_account_dirs.sh`:
+
+```bash
+TARGET_OUS=(
+    "ou-xxxx-cccccccc"  # Production OU
+    "ou-xxxx-dddddddd"  # Development OU
+)
+```
+
+2. **Run the script** (requires AWS CLI credentials with `organizations:ListAccountsForParent` permission):
+
+```bash
+# Preview what will be created
+./scripts/generate_account_dirs.sh --dry-run
+
+# Create the directories
+./scripts/generate_account_dirs.sh
+```
+
+The script will:
+- Query each OU for active accounts
+- Skip the master account (identified from `envs/master/account.hcl`)
+- Create `account.hcl`, `region.hcl`, and `sso-account-assignments/terragrunt.hcl` for each account
+- Generated assignments include a default set of groups (AWS-Admins, AWS-ReadOnly, AWS-SecurityAudit) — customise per account after generation
+- Existing directories are never overwritten
+
+3. **Review and customise** the generated `terragrunt.hcl` files to adjust group assignments and permission sets for each account.
+
+4. **Deploy:**
+
+```bash
+# Deploy all assignments at once
+cd envs && terragrunt run-all plan
+
+# Or deploy a single account
+cd envs/workload-newaccount/eu-west-1/sso-account-assignments
+terragrunt apply
+```
+
+### Manual
 
 1. **Create the account directory structure:**
 

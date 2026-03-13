@@ -53,79 +53,82 @@ Terraform modules + Terragrunt live configurations for bootstrapping foundationa
 
 ```
 .
+├── terragrunt.hcl                  # Root config (remote state, provider)
+├── _envcommon/
+│   ├── cross-account-roles.hcl     # Shared config for cross-account-roles
+│   ├── kms-keys.hcl                # Shared config for kms-keys
+│   └── backup-vault.hcl            # Shared config for backup-vault
+│
 ├── modules/
-│   ├── cross-account-roles/       # IAM cross-account roles
+│   ├── cross-account-roles/        # IAM cross-account roles
 │   │   ├── main.tf
 │   │   ├── variables.tf
 │   │   ├── outputs.tf
 │   │   ├── versions.tf
 │   │   └── README.md
 │   │
-│   ├── kms-keys/                  # Organisation-wide AMI encryption key
+│   ├── kms-keys/                   # Organisation-wide AMI encryption key
 │   │   ├── main.tf
 │   │   ├── variables.tf
 │   │   ├── outputs.tf
 │   │   ├── versions.tf
 │   │   └── README.md
 │   │
-│   └── backup-vault/              # DR backup vault infrastructure
+│   └── backup-vault/               # DR backup vault infrastructure
 │       ├── main.tf
 │       ├── variables.tf
 │       ├── outputs.tf
 │       ├── versions.tf
 │       └── README.md
 │
-└── live/                           # Terragrunt live configurations
-    ├── terragrunt.hcl              #   Root config (remote state, provider)
-    ├── _envcommon/
-    │   ├── cross-account-roles.hcl #   Shared config for cross-account-roles
-    │   ├── kms-keys.hcl            #   Shared config for kms-keys
-    │   └── backup-vault.hcl        #   Shared config for backup-vault
-    │
-    ├── dev/
-    │   ├── account.hcl
-    │   ├── cross-account-roles/
-    │   │   └── terragrunt.hcl
-    │   └── kms-keys/
-    │       └── terragrunt.hcl
-    │
-    ├── staging/
-    │   ├── account.hcl
-    │   ├── cross-account-roles/
-    │   │   └── terragrunt.hcl
-    │   └── kms-keys/
-    │       └── terragrunt.hcl
-    │
-    ├── prod/
-    │   ├── account.hcl
-    │   ├── cross-account-roles/
-    │   │   └── terragrunt.hcl
-    │   └── kms-keys/
-    │       └── terragrunt.hcl
-    │
-    └── backup/
-        ├── account.hcl
-        └── backup-vault/
-            └── terragrunt.hcl
+├── envs/                            # Terragrunt environment configurations
+│   ├── dev/
+│   │   ├── account.hcl
+│   │   ├── cross-account-roles/
+│   │   │   └── terragrunt.hcl
+│   │   └── kms-keys/
+│   │       └── terragrunt.hcl
+│   │
+│   ├── staging/
+│   │   ├── account.hcl
+│   │   ├── cross-account-roles/
+│   │   │   └── terragrunt.hcl
+│   │   └── kms-keys/
+│   │       └── terragrunt.hcl
+│   │
+│   ├── prod/
+│   │   ├── account.hcl
+│   │   ├── cross-account-roles/
+│   │   │   └── terragrunt.hcl
+│   │   └── kms-keys/
+│   │       └── terragrunt.hcl
+│   │
+│   └── backup/
+│       ├── account.hcl
+│       └── backup-vault/
+│           └── terragrunt.hcl
+│
+└── scripts/
+    └── generate_account_dirs.sh     # Script to scaffold new account directories
 ```
 
 ### How the Config Hierarchy Works
 
 ```
-live/terragrunt.hcl                  <-- Remote state (S3) + provider (assume role)
+terragrunt.hcl                       <-- Remote state (S3) + provider (assume role)
   │
-  ├── live/{account}/account.hcl     <-- Account ID, name, region
+  ├── envs/{account}/account.hcl     <-- Account ID, name, region
   │
-  └── live/_envcommon/               <-- Module source + shared default inputs
+  └── _envcommon/                    <-- Module source + shared default inputs
         {module-name}.hcl
               │
-              └── live/{account}/{module-name}/terragrunt.hcl
+              └── envs/{account}/{module-name}/terragrunt.hcl
                                      <-- Pulls in root + envcommon, adds overrides
 ```
 
 Each account's `terragrunt.hcl` inherits from:
-1. **Root** (`live/terragrunt.hcl`) -- remote state key is auto-namespaced per account, and the AWS provider assumes a role into the target account.
-2. **Envcommon** (`live/_envcommon/{module-name}.hcl`) -- the module source path and default variable values.
+1. **Root** (`terragrunt.hcl`) -- remote state key is auto-namespaced per account, and the AWS provider assumes a role into the target account.
+2. **Envcommon** (`_envcommon/{module-name}.hcl`) -- the module source path and default variable values.
 
 Account-specific overrides go in the account's own `terragrunt.hcl` `inputs` block.
 
@@ -144,14 +147,14 @@ There are several placeholder values you must update before deploying:
 
 | File | Value to Update |
 |---|---|
-| `live/terragrunt.hcl` | `state_bucket`, `state_lock_table`, `state_region` |
-| `live/_envcommon/cross-account-roles.hcl` | `trusted_account_id` |
-| `live/_envcommon/kms-keys.hcl` | `organization_id` |
-| `live/_envcommon/backup-vault.hcl` | `organization_id`, `backup_source_account_ids`, `sns_topic_arn`, `cross_account_role_name`, `bucket_read_org_paths` |
-| `live/dev/account.hcl` | `account_id` |
-| `live/staging/account.hcl` | `account_id` |
-| `live/prod/account.hcl` | `account_id` |
-| `live/backup/account.hcl` | `account_id` |
+| `terragrunt.hcl` | `state_bucket`, `state_lock_table`, `state_region` |
+| `_envcommon/cross-account-roles.hcl` | `trusted_account_id` |
+| `_envcommon/kms-keys.hcl` | `organization_id` |
+| `_envcommon/backup-vault.hcl` | `organization_id`, `backup_source_account_ids`, `sns_topic_arn`, `cross_account_role_name`, `bucket_read_org_paths` |
+| `envs/dev/account.hcl` | `account_id` |
+| `envs/staging/account.hcl` | `account_id` |
+| `envs/prod/account.hcl` | `account_id` |
+| `envs/backup/account.hcl` | `account_id` |
 
 ### 2. Remote State Setup
 
@@ -191,7 +194,7 @@ aws dynamodb create-table \
 
 ### 3. Assume-Role Permissions
 
-Terragrunt assumes `OrganizationAccountAccessRole` in each target account. This role is created automatically by AWS Organizations when you create member accounts. If you use a different role, update the `role_arn` in `live/terragrunt.hcl`.
+Terragrunt assumes `OrganizationAccountAccessRole` in each target account. This role is created automatically by AWS Organizations when you create member accounts. If you use a different role, update the `role_arn` in `terragrunt.hcl`.
 
 Your local AWS credentials (or CI/CD role) must have permission to call `sts:AssumeRole` on the deployment role in each target account.
 
@@ -200,7 +203,7 @@ Your local AWS credentials (or CI/CD role) must have permission to call `sts:Ass
 ### Single Module in a Single Account
 
 ```bash
-cd live/dev/kms-keys
+cd envs/dev/kms-keys
 terragrunt plan
 terragrunt apply
 ```
@@ -208,7 +211,7 @@ terragrunt apply
 ### All Modules in a Single Account
 
 ```bash
-cd live/dev
+cd envs/dev
 terragrunt run-all plan
 terragrunt run-all apply
 ```
@@ -216,7 +219,7 @@ terragrunt run-all apply
 ### A Specific Module Across All Accounts
 
 ```bash
-cd live
+cd envs
 terragrunt run-all plan --terragrunt-include-dir "*/kms-keys"
 terragrunt run-all apply --terragrunt-include-dir "*/kms-keys"
 ```
@@ -224,7 +227,7 @@ terragrunt run-all apply --terragrunt-include-dir "*/kms-keys"
 ### All Modules in All Accounts
 
 ```bash
-cd live
+cd envs
 terragrunt run-all plan
 terragrunt run-all apply
 ```
@@ -232,7 +235,7 @@ terragrunt run-all apply
 ### Specific Accounts Only
 
 ```bash
-cd live
+cd envs
 terragrunt run-all plan \
   --terragrunt-include-dir "dev/*" \
   --terragrunt-include-dir "staging/*"
@@ -241,7 +244,7 @@ terragrunt run-all plan \
 ### Backup Account Only
 
 ```bash
-cd live/backup/backup-vault
+cd envs/backup/backup-vault
 terragrunt plan
 terragrunt apply
 ```
@@ -250,11 +253,11 @@ terragrunt apply
 
 ```bash
 # Single module in one account
-cd live/dev/kms-keys
+cd envs/dev/kms-keys
 terragrunt destroy
 
 # All modules in all accounts
-cd live
+cd envs
 terragrunt run-all destroy
 ```
 
@@ -262,13 +265,25 @@ terragrunt run-all destroy
 
 ## Adding a New Account
 
+### Automated (recommended)
+
+Run the scaffolding script:
+
+```bash
+./scripts/generate_account_dirs.sh
+```
+
+The script will prompt for the account name, AWS account ID, and region, then create the directory structure, `account.hcl`, and module `terragrunt.hcl` files under `envs/`.
+
+### Manual
+
 1. Create the account directory and config:
 
    ```bash
-   mkdir -p live/new-account
+   mkdir -p envs/new-account
    ```
 
-2. Create `live/new-account/account.hcl`:
+2. Create `envs/new-account/account.hcl`:
 
    ```hcl
    locals {
@@ -281,8 +296,8 @@ terragrunt run-all destroy
 3. Add module directories for each module to deploy:
 
    ```bash
-   mkdir -p live/new-account/cross-account-roles
-   mkdir -p live/new-account/kms-keys
+   mkdir -p envs/new-account/cross-account-roles
+   mkdir -p envs/new-account/kms-keys
    ```
 
 4. Create `terragrunt.hcl` in each module directory:
@@ -301,7 +316,7 @@ terragrunt run-all destroy
 5. Deploy:
 
    ```bash
-   cd live/new-account
+   cd envs/new-account
    terragrunt run-all apply
    ```
 
@@ -309,7 +324,7 @@ terragrunt run-all destroy
 
 1. Create the module in `modules/new-module/` with the standard files (`main.tf`, `variables.tf`, `outputs.tf`, `versions.tf`).
 
-2. Create `live/_envcommon/new-module.hcl` with the shared config:
+2. Create `_envcommon/new-module.hcl` with the shared config:
 
    ```hcl
    locals {
@@ -332,7 +347,7 @@ terragrunt run-all destroy
    }
    ```
 
-3. Add `live/{account}/new-module/terragrunt.hcl` for each account that should receive the module:
+3. Add `envs/{account}/new-module/terragrunt.hcl` for each account that should receive the module:
 
    ```hcl
    include "root" {
@@ -350,7 +365,7 @@ terragrunt run-all destroy
 Each account can override any input from the envcommon config. For example, to use a different KMS key alias in prod:
 
 ```hcl
-# live/prod/kms-keys/terragrunt.hcl
+# envs/prod/kms-keys/terragrunt.hcl
 
 include "root" {
   path = find_in_parent_folders()

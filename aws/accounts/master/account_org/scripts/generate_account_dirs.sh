@@ -14,11 +14,11 @@
 #     organizations:ListAccountsForParent
 #   - jq installed
 #
-# This script reads live/env.hcl to get the target OUs and regions, then
+# This script reads envs/env.hcl to get the target OUs and regions, then
 # creates the following structure for each active account in each target OU:
 #
-#   live/<account_name>/<region>/region.hcl
-#   live/<account_name>/account.hcl
+#   envs/<account_name>/<region>/region.hcl
+#   envs/<account_name>/account.hcl
 #
 # Primary-region modules (first region listed):
 #   common-resources, config-recorder, config-rules,
@@ -35,7 +35,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-LIVE_DIR="${ROOT_DIR}/live"
+ENVS_DIR="${ROOT_DIR}/envs"
 
 DRY_RUN=false
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -57,34 +57,34 @@ if ! command -v jq &>/dev/null; then
     exit 1
 fi
 
-if [[ ! -f "${LIVE_DIR}/env.hcl" ]]; then
-    echo "Error: ${LIVE_DIR}/env.hcl not found"
+if [[ ! -f "${ENVS_DIR}/env.hcl" ]]; then
+    echo "Error: ${ENVS_DIR}/env.hcl not found"
     exit 1
 fi
 
-if [[ ! -f "${LIVE_DIR}/_envcommon/common_vars.hcl" ]]; then
-    echo "Error: ${LIVE_DIR}/_envcommon/common_vars.hcl not found"
+if [[ ! -f "${ROOT_DIR}/_envcommon/common_vars.hcl" ]]; then
+    echo "Error: ${ROOT_DIR}/_envcommon/common_vars.hcl not found"
     exit 1
 fi
 
 # ---------------------------------------------------------------------------
 # Parse env.hcl for target_ou_ids and target_regions
 # ---------------------------------------------------------------------------
-TARGET_OUS=$(grep -A 20 'target_ou_ids' "${LIVE_DIR}/env.hcl" \
+TARGET_OUS=$(grep -A 20 'target_ou_ids' "${ENVS_DIR}/env.hcl" \
     | grep -oE '"ou-[^"]+' \
     | sed 's/"//')
 
-TARGET_REGIONS=$(grep -A 20 'target_regions' "${LIVE_DIR}/env.hcl" \
+TARGET_REGIONS=$(grep -A 20 'target_regions' "${ENVS_DIR}/env.hcl" \
     | grep -oE '"[a-z]+-[a-z]+-[0-9]+"' \
     | sed 's/"//g')
 
 if [[ -z "$TARGET_OUS" ]]; then
-    echo "No target_ou_ids found in ${LIVE_DIR}/env.hcl"
+    echo "No target_ou_ids found in ${ENVS_DIR}/env.hcl"
     exit 1
 fi
 
 if [[ -z "$TARGET_REGIONS" ]]; then
-    echo "No target_regions found in ${LIVE_DIR}/env.hcl"
+    echo "No target_regions found in ${ENVS_DIR}/env.hcl"
     exit 1
 fi
 
@@ -92,9 +92,9 @@ fi
 PRIMARY_REGION=$(echo "$TARGET_REGIONS" | head -1)
 
 # Parse skip account IDs from common_vars.hcl (audit + management accounts)
-AUDIT_ACCOUNT_ID=$(grep 'audit_account_id' "${LIVE_DIR}/_envcommon/common_vars.hcl" \
+AUDIT_ACCOUNT_ID=$(grep 'audit_account_id' "${ROOT_DIR}/_envcommon/common_vars.hcl" \
     | grep -oE '[0-9]{12}' | head -1)
-IDENTITY_ACCOUNT_ID=$(grep 'identity_account_id' "${LIVE_DIR}/_envcommon/common_vars.hcl" \
+IDENTITY_ACCOUNT_ID=$(grep 'identity_account_id' "${ROOT_DIR}/_envcommon/common_vars.hcl" \
     | grep -oE '[0-9]{12}' | head -1)
 
 SKIP_ACCOUNT_IDS="${AUDIT_ACCOUNT_ID:-} ${IDENTITY_ACCOUNT_ID:-}"
@@ -129,9 +129,9 @@ sanitize_name() {
 # ---------------------------------------------------------------------------
 # Helper: compute relative path from a leaf module dir to modules/
 # ---------------------------------------------------------------------------
-# Structure: live/<account>/<region>/<module>/terragrunt.hcl
+# Structure: envs/<account>/<region>/<module>/terragrunt.hcl
 # Relative to modules: ../../../../modules//<module>
-# But since root terragrunt.hcl is at live/terragrunt.hcl
+# But since root terragrunt.hcl is at terragrunt.hcl
 # the module source is always relative from the leaf dir to ROOT_DIR/modules
 modules_relative_path() {
     echo "../../../../modules"
@@ -154,7 +154,7 @@ include "root" {
 }
 
 locals {
-  common_vars = read_terragrunt_config("${get_terragrunt_dir()}/../../../_envcommon/common_vars.hcl")
+  common_vars = read_terragrunt_config("${dirname(find_in_parent_folders())}/_envcommon/common_vars.hcl")
 }
 
 terraform {
@@ -177,7 +177,7 @@ include "root" {
 }
 
 locals {
-  common_vars = read_terragrunt_config("${get_terragrunt_dir()}/../../../_envcommon/common_vars.hcl")
+  common_vars = read_terragrunt_config("${dirname(find_in_parent_folders())}/_envcommon/common_vars.hcl")
 }
 
 terraform {
@@ -220,7 +220,7 @@ include "root" {
 }
 
 locals {
-  common_vars = read_terragrunt_config("${get_terragrunt_dir()}/../../../_envcommon/common_vars.hcl")
+  common_vars = read_terragrunt_config("${dirname(find_in_parent_folders())}/_envcommon/common_vars.hcl")
 }
 
 terraform {
@@ -287,7 +287,7 @@ for OU_ID in $TARGET_OUS; do
         fi
 
         DIR_NAME=$(sanitize_name "$ACCOUNT_NAME")
-        ACCOUNT_DIR="${LIVE_DIR}/${DIR_NAME}"
+        ACCOUNT_DIR="${ENVS_DIR}/${DIR_NAME}"
 
         echo "  Account: ${ACCOUNT_NAME} (${ACCOUNT_ID}) -> ${DIR_NAME}/"
 
@@ -362,8 +362,8 @@ if [[ "$DRY_RUN" == true ]]; then
     echo "This was a dry run. Re-run without --dry-run to create the directories."
 else
     echo "To deploy all sub-accounts:"
-    echo "  cd live && terragrunt run-all plan --exclude-dir management --exclude-dir audit"
+    echo "  cd envs && terragrunt run-all plan --exclude-dir management --exclude-dir audit"
     echo ""
     echo "To deploy a single account:"
-    echo "  cd live/<account-name> && terragrunt run-all plan"
+    echo "  cd envs/<account-name> && terragrunt run-all plan"
 fi

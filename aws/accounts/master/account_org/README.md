@@ -134,11 +134,12 @@ master/
 │           ├── pci.yaml
 │           └── other.yaml
 │
-└── live/                             # Terragrunt deployment configurations
-    ├── terragrunt.hcl                # Root config (provider, backend, tags)
+├── terragrunt.hcl                    # Root config (provider, backend, tags)
+├── _envcommon/
+│   └── common_vars.hcl               # Shared variables (account IDs, org ID, etc.)
+│
+└── envs/                             # Terragrunt deployment configurations
     ├── env.hcl                       # Target OUs and regions for generate_account_dirs.sh
-    ├── _envcommon/
-    │   └── common_vars.hcl           # Shared variables (account IDs, org ID, etc.)
     │
     ├── audit/                        # Audit account deployments
     │   ├── account.hcl
@@ -414,7 +415,7 @@ When using Terragrunt, you can add `dependencies` blocks to enforce this orderin
 
 ### 1. Update common variables
 
-Edit `live/_envcommon/common_vars.hcl` with your actual values:
+Edit `_envcommon/common_vars.hcl` with your actual values:
 
 ```hcl
 locals {
@@ -435,7 +436,7 @@ locals {
 Edit each `account.hcl` file with the real account ID:
 
 ```hcl
-# live/production/account.hcl
+# envs/production/account.hcl
 locals {
   account_name = "production"
   account_id   = "123456789012"   # Your actual account ID
@@ -448,7 +449,7 @@ The root `terragrunt.hcl` uses S3 backend with DynamoDB locking. Ensure the stat
 
 ### 4. Configure authentication
 
-Uncomment and configure the `assume_role` block in `live/terragrunt.hcl` if deploying from a central account:
+Uncomment and configure the `assume_role` block in `terragrunt.hcl` if deploying from a central account:
 
 ```hcl
 provider "aws" {
@@ -466,42 +467,42 @@ provider "aws" {
 ### Deploy a Single Module
 
 ```bash
-cd live/production/eu-west-1/common-resources
+cd envs/production/eu-west-1/common-resources
 terragrunt apply
 ```
 
 ### Deploy All Modules in an Account
 
 ```bash
-cd live/production
+cd envs/production
 terragrunt run-all apply
 ```
 
 ### Deploy All Modules in a Region
 
 ```bash
-cd live/production/eu-west-1
+cd envs/production/eu-west-1
 terragrunt run-all apply
 ```
 
 ### Deploy Everything
 
 ```bash
-cd live
+cd envs
 terragrunt run-all apply
 ```
 
 ### Plan Changes
 
 ```bash
-cd live/production/eu-west-1/security-alarms
+cd envs/production/eu-west-1/security-alarms
 terragrunt plan
 ```
 
 ### Destroy
 
 ```bash
-cd live/development/eu-west-1/common-resources
+cd envs/development/eu-west-1/common-resources
 terragrunt destroy
 ```
 
@@ -513,7 +514,7 @@ The recommended approach is to use the `generate_account_dirs.sh` script, which 
 
 ### Automated (recommended)
 
-1. Configure target OUs and regions in `live/env.hcl`:
+1. Configure target OUs and regions in `envs/env.hcl`:
 
 ```hcl
 locals {
@@ -549,10 +550,10 @@ The script will:
 
 ### Manual
 
-1. Create a new directory under `live/`:
+1. Create a new directory under `envs/`:
 
 ```bash
-mkdir -p live/new-account/eu-west-1
+mkdir -p envs/new-account/eu-west-1
 ```
 
 2. Create `account.hcl`:
@@ -581,7 +582,7 @@ locals {
 1. Create a new region directory under the account:
 
 ```bash
-mkdir -p live/production/us-east-1/{common-resources,config-recorder}
+mkdir -p envs/production/us-east-1/{common-resources,config-recorder}
 ```
 
 2. Create `region.hcl`:
@@ -614,7 +615,7 @@ locals {
 
 ## Sensitive Values
 
-All AWS account IDs, organization IDs, OU IDs, hosted zone IDs, and KMS key ARNs have been replaced with dummy values. Update these in `live/_envcommon/common_vars.hcl` before deploying:
+All AWS account IDs, organization IDs, OU IDs, hosted zone IDs, and KMS key ARNs have been replaced with dummy values. Update these in `_envcommon/common_vars.hcl` before deploying:
 
 | Placeholder | Description | Where to Update |
 |-------------|-------------|-----------------|
