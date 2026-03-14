@@ -81,8 +81,8 @@ This is the primary feature of this cluster variant. DDL is replicated using pgl
 # Drop a table — needs CASCADE because of replication set membership
 ./scripts/manage.sh ddl "DROP TABLE public.users CASCADE;"
 
-# From a SQL file
-./scripts/manage.sh ddl -f migrations/001_create_schema.sql
+# From a SQL file (provide your own)
+./scripts/manage.sh ddl -f my_migration.sql
 ```
 
 ### How it works

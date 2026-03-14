@@ -117,8 +117,8 @@ Use the built-in DDL helper:
 # Drop a table on ALL nodes
 ./scripts/manage.sh ddl "DROP TABLE IF EXISTS users;"
 
-# Execute DDL from a file on ALL nodes
-./scripts/manage.sh ddl -f migrations/001_create_users.sql
+# Execute DDL from a file on ALL nodes (provide your own)
+./scripts/manage.sh ddl -f my_migration.sql
 ```
 
 The `ddl` command automatically refreshes all subscriptions when tables are created or dropped (subscriptions must be refreshed to learn about new tables).

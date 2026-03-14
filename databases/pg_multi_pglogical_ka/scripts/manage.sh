@@ -68,7 +68,7 @@ cmd_ddl() {
         echo "  $0 ddl \"CREATE TABLE public.users (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text); SELECT pglogical.replication_set_add_table('default', 'public.users', true);\""
         echo "  $0 ddl \"ALTER TABLE public.users ADD COLUMN email text;\""
         echo "  $0 ddl \"DROP TABLE public.users CASCADE;\""
-        echo "  $0 ddl -f migrations/001_create_users.sql"
+        echo "  $0 ddl -f my_migration.sql"
         return 1
     fi
 
