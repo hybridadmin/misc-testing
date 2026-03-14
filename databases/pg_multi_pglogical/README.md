@@ -126,7 +126,7 @@ When two nodes update the same row concurrently:
 1. Both changes replicate to the other node
 2. pglogical compares the `commit_timestamp` of each transaction
 3. The later timestamp wins — the earlier change is silently discarded
-4. Conflicts are logged at `LOG` level (`pglogical.conflict_log_level = 'log'`)
+4. Conflicts are logged at `WARNING` level (`pglogical.conflict_log_level = 'warning'`)
 
 ### Available conflict resolution modes
 
@@ -189,6 +189,32 @@ Uses subnet `172.31.0.0/16` to avoid conflicts with:
 - `pg_multi_flyway/` (172.30.0.0/16) — Flyway DDL management multi-master
 
 All containers use the `mmp-` prefix (e.g., `mmp-pg-node1`, `mmp-valkey-master`).
+
+## Benchmark Results
+
+Tested on Docker Desktop (Apple Silicon) with ~2GB RAM, pgbench scale=10 (1M rows), 30s per test.
+Benchmarks run with subscriptions disabled (each node tested independently):
+
+| Metric | Per Node (avg) | Aggregate (3 nodes) |
+|--------|---------------|---------------------|
+| Write TPS | ~6,841 | ~20,523 |
+| Read TPS | ~54,730 | ~164,190 |
+| Failed txns | 0 | 0 |
+| Write nodes | All 3 | All 3 |
+
+For comparison with the other multi-master variants:
+
+| Metric | pg_multi (native) | pg_multi_pglogical |
+|--------|-------------------|-------------------|
+| Write TPS (per node) | ~6,167 | ~6,841 |
+| Read TPS (per node) | ~37,829 | ~54,730 |
+
+> **Note**: Benchmark numbers are raw per-node performance with replication disabled.
+> Under normal operation with replication enabled, effective throughput is lower due to
+> WAL shipping overhead. The `bench` command disables subscriptions because pgbench's
+> TPC-B workload would cause conflicts across nodes. The `bench` command automatically
+> enters maintenance mode to prevent the self-fencing watchdog from triggering while
+> subscriptions are disabled.
 
 ## How pglogical Replication Works
 
@@ -286,6 +312,137 @@ pglogical exposes status via SQL functions (`pglogical.show_subscription_status(
 6. **Avoid concurrent updates to the same row on different nodes** — even with last-writer-wins, one update will be silently lost
 7. **Monitor conflicts regularly** — `manage.sh conflicts` and Docker logs
 8. **Use additive DDL** — prefer `ADD COLUMN` over `DROP COLUMN`; dropping columns while replication is active can cause errors
+
+## Split-Brain Protection
+
+pglogical has **zero built-in split-brain protection**. There is no quorum, no fencing, and no partition-awareness — a partitioned node continues accepting writes, which leads to divergent data that must be manually reconciled. This cluster implements several mitigations.
+
+### Implemented mitigations
+
+#### 1. Conflict logging at WARNING level
+
+`pglogical.conflict_log_level` is set to `warning` (default is `log`) so conflicts are harder to miss in logs and monitoring.
+
+#### 2. Quorum-aware self-fencing (watchdog)
+
+Each node runs a background watchdog (every 10s) that checks TCP reachability to all peer nodes. With 3 nodes, **majority = 2** (self + at least 1 peer). If a node cannot reach enough peers to form a majority, it **self-fences**:
+
+- Sets `default_transaction_read_only = on` via `ALTER SYSTEM` — blocks all writes, even on direct-access ports (5641-5643)
+- Creates `/tmp/pglogical_fenced` with the reason
+- Reports `down` to HAProxy (removes from load balancer pool)
+
+The watchdog runs independently of HAProxy polling, so a partitioned node will self-fence even when HAProxy cannot reach it.
+
+#### 3. Self-fencing on total subscription loss
+
+If ALL pglogical subscriptions on a node are `down` (not `replicating`, `initializing`, or `copying`), the node self-fences with the same mechanism as above — even if TCP peer checks pass.
+
+#### 4. Auto-unfencing on recovery
+
+When quorum is restored AND subscriptions recover to a healthy state, the watchdog automatically:
+
+- Runs `ALTER SYSTEM RESET default_transaction_read_only`
+- Reloads the PostgreSQL configuration
+- Removes the fence file
+- Reports `ready up 100%` to HAProxy on the next agent-check
+
+**Recovery is fully automatic** — no manual intervention needed.
+
+### How it works in practice
+
+**Scenario: node3 loses network connectivity**
+
+| Time | Event |
+|------|-------|
+| T+0 | Node3 disconnected from Docker network |
+| T+10-20s | Watchdog detects 0/2 peers reachable (need 1 for quorum) |
+| T+10-20s | Node3 self-fences: `default_transaction_read_only = on` |
+| T+10-20s | Any write attempt on node3 returns: `ERROR: cannot execute ... in a read-only transaction` |
+| T+10-20s | HAProxy marks node3 `down`, routes all traffic to nodes 1 & 2 |
+| — | Nodes 1 & 2 continue operating normally (they have quorum: 2/3) |
+| T+reconnect | Node3 rejoins the network |
+| T+reconnect+10-20s | Watchdog detects peers reachable, subscriptions recovering |
+| T+reconnect+10-20s | Node3 auto-unfences: `default_transaction_read_only = off` |
+| T+reconnect+10-20s | pglogical catches up — rows written during partition replicate to node3 |
+
+### Testing partition behavior
+
+```bash
+# 1. Verify baseline — all nodes writable
+for n in 1 2 3; do
+  echo "--- Node $n ---"
+  docker exec mmp-pg-node$n psql -U postgres -d appdb -tAc \
+    "SHOW default_transaction_read_only;"
+done
+
+# 2. Partition node3
+docker network disconnect pg-multimaster-pglogical-cluster_pg-cluster-net mmp-pg-node3
+
+# 3. Wait 20-30s for watchdog to detect and fence
+sleep 25
+
+# 4. Verify node3 is fenced
+docker exec mmp-pg-node3 psql -U postgres -d appdb -tAc \
+  "SHOW default_transaction_read_only;"
+# Expected: on
+
+# 5. Verify writes to node3 are rejected
+docker exec mmp-pg-node3 psql -U postgres -d appdb -c \
+  "CREATE TABLE public.test (id int);"
+# Expected: ERROR: cannot execute CREATE TABLE in a read-only transaction
+
+# 6. Verify nodes 1 & 2 still accept writes
+docker exec mmp-pg-node1 psql -U postgres -d appdb -c \
+  "SELECT pglogical.replicate_ddl_command(\$DDL\$ CREATE TABLE public.test (id int); SELECT pglogical.replication_set_add_table('default', 'public.test', true); \$DDL\$);"
+
+# 7. Reconnect node3
+docker network connect pg-multimaster-pglogical-cluster_pg-cluster-net mmp-pg-node3
+
+# 8. Wait 20-30s for auto-unfencing
+sleep 25
+
+# 9. Verify node3 is unfenced and data caught up
+docker exec mmp-pg-node3 psql -U postgres -d appdb -tAc \
+  "SHOW default_transaction_read_only;"
+# Expected: off
+
+docker exec mmp-pg-node3 psql -U postgres -d appdb -c \
+  "SELECT * FROM public.test;"
+
+# 10. Clean up
+docker exec mmp-pg-node1 psql -U postgres -d appdb -c \
+  "SELECT pglogical.replicate_ddl_command(\$DDL\$ DROP TABLE public.test CASCADE; \$DDL\$);"
+```
+
+### What is NOT protected (known gaps)
+
+| Gap | Description | Possible future mitigation |
+|-----|-------------|---------------------------|
+| **Brief write window** | Writes accepted in the ~10-20s before the watchdog detects the partition | Synchronous commit to at least one peer (`synchronous_standby_names`) |
+| **Direct-port writes after fencing** | A client already connected to a direct port before fencing can still execute reads (writes are blocked by `read_only`) | Application-level connection validation |
+| **Symmetric partition** | If all 3 nodes are isolated from each other, all self-fence and the entire cluster becomes read-only | External arbiter (Valkey/Sentinel could serve as a tiebreaker) |
+| **Clock skew** | `last_update_wins` depends on `track_commit_timestamp` — NTP desync can cause wrong winner | Use NTP with tight drift tolerance |
+| **Application-level conflicts** | Two nodes can make logically conflicting changes (e.g., overdrawing an account) even if row-level conflict resolution works | Application-level optimistic locking (version columns) |
+
+### Architecture of the fencing system
+
+```
+                  ┌─────────────────────────────────┐
+                  │  pg-repl-health-agent.sh          │
+                  │  (runs on every PG node)          │
+                  ├─────────────────────────────────┤
+                  │ 1. pg_isready? (local PG up?)    │
+                  │ 2. pglogical extension loaded?    │
+                  │ 3. Quorum check (TCP to peers)    │──► FAIL → fence_node() → "down"
+                  │ 4. Subscription health check      │──► ALL down → fence_node() → "down"
+                  │ 5. All OK → unfence_node()        │──► "ready up 100%"
+                  │ 6. Replication lag check           │──► Lag → "ready up 75%"
+                  └─────────────────────────────────┘
+                           │                  │
+                  Triggered by:        Triggered by:
+                  socat (HAProxy         watchdog loop
+                  agent-check :5480)     (every 10s)
+```
 
 ## Comparison: All Multi-Master Variants
 

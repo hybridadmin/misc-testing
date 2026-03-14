@@ -149,9 +149,9 @@ run_sql_quiet "$DB" "ALTER ROLE $SU SUPERUSER;"
 # ---------------------------------------------------------------------------
 log "Setting conflict resolution to last_update_wins..."
 run_sql_quiet "$DB" "ALTER SYSTEM SET pglogical.conflict_resolution = 'last_update_wins';"
-run_sql_quiet "$DB" "ALTER SYSTEM SET pglogical.conflict_log_level = 'log';"
+run_sql_quiet "$DB" "ALTER SYSTEM SET pglogical.conflict_log_level = 'warning';"
 run_sql_quiet "$DB" "SELECT pg_reload_conf();"
-log "Conflict resolution configured"
+log "Conflict resolution configured (log_level=warning)"
 
 # ---------------------------------------------------------------------------
 # Step 4: Create pglogical node (this node's identity)

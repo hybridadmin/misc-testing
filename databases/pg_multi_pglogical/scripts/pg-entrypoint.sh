@@ -101,4 +101,33 @@ nohup setsid bash -c '
 ' > /tmp/health-agent.log 2>&1 &
 disown
 
+# ---------------------------------------------------------------------------
+# Self-fencing watchdog: runs every 10s independently of HAProxy polling.
+# This ensures a partitioned node self-fences even when HAProxy cannot reach
+# it (the socat agent-check only fires on incoming connections).
+# ---------------------------------------------------------------------------
+nohup setsid bash -c '
+    trap "exit 0" ERR EXIT
+
+    attempts=0
+    while ! pg_isready -h 127.0.0.1 -p 5432 -U "${POSTGRES_USER:-postgres}" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        if [ "$attempts" -ge 60 ]; then
+            echo "=== [fence-watchdog] ERROR: PG not ready after 120s, giving up ==="
+            exit 0
+        fi
+        sleep 2
+    done
+
+    # Wait for replication setup to complete before starting checks
+    sleep 30
+
+    echo "=== [fence-watchdog] Starting self-fencing watchdog (10s interval) ==="
+    while true; do
+        /usr/local/bin/pg-repl-health-agent.sh > /dev/null 2>&1 || true
+        sleep 10
+    done
+' > /tmp/fence-watchdog.log 2>&1 &
+disown
+
 exec docker-entrypoint.sh "$@"

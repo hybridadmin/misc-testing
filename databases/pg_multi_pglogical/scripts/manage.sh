@@ -479,6 +479,13 @@ cmd_bench() {
     log_info "pglogical subscriptions are disabled during benchmark."
     echo ""
 
+    # Enter maintenance mode on all nodes (prevents watchdog from fencing
+    # when subscriptions are intentionally disabled)
+    log_info "Entering maintenance mode on all nodes..."
+    for node in "${NODES[@]}"; do
+        docker exec "$node" touch /tmp/pglogical_maintenance
+    done
+
     # Disable pglogical subscriptions
     log_info "Disabling pglogical subscriptions for benchmark..."
     for i in "${!NODES[@]}"; do
@@ -551,6 +558,12 @@ cmd_bench() {
     done
 
     log_ok "Benchmark complete, subscriptions re-enabled"
+
+    # Exit maintenance mode
+    log_info "Exiting maintenance mode..."
+    for node in "${NODES[@]}"; do
+        docker exec "$node" rm -f /tmp/pglogical_maintenance
+    done
 }
 
 cmd_repair() {
