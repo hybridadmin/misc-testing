@@ -1,0 +1,343 @@
+# PostgreSQL 18 Multi-Master Cluster with pglogical
+
+A true multi-master PostgreSQL 18 cluster using the **pglogical** extension for logical replication with DDL replication support via `replicate_ddl_command()`, Docker Compose orchestration, and last-writer-wins conflict resolution.
+
+## Architecture
+
+```
+                    ┌─────────────────────────────┐
+                    │          HAProxy             │
+                    │   Write :5632 (round-robin)  │
+                    │   Read  :5633 (leastconn)    │
+                    │   Stats :7200                │
+                    └──────┬──────┬──────┬─────────┘
+                           │      │      │
+              ┌────────────┘      │      └────────────┐
+              ▼                   ▼                    ▼
+     ┌─────────────┐    ┌─────────────┐     ┌─────────────┐
+     │  pg-node1   │◄──►│  pg-node2   │◄───►│  pg-node3   │
+     │  :5641      │    │  :5642      │     │  :5643      │
+     │  (writer)   │◄──►│  (writer)   │◄───►│  (writer)   │
+     └─────────────┘    └─────────────┘     └─────────────┘
+           Full-mesh pglogical replication
+           (forward_origins='{}' prevents loops)
+
+     ┌─────────────┐    ┌─────────────┐     ┌─────────────┐
+     │   Valkey     │    │   Valkey     │     │   Valkey     │
+     │   Master     │───►│   Replica1   │     │   Replica2   │
+     │   :6579      │    │   :6580      │     │   :6581      │
+     └─────────────┘    └─────────────┘     └─────────────┘
+           │
+     ┌─────┴──────────────┬───────────────────┐
+     ▼                    ▼                   ▼
+  Sentinel1 :26579   Sentinel2 :26580   Sentinel3 :26581
+```
+
+**10 services total:** 3 PostgreSQL nodes + 1 HAProxy + 1 Valkey master + 2 Valkey replicas + 3 Valkey Sentinels
+
+## Key Advantages Over Native Logical Replication
+
+| Feature | Native (pg_multi) | pglogical (this cluster) |
+|---------|-------------------|--------------------------|
+| DDL replication | Not supported — must run DDL on each node manually | `replicate_ddl_command()` runs DDL once, propagates to all peers |
+| Conflict resolution | None — apply errors crash the subscription worker | **Last-writer-wins** using real commit timestamps (`track_commit_timestamp`) |
+| Replication sets | One publication per node | Named sets (`default`, `default_insert_only`, `ddl_sql`) |
+| Table management | `FOR ALL TABLES` (cannot exclude individual tables) | Tables added to replication sets explicitly or via defaults |
+
+## Quick Start
+
+```bash
+cd pg_multi_pglogical
+
+# Build and start the cluster
+docker compose up -d --build
+
+# Wait ~60s for pglogical nodes and subscriptions to initialize
+# (subscriptions are staggered by node number to avoid slot creation conflicts)
+sleep 60
+
+# Check cluster status
+./scripts/manage.sh status
+
+# Run the full replication test (DDL + DML + ALTER TABLE)
+./scripts/manage.sh test
+```
+
+## DDL Replication
+
+This is the primary feature of this cluster variant. DDL is replicated using pglogical's `replicate_ddl_command()` function.
+
+### Using the `ddl` command
+
+```bash
+# Create a table — runs on node1, automatically replicates to node2 and node3
+# IMPORTANT: Always use schema-qualified names (public.tablename)
+# For CREATE TABLE, also add to the replication set so DML replicates:
+./scripts/manage.sh ddl "CREATE TABLE public.users (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text NOT NULL, email text); SELECT pglogical.replication_set_add_table('default', 'public.users', true);"
+
+# Alter a table — same mechanism
+./scripts/manage.sh ddl "ALTER TABLE public.users ADD COLUMN created_at timestamptz DEFAULT now();"
+
+# Drop a table — needs CASCADE because of replication set membership
+./scripts/manage.sh ddl "DROP TABLE public.users CASCADE;"
+
+# From a SQL file
+./scripts/manage.sh ddl -f migrations/001_create_schema.sql
+```
+
+### How it works
+
+1. `manage.sh ddl` connects to **node1** only
+2. It wraps the DDL in `SELECT pglogical.replicate_ddl_command('...');`
+3. pglogical executes the DDL locally on node1
+4. The DDL statement is replicated to all subscribers via the `ddl_sql` replication set
+5. Each subscriber executes the DDL locally
+
+### Critical details
+
+- **Schema qualification required:** `replicate_ddl_command()` runs with an empty `search_path`. All table references must use explicit schema (e.g., `public.users` not `users`).
+- **Replication set membership:** Creating a table via `replicate_ddl_command()` does **not** automatically add it to a replication set. You must include `SELECT pglogical.replication_set_add_table('default', 'public.tablename', true);` in the same `replicate_ddl_command()` call. This executes on all nodes, so the table is immediately ready for DML replication everywhere.
+- **DROP TABLE needs CASCADE:** Tables in a replication set have a dependency on their replication set membership. Use `DROP TABLE public.tablename CASCADE;`.
+
+### What `replicate_ddl_command()` can do
+
+- `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`
+- `CREATE INDEX`, `DROP INDEX`
+- `CREATE SEQUENCE`, `ALTER SEQUENCE`
+- Any DDL that PostgreSQL supports
+
+### What it cannot do
+
+- It is **not automatic** — you must explicitly wrap DDL in the function call (or use `manage.sh ddl`)
+- The `pgl_ddl_deploy` extension (which provides automatic DDL capture via event triggers) is **not available for PostgreSQL 18** — only packages up to PG17 exist
+- Complex DDL involving multiple statements may need to be wrapped in a single call
+
+## Conflict Resolution
+
+pglogical supports true **last-writer-wins** conflict resolution using PostgreSQL's `track_commit_timestamp` feature. This compares actual commit timestamps rather than arrival order.
+
+### Configured mode: `last_update_wins`
+
+```
+pglogical.conflict_resolution = 'last_update_wins'
+```
+
+When two nodes update the same row concurrently:
+1. Both changes replicate to the other node
+2. pglogical compares the `commit_timestamp` of each transaction
+3. The later timestamp wins — the earlier change is silently discarded
+4. Conflicts are logged at `LOG` level (`pglogical.conflict_log_level = 'log'`)
+
+### Available conflict resolution modes
+
+| Mode | Behavior |
+|------|----------|
+| `last_update_wins` | Later commit timestamp wins (recommended for multi-master) |
+| `first_update_wins` | Earlier commit timestamp wins |
+| `apply_remote` | Always apply the incoming change |
+| `keep_local` | Always keep the local version |
+| `error` | Raise an error (breaks replication — not recommended) |
+
+### Checking for conflicts
+
+```bash
+# View subscription status and conflict info
+./scripts/manage.sh conflicts
+
+# Check Docker logs for conflict messages
+docker logs mmp-pg-node1 2>&1 | grep -i conflict
+```
+
+## Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `status` | Cluster overview: node health, pglogical subscriptions, conflict resolution mode |
+| `replication` | Detailed pglogical info: node interfaces, subscriptions, replication sets |
+| `test` | Full test: DDL replication (CREATE + ALTER TABLE) + DML (INSERT/UPDATE/DELETE) |
+| `ddl "SQL"` | Execute DDL via `pglogical.replicate_ddl_command()` — replicates to all nodes |
+| `ddl -f file.sql` | Execute DDL from a file |
+| `conflicts` | Show subscription statuses, conflict resolution mode, replication lag |
+| `repair enable` | Re-enable all disabled pglogical subscriptions |
+| `repair enable <node>` | Re-enable subscriptions on a specific node |
+| `repair resync <node>` | Drop + recreate all subscriptions on a node (full resync) |
+| `psql [port]` | Connect via psql (5632=write, 5633=read, 5641-5643=direct) |
+| `valkey-cli` | Connect to Valkey CLI |
+| `logs [service]` | Tail Docker logs |
+| `bench [scale]` | Run pgbench benchmark (default scale=10) |
+
+## Ports
+
+| Service | Port | Purpose |
+|---------|------|---------|
+| HAProxy Write | 5632 | Round-robin writes to all PG nodes |
+| HAProxy Read | 5633 | Least-connections reads from all PG nodes |
+| HAProxy Stats | 7200 | Web dashboard (`admin`/`changeme_haproxy_2025`) |
+| pg-node1 | 5641 | Direct access to node 1 |
+| pg-node2 | 5642 | Direct access to node 2 |
+| pg-node3 | 5643 | Direct access to node 3 |
+| Valkey Master | 6579 | Cache (master) |
+| Valkey Replica 1 | 6580 | Cache (replica) |
+| Valkey Replica 2 | 6581 | Cache (replica) |
+| Sentinel 1/2/3 | 26579-26581 | Valkey high-availability |
+
+## Network
+
+Uses subnet `172.31.0.0/16` to avoid conflicts with:
+- `pg/` (172.28.0.0/16) — single-writer Patroni cluster
+- `pg_multi/` (172.29.0.0/16) — native logical replication multi-master
+- `pg_multi_flyway/` (172.30.0.0/16) — Flyway DDL management multi-master
+
+All containers use the `mmp-` prefix (e.g., `mmp-pg-node1`, `mmp-valkey-master`).
+
+## How pglogical Replication Works
+
+### Node and subscription model
+
+Each PostgreSQL instance registers itself as a **pglogical node** with a unique name (`pg_node1`, `pg_node2`, `pg_node3`). Nodes create **subscriptions** to each peer, forming a full-mesh topology:
+
+```
+pg_node1 subscribes to: pg_node2, pg_node3
+pg_node2 subscribes to: pg_node1, pg_node3
+pg_node3 subscribes to: pg_node1, pg_node2
+```
+
+### Preventing replication loops
+
+Each subscription uses `forward_origins = '{}'` — this means a node will only replicate changes that **originated locally**, never forwarding changes received from other nodes. This is pglogical's equivalent of native logical replication's `origin = none`.
+
+### Replication sets
+
+Subscriptions subscribe to three replication sets:
+- `default` — standard tables (INSERT/UPDATE/DELETE replicated)
+- `default_insert_only` — tables where only INSERTs replicate
+- `ddl_sql` — carries DDL commands from `replicate_ddl_command()`
+
+### Startup sequence
+
+1. Each node starts PostgreSQL with `shared_preload_libraries = 'pglogical'`
+2. The init script creates the replication user and application database
+3. A background process waits for all peers to be ready
+4. Subscription creation is **staggered** by node number (node1 waits 20s, node2 waits 25s, node3 waits 30s) to avoid simultaneous `CREATE_REPLICATION_SLOT` crashes
+5. Each node creates its pglogical node identity, then subscribes to each peer
+
+## Limitations
+
+### 1. DDL replication is explicit, not automatic
+
+You must use `manage.sh ddl` or call `pglogical.replicate_ddl_command()` directly. If you run plain DDL (`CREATE TABLE ...`) without the wrapper, it will NOT replicate.
+
+The `pgl_ddl_deploy` extension (which captures DDL automatically via event triggers) is not packaged for PostgreSQL 18 — only PG17 and earlier.
+
+### 2. DDL must use schema-qualified names
+
+`replicate_ddl_command()` executes DDL in a context where `search_path` is empty. All table references must use explicit schema qualification:
+
+```sql
+-- Correct:
+SELECT pglogical.replicate_ddl_command($DDL$ CREATE TABLE public.users (...); $DDL$);
+
+-- Wrong (fails with "no schema has been selected to create in"):
+SELECT pglogical.replicate_ddl_command($DDL$ CREATE TABLE users (...); $DDL$);
+```
+
+### 3. New tables must be explicitly added to replication sets
+
+`replicate_ddl_command()` creates the table on all nodes but does NOT add it to any replication set. Without replication set membership, DML (INSERT/UPDATE/DELETE) will not replicate.
+
+The solution: include `replication_set_add_table` in the same `replicate_ddl_command()` call:
+
+```sql
+SELECT pglogical.replicate_ddl_command($DDL$
+    CREATE TABLE public.my_table (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), name text);
+    SELECT pglogical.replication_set_add_table('default', 'public.my_table', true);
+$DDL$);
+```
+
+This executes on all nodes simultaneously, so the table is immediately ready for bidirectional DML replication.
+
+### 4. DROP TABLE needs CASCADE
+
+Tables in a replication set have a dependency on their set membership. Use `DROP TABLE public.tablename CASCADE;` to drop them.
+
+### 5. pglogical 2.4.6 on PG18 is community-supported
+
+The `postgresql-18-pglogical` package is available from Debian Trixie repos. It is not officially supported by the pglogical commercial team (2ndQuadrant/EDB) for PG18.
+
+### 6. No automatic conflict resolution for INSERT/INSERT conflicts
+
+`last_update_wins` resolves UPDATE/UPDATE and UPDATE/DELETE conflicts. For INSERT/INSERT conflicts (two nodes insert a row with the same primary key), the behavior depends on the conflict resolution mode. Using UUID primary keys (`gen_random_uuid()`) effectively eliminates INSERT/INSERT conflicts.
+
+### 7. Schema must exist before data replication
+
+If a table exists on node1 but not node2, replication of data to that table on node2 will fail. Always use `replicate_ddl_command()` to ensure schema consistency.
+
+### 8. No built-in monitoring dashboard
+
+pglogical exposes status via SQL functions (`pglogical.show_subscription_status()`) but doesn't provide a web UI. Use `manage.sh status` and `manage.sh conflicts` for monitoring.
+
+## Best Practices
+
+1. **Always use `gen_random_uuid()` for primary keys** — eliminates INSERT/INSERT conflicts
+2. **Always use `manage.sh ddl` for schema changes** — ensures DDL replicates to all nodes
+3. **Always use schema-qualified names** in DDL — `public.tablename`, not just `tablename`
+4. **Include `replication_set_add_table()` when creating tables** — otherwise DML won't replicate
+5. **Use CASCADE when dropping tables** — replication set membership creates a dependency
+6. **Avoid concurrent updates to the same row on different nodes** — even with last-writer-wins, one update will be silently lost
+7. **Monitor conflicts regularly** — `manage.sh conflicts` and Docker logs
+8. **Use additive DDL** — prefer `ADD COLUMN` over `DROP COLUMN`; dropping columns while replication is active can cause errors
+
+## Comparison: All Multi-Master Variants
+
+| Feature | pg_multi (native) | pg_multi_flyway | pg_multi_pglogical |
+|---------|-------------------|-----------------|-------------------|
+| DDL approach | Manual on each node | Flyway migrations per node | `replicate_ddl_command()` — run once |
+| Conflict resolution | None (apply error) | None (apply error) | **Last-writer-wins** (real timestamps) |
+| DDL version control | None | Flyway SQL files | None (use git for SQL files) |
+| Replication protocol | Native logical | Native logical | pglogical extension |
+| Extra dependencies | None | Flyway container | pglogical package |
+| Table management | `FOR ALL TABLES` | `FOR ALL TABLES` | Replication sets (explicit) |
+| Container prefix | `mm-` | `mmf-` | `mmp-` |
+| PG direct ports | 5441-5443 | 5541-5543 | 5641-5643 |
+| HAProxy ports | 5432/5433 | 5532/5533 | 5632/5633 |
+
+## Troubleshooting
+
+```bash
+# Check cluster status
+./scripts/manage.sh status
+
+# Detailed replication info (node interfaces, subscriptions, replication sets)
+./scripts/manage.sh replication
+
+# Check for conflicts or disabled subscriptions
+./scripts/manage.sh conflicts
+
+# View setup logs inside a container
+docker exec mmp-pg-node1 cat /tmp/repl-setup.log
+
+# View PostgreSQL logs
+./scripts/manage.sh logs pg-node1
+
+# Re-enable disabled subscriptions
+./scripts/manage.sh repair enable
+
+# Full resync of a node (drops and recreates subscriptions)
+./scripts/manage.sh repair resync mmp-pg-node1
+
+# Connect directly to a node
+./scripts/manage.sh psql 5641
+
+# Check pglogical extension version
+docker exec mmp-pg-node1 psql -h localhost -U postgres -d appdb -c "SELECT * FROM pg_extension WHERE extname = 'pglogical';"
+```
+
+## Teardown
+
+```bash
+# Stop the cluster (preserves data volumes)
+docker compose down
+
+# Stop and destroy all data
+docker compose down -v
+```

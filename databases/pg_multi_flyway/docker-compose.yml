@@ -1,0 +1,392 @@
+# =============================================================================
+# PostgreSQL 18 Multi-Master Cluster with Flyway DDL Management + Valkey
+# =============================================================================
+# Architecture:
+#   3x PostgreSQL 18        - Multi-master (all nodes accept writes)
+#                             Bidirectional logical replication (full mesh)
+#   1x HAProxy              - Load balancer (write:5532 round-robin, read:5533)
+#   1x Valkey master        - Cache layer
+#   2x Valkey replicas      - Cache read replicas
+#   3x Valkey Sentinels     - Cache HA / automatic failover
+#   1x Flyway (on-demand)   - DDL migration tool (runs against all 3 nodes)
+#
+# Total: 10 always-on services + 1 on-demand Flyway runner
+# =============================================================================
+
+name: pg-multimaster-flyway-cluster
+
+x-pg-common: &pg-common
+  build:
+    context: .
+    dockerfile: postgres/Dockerfile
+  restart: unless-stopped
+  shm_size: '512mb'
+  init: true  # Use tini as PID 1 — prevents PG from crash-looping when socat children exit
+  networks:
+    - pg-cluster-net
+  env_file: .env
+  environment:
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    POSTGRES_DB: ${POSTGRES_DB}
+    POSTGRES_REPL_USER: ${POSTGRES_REPL_USER}
+    POSTGRES_REPL_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+    ALL_NODES: pg-node1,pg-node2,pg-node3
+    SETUP_REPLICATION: "true"
+  volumes:
+    - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+
+x-valkey-common: &valkey-common
+  image: valkey/valkey:9
+  restart: unless-stopped
+  networks:
+    - pg-cluster-net
+
+services:
+  # ===========================================================================
+  # PostgreSQL Multi-Master Nodes (3 writable peers)
+  # ===========================================================================
+  pg-node1:
+    <<: *pg-common
+    container_name: mmf-pg-node1
+    hostname: pg-node1
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_REPL_USER: ${POSTGRES_REPL_USER}
+      POSTGRES_REPL_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      ALL_NODES: pg-node1,pg-node2,pg-node3
+      SETUP_REPLICATION: "true"
+      NODE_NAME: pg-node1
+    volumes:
+      - pg-node1-data:/var/lib/postgresql
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    ports:
+      - "5541:5432"     # Direct access (debugging only)
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pg-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  pg-node2:
+    <<: *pg-common
+    container_name: mmf-pg-node2
+    hostname: pg-node2
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_REPL_USER: ${POSTGRES_REPL_USER}
+      POSTGRES_REPL_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      ALL_NODES: pg-node1,pg-node2,pg-node3
+      SETUP_REPLICATION: "true"
+      NODE_NAME: pg-node2
+    volumes:
+      - pg-node2-data:/var/lib/postgresql
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    ports:
+      - "5542:5432"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pg-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  pg-node3:
+    <<: *pg-common
+    container_name: mmf-pg-node3
+    hostname: pg-node3
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_REPL_USER: ${POSTGRES_REPL_USER}
+      POSTGRES_REPL_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      ALL_NODES: pg-node1,pg-node2,pg-node3
+      SETUP_REPLICATION: "true"
+      NODE_NAME: pg-node3
+    volumes:
+      - pg-node3-data:/var/lib/postgresql
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    ports:
+      - "5543:5432"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pg-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ===========================================================================
+  # HAProxy - Load Balancer (round-robin writes to all nodes)
+  # ===========================================================================
+  haproxy-pg:
+    image: haproxy:3.1-alpine
+    container_name: mmf-haproxy-pg
+    hostname: haproxy-pg
+    restart: unless-stopped
+    networks:
+      - pg-cluster-net
+    depends_on:
+      pg-node1:
+        condition: service_healthy
+      pg-node2:
+        condition: service_healthy
+      pg-node3:
+        condition: service_healthy
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "${HAPROXY_WRITE_PORT:-5532}:5532"    # Write endpoint -> round-robin all nodes
+      - "${HAPROXY_READ_PORT:-5533}:5533"      # Read endpoint -> leastconn all nodes
+      - "${HAPROXY_STATS_PORT:-7100}:7100"     # Stats dashboard
+    healthcheck:
+      test: ["CMD-SHELL", "haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ===========================================================================
+  # Flyway - DDL Migration Runner (on-demand via manage.sh migrate)
+  # ===========================================================================
+  # This service does NOT auto-start with `docker compose up`.
+  # It is invoked by `manage.sh migrate` which runs it against each node
+  # sequentially using docker compose run.
+  #
+  # The flyway_schema_history table is EXCLUDED from logical replication
+  # publications so each node tracks its own migration state independently.
+  # ===========================================================================
+  flyway:
+    image: flyway/flyway:latest
+    container_name: mmf-flyway
+    networks:
+      - pg-cluster-net
+    profiles:
+      - migration   # Only runs when explicitly invoked
+    volumes:
+      - ./flyway/sql:/flyway/sql:ro
+      - ./flyway/conf:/flyway/conf:ro
+    environment:
+      FLYWAY_URL: "jdbc:postgresql://pg-node1:5432/${POSTGRES_DB}"
+      FLYWAY_USER: ${FLYWAY_USER:-postgres}
+      FLYWAY_PASSWORD: ${FLYWAY_PASSWORD:-changeme_postgres_2025}
+      FLYWAY_SCHEMAS: public
+      FLYWAY_CONNECT_RETRIES: 5
+      FLYWAY_CONNECT_RETRIES_INTERVAL: 3
+    depends_on:
+      pg-node1:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Valkey Cache Cluster (Master + 2 Replicas + 3 Sentinels)
+  # ===========================================================================
+  valkey-master:
+    <<: *valkey-common
+    container_name: mmf-valkey-master
+    hostname: valkey-master
+    command: >
+      valkey-server
+      --port 6379
+      --bind 0.0.0.0
+      --requirepass ${VALKEY_PASSWORD}
+      --masterauth ${VALKEY_PASSWORD}
+      --maxmemory ${VALKEY_MAXMEMORY:-128mb}
+      --maxmemory-policy allkeys-lfu
+      --save "900 1"
+      --save "300 10"
+      --save "60 10000"
+      --hz 100
+      --dynamic-hz yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --tcp-keepalive 300
+      --maxclients 10000
+      --repl-diskless-sync yes
+      --loglevel notice
+    volumes:
+      - valkey-master-data:/data
+    ports:
+      - "${VALKEY_PORT:-6479}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  valkey-replica1:
+    <<: *valkey-common
+    container_name: mmf-valkey-replica1
+    hostname: valkey-replica1
+    command: >
+      valkey-server
+      --port 6379
+      --bind 0.0.0.0
+      --requirepass ${VALKEY_PASSWORD}
+      --masterauth ${VALKEY_PASSWORD}
+      --replicaof valkey-master 6379
+      --maxmemory ${VALKEY_MAXMEMORY:-128mb}
+      --maxmemory-policy allkeys-lfu
+      --replica-read-only yes
+      --hz 100
+      --dynamic-hz yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --tcp-keepalive 300
+      --maxclients 10000
+      --repl-diskless-sync yes
+      --loglevel notice
+    volumes:
+      - valkey-replica1-data:/data
+    ports:
+      - "6480:6379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  valkey-replica2:
+    <<: *valkey-common
+    container_name: mmf-valkey-replica2
+    hostname: valkey-replica2
+    command: >
+      valkey-server
+      --port 6379
+      --bind 0.0.0.0
+      --requirepass ${VALKEY_PASSWORD}
+      --masterauth ${VALKEY_PASSWORD}
+      --replicaof valkey-master 6379
+      --maxmemory ${VALKEY_MAXMEMORY:-128mb}
+      --maxmemory-policy allkeys-lfu
+      --replica-read-only yes
+      --hz 100
+      --dynamic-hz yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --tcp-keepalive 300
+      --maxclients 10000
+      --repl-diskless-sync yes
+      --loglevel notice
+    volumes:
+      - valkey-replica2-data:/data
+    ports:
+      - "6481:6379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  valkey-sentinel1:
+    <<: *valkey-common
+    container_name: mmf-valkey-sentinel1
+    hostname: valkey-sentinel1
+    entrypoint: ["/bin/bash", "/scripts/sentinel-entrypoint.sh"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+      - ./scripts/sentinel-entrypoint.sh:/scripts/sentinel-entrypoint.sh:ro
+      - valkey-sentinel1-data:/data
+    ports:
+      - "${VALKEY_SENTINEL_PORT:-26479}:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+      valkey-replica1:
+        condition: service_healthy
+      valkey-replica2:
+        condition: service_healthy
+
+  valkey-sentinel2:
+    <<: *valkey-common
+    container_name: mmf-valkey-sentinel2
+    hostname: valkey-sentinel2
+    entrypoint: ["/bin/bash", "/scripts/sentinel-entrypoint.sh"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+      - ./scripts/sentinel-entrypoint.sh:/scripts/sentinel-entrypoint.sh:ro
+      - valkey-sentinel2-data:/data
+    ports:
+      - "26480:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+      valkey-replica1:
+        condition: service_healthy
+      valkey-replica2:
+        condition: service_healthy
+
+  valkey-sentinel3:
+    <<: *valkey-common
+    container_name: mmf-valkey-sentinel3
+    hostname: valkey-sentinel3
+    entrypoint: ["/bin/bash", "/scripts/sentinel-entrypoint.sh"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+      - ./scripts/sentinel-entrypoint.sh:/scripts/sentinel-entrypoint.sh:ro
+      - valkey-sentinel3-data:/data
+    ports:
+      - "26481:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+      valkey-replica1:
+        condition: service_healthy
+      valkey-replica2:
+        condition: service_healthy
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  pg-cluster-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${CLUSTER_SUBNET:-172.30.0.0/16}
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  pg-node1-data:
+    driver: local
+  pg-node2-data:
+    driver: local
+  pg-node3-data:
+    driver: local
+  valkey-master-data:
+    driver: local
+  valkey-replica1-data:
+    driver: local
+  valkey-replica2-data:
+    driver: local
+  valkey-sentinel1-data:
+    driver: local
+  valkey-sentinel2-data:
+    driver: local
+  valkey-sentinel3-data:
+    driver: local
