@@ -1,0 +1,401 @@
+# =============================================================================
+# PostgreSQL 18 HA Cluster — Patroni + etcd + HAProxy + PgBouncer + Valkey
+# =============================================================================
+#
+# Architecture (14 containers, all native ARM64):
+#
+#   Clients → PgBouncer(:6432) → HAProxy(:5050 RW, :5051 RO)
+#                                    ↓
+#          ┌─────────────┬───────────┼───────────┐
+#          │             │           │            │
+#     patroni1      patroni2    patroni3    (PG18 + Patroni)
+#     :5432/:8008   :5432/:8008 :5432/:8008
+#          │             │           │
+#     etcd1:2379    etcd2:2379  etcd3:2379  (DCS cluster)
+#
+#   + Valkey 9 (1 master + 2 replicas + 3 sentinels)
+#
+# =============================================================================
+
+name: pg-patroni-cluster
+
+# =============================================================================
+# YAML anchors for DRY service definitions
+# =============================================================================
+
+x-etcd-common: &etcd-common
+  image: quay.io/coreos/etcd:${ETCD_VERSION:-v3.5.17}
+  restart: unless-stopped
+  init: true
+  networks:
+    - patroni-net
+  environment: &etcd-env-common
+    ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+    ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+    ETCD_INITIAL_CLUSTER_TOKEN: patroni-etcd-cluster
+    ETCD_INITIAL_CLUSTER_STATE: new
+    ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+    ETCD_DATA_DIR: /etcd-data
+    ETCD_ENABLE_V2: "false"
+  healthcheck:
+    test: ["CMD", "etcdctl", "endpoint", "health", "--endpoints=http://localhost:2379"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 10s
+
+x-patroni-common: &patroni-common
+  build:
+    context: .
+    dockerfile: postgres/Dockerfile
+  restart: unless-stopped
+  shm_size: '256mb'
+  init: true
+  env_file: .env
+  depends_on:
+    etcd1:
+      condition: service_healthy
+    etcd2:
+      condition: service_healthy
+    etcd3:
+      condition: service_healthy
+  networks:
+    - patroni-net
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/pg-healthcheck.sh"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 30s
+
+x-valkey-common: &valkey-common
+  image: valkey/valkey:${VALKEY_VERSION:-9}
+  restart: unless-stopped
+  init: true
+  networks:
+    - patroni-net
+  healthcheck:
+    test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD:-changeme_valkey_2025}", "PING"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 5s
+
+services:
+  # ===========================================================================
+  # etcd — Distributed Configuration Store (3-node cluster)
+  # ===========================================================================
+
+  etcd1:
+    <<: *etcd-common
+    container_name: pat-etcd1
+    hostname: etcd1
+    environment:
+      <<: *etcd-env-common
+      ETCD_NAME: etcd1
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd1:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd1:2379
+    volumes:
+      - etcd1-data:/etcd-data
+    networks:
+      patroni-net:
+        ipv4_address: ${ETCD1_IP:-172.35.0.2}
+
+  etcd2:
+    <<: *etcd-common
+    container_name: pat-etcd2
+    hostname: etcd2
+    environment:
+      <<: *etcd-env-common
+      ETCD_NAME: etcd2
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd2:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd2:2379
+    volumes:
+      - etcd2-data:/etcd-data
+    networks:
+      patroni-net:
+        ipv4_address: ${ETCD2_IP:-172.35.0.3}
+
+  etcd3:
+    <<: *etcd-common
+    container_name: pat-etcd3
+    hostname: etcd3
+    environment:
+      <<: *etcd-env-common
+      ETCD_NAME: etcd3
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd3:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd3:2379
+    volumes:
+      - etcd3-data:/etcd-data
+    networks:
+      patroni-net:
+        ipv4_address: ${ETCD3_IP:-172.35.0.4}
+
+  # ===========================================================================
+  # Patroni + PostgreSQL 18 (3-node cluster: 1 primary + 2 sync replicas)
+  # ===========================================================================
+
+  patroni1:
+    <<: *patroni-common
+    container_name: pat-node1
+    hostname: patroni1
+    environment:
+      PATRONI_NAME: patroni1
+    volumes:
+      - patroni1-data:/var/lib/postgresql
+    ports:
+      - "${PG_NODE1_PORT:-6041}:5432"
+      - "${PATRONI1_API_PORT:-8041}:8008"
+    networks:
+      patroni-net:
+        ipv4_address: ${PATRONI1_IP:-172.35.0.10}
+
+  patroni2:
+    <<: *patroni-common
+    container_name: pat-node2
+    hostname: patroni2
+    environment:
+      PATRONI_NAME: patroni2
+    volumes:
+      - patroni2-data:/var/lib/postgresql
+    ports:
+      - "${PG_NODE2_PORT:-6042}:5432"
+      - "${PATRONI2_API_PORT:-8042}:8008"
+    networks:
+      patroni-net:
+        ipv4_address: ${PATRONI2_IP:-172.35.0.11}
+
+  patroni3:
+    <<: *patroni-common
+    container_name: pat-node3
+    hostname: patroni3
+    environment:
+      PATRONI_NAME: patroni3
+    volumes:
+      - patroni3-data:/var/lib/postgresql
+    ports:
+      - "${PG_NODE3_PORT:-6043}:5432"
+      - "${PATRONI3_API_PORT:-8043}:8008"
+    networks:
+      patroni-net:
+        ipv4_address: ${PATRONI3_IP:-172.35.0.12}
+
+  # ===========================================================================
+  # HAProxy — PostgreSQL traffic routing via Patroni REST API health checks
+  # ===========================================================================
+
+  haproxy:
+    image: haproxy:3.1-alpine
+    container_name: pat-haproxy
+    hostname: haproxy
+    restart: unless-stopped
+    init: true
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "${HAPROXY_PORT_RW:-5050}:5050"
+      - "${HAPROXY_PORT_RO:-5051}:5051"
+      - "${HAPROXY_STATS_PORT:-7070}:7000"
+    depends_on:
+      patroni1:
+        condition: service_healthy
+      patroni2:
+        condition: service_healthy
+      patroni3:
+        condition: service_healthy
+    networks:
+      patroni-net:
+        ipv4_address: ${HAPROXY_IP:-172.35.0.20}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:7000/stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ===========================================================================
+  # PgBouncer — Connection pooling
+  # ===========================================================================
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: pat-pgbouncer
+    hostname: pgbouncer
+    restart: unless-stopped
+    init: true
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "${PGBOUNCER_PORT:-6432}:6432"
+    depends_on:
+      haproxy:
+        condition: service_healthy
+    networks:
+      patroni-net:
+        ipv4_address: ${PGBOUNCER_IP:-172.35.0.21}
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "6432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ===========================================================================
+  # Valkey 9 — Caching layer (1 master + 2 replicas + 3 sentinels)
+  # ===========================================================================
+
+  valkey-master:
+    <<: *valkey-common
+    container_name: pat-valkey-master
+    hostname: valkey-master
+    command: >
+      valkey-server
+      --requirepass ${VALKEY_PASSWORD:-changeme_valkey_2025}
+      --maxmemory ${VALKEY_MAXMEMORY:-128mb}
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --appendfsync everysec
+    ports:
+      - "${VALKEY_PORT:-6999}:6379"
+    volumes:
+      - valkey-master-data:/data
+    networks:
+      patroni-net:
+        ipv4_address: ${VALKEY_MASTER_IP:-172.35.0.30}
+
+  valkey-replica1:
+    <<: *valkey-common
+    container_name: pat-valkey-replica1
+    hostname: valkey-replica1
+    command: >
+      valkey-server
+      --requirepass ${VALKEY_PASSWORD:-changeme_valkey_2025}
+      --masterauth ${VALKEY_PASSWORD:-changeme_valkey_2025}
+      --replicaof valkey-master 6379
+      --maxmemory ${VALKEY_MAXMEMORY:-128mb}
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "7001:6379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    volumes:
+      - valkey-replica1-data:/data
+    networks:
+      patroni-net:
+        ipv4_address: ${VALKEY_REPLICA1_IP:-172.35.0.31}
+
+  valkey-replica2:
+    <<: *valkey-common
+    container_name: pat-valkey-replica2
+    hostname: valkey-replica2
+    command: >
+      valkey-server
+      --requirepass ${VALKEY_PASSWORD:-changeme_valkey_2025}
+      --masterauth ${VALKEY_PASSWORD:-changeme_valkey_2025}
+      --replicaof valkey-master 6379
+      --maxmemory ${VALKEY_MAXMEMORY:-128mb}
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "7002:6379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    volumes:
+      - valkey-replica2-data:/data
+    networks:
+      patroni-net:
+        ipv4_address: ${VALKEY_REPLICA2_IP:-172.35.0.32}
+
+  valkey-sentinel1:
+    <<: *valkey-common
+    container_name: pat-valkey-sentinel1
+    hostname: valkey-sentinel1
+    entrypoint: /usr/local/bin/sentinel-entrypoint.sh
+    volumes:
+      - ./scripts/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel.conf:ro
+    ports:
+      - "${VALKEY_SENTINEL_PORT:-26999}:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    networks:
+      patroni-net:
+        ipv4_address: ${VALKEY_SENTINEL1_IP:-172.35.0.33}
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "26379", "-a", "${VALKEY_PASSWORD:-changeme_valkey_2025}", "PING"]
+
+  valkey-sentinel2:
+    <<: *valkey-common
+    container_name: pat-valkey-sentinel2
+    hostname: valkey-sentinel2
+    entrypoint: /usr/local/bin/sentinel-entrypoint.sh
+    volumes:
+      - ./scripts/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel.conf:ro
+    ports:
+      - "27000:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    networks:
+      patroni-net:
+        ipv4_address: ${VALKEY_SENTINEL2_IP:-172.35.0.34}
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "26379", "-a", "${VALKEY_PASSWORD:-changeme_valkey_2025}", "PING"]
+
+  valkey-sentinel3:
+    <<: *valkey-common
+    container_name: pat-valkey-sentinel3
+    hostname: valkey-sentinel3
+    entrypoint: /usr/local/bin/sentinel-entrypoint.sh
+    volumes:
+      - ./scripts/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel.conf:ro
+    ports:
+      - "27001:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    networks:
+      patroni-net:
+        ipv4_address: ${VALKEY_SENTINEL3_IP:-172.35.0.35}
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "26379", "-a", "${VALKEY_PASSWORD:-changeme_valkey_2025}", "PING"]
+
+# =============================================================================
+# Networks
+# =============================================================================
+
+networks:
+  patroni-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${CLUSTER_SUBNET:-172.35.0.0/16}
+
+# =============================================================================
+# Volumes
+# =============================================================================
+
+volumes:
+  etcd1-data:
+    driver: local
+  etcd2-data:
+    driver: local
+  etcd3-data:
+    driver: local
+  patroni1-data:
+    driver: local
+  patroni2-data:
+    driver: local
+  patroni3-data:
+    driver: local
+  valkey-master-data:
+    driver: local
+  valkey-replica1-data:
+    driver: local
+  valkey-replica2-data:
+    driver: local
