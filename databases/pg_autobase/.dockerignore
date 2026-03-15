@@ -1,0 +1,4 @@
+.git
+.env.backup
+*.md
+.DS_Store

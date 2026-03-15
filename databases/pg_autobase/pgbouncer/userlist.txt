@@ -1,0 +1,2 @@
+"postgres" "changeme_postgres_2025"
+"replicator" "changeme_repl_2025"

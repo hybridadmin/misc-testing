@@ -1,0 +1,434 @@
+# =============================================================================
+# pg_autobase — PostgreSQL 18 HA (Autobase-style)
+# Patroni + etcd + HAProxy + PgBouncer + pgBackRest + Valkey
+# =============================================================================
+#
+# Architecture (14 containers, all native ARM64):
+#
+#   Clients → PgBouncer(:6432) → HAProxy(:5050 RW, :5051 RO, :5052 sync, :5053 async)
+#                                    ↓
+#          ┌─────────────┬───────────┼───────────┐
+#          │             │           │            │
+#     patroni1      patroni2    patroni3    (PG18 + Patroni + pgBackRest)
+#     :5432/:8008   :5432/:8008 :5432/:8008
+#          │             │           │
+#          └─────────────┼───────────┘
+#                        │
+#                 shared backups volume (/var/lib/pgbackrest)
+#          │             │           │
+#     etcd1:2379    etcd2:2379  etcd3:2379  (DCS cluster)
+#
+#   + Valkey 9 (1 master + 2 replicas + 3 sentinels)
+#
+# =============================================================================
+
+name: pg-autobase-cluster
+
+# =============================================================================
+# YAML anchors for DRY service definitions
+# =============================================================================
+
+x-etcd-common: &etcd-common
+  image: quay.io/coreos/etcd:${ETCD_VERSION:-v3.5.17}
+  restart: unless-stopped
+  init: true
+  networks:
+    - autobase-net
+  environment: &etcd-env-common
+    ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+    ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+    ETCD_INITIAL_CLUSTER_TOKEN: autobase-etcd-cluster
+    ETCD_INITIAL_CLUSTER_STATE: new
+    ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+    ETCD_DATA_DIR: /etcd-data
+    ETCD_ENABLE_V2: "false"
+  healthcheck:
+    test: ["CMD", "etcdctl", "endpoint", "health", "--endpoints=http://localhost:2379"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 10s
+
+x-patroni-common: &patroni-common
+  build:
+    context: .
+    dockerfile: postgres/Dockerfile
+  restart: unless-stopped
+  shm_size: '256mb'
+  init: true
+  env_file: .env
+  depends_on:
+    etcd1:
+      condition: service_healthy
+    etcd2:
+      condition: service_healthy
+    etcd3:
+      condition: service_healthy
+  networks:
+    - autobase-net
+  healthcheck:
+    test: ["CMD", "/usr/local/bin/pg-healthcheck.sh"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 30s
+
+x-valkey-common: &valkey-common
+  image: valkey/valkey:${VALKEY_VERSION:-9}
+  restart: unless-stopped
+  init: true
+  networks:
+    - autobase-net
+  healthcheck:
+    test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD:-changeme_valkey_2025}", "PING"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 5s
+
+services:
+  # ===========================================================================
+  # etcd — Distributed Configuration Store (3-node cluster)
+  # ===========================================================================
+
+  etcd1:
+    <<: *etcd-common
+    container_name: ab-etcd1
+    hostname: etcd1
+    environment:
+      <<: *etcd-env-common
+      ETCD_NAME: etcd1
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd1:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd1:2379
+    volumes:
+      - etcd1-data:/etcd-data
+    networks:
+      autobase-net:
+        ipv4_address: ${ETCD1_IP:-172.36.0.2}
+
+  etcd2:
+    <<: *etcd-common
+    container_name: ab-etcd2
+    hostname: etcd2
+    environment:
+      <<: *etcd-env-common
+      ETCD_NAME: etcd2
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd2:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd2:2379
+    volumes:
+      - etcd2-data:/etcd-data
+    networks:
+      autobase-net:
+        ipv4_address: ${ETCD2_IP:-172.36.0.3}
+
+  etcd3:
+    <<: *etcd-common
+    container_name: ab-etcd3
+    hostname: etcd3
+    environment:
+      <<: *etcd-env-common
+      ETCD_NAME: etcd3
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd3:2380
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd3:2379
+    volumes:
+      - etcd3-data:/etcd-data
+    networks:
+      autobase-net:
+        ipv4_address: ${ETCD3_IP:-172.36.0.4}
+
+  # ===========================================================================
+  # Patroni + PostgreSQL 18 + pgBackRest (3-node cluster)
+  # ===========================================================================
+
+  patroni1:
+    <<: *patroni-common
+    container_name: ab-node1
+    hostname: patroni1
+    environment:
+      PATRONI_NAME: patroni1
+    volumes:
+      - patroni1-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool1:/var/spool/pgbackrest
+      - pgbackrest-log1:/var/log/pgbackrest
+    ports:
+      - "${PG_NODE1_PORT:-6051}:5432"
+      - "${PATRONI1_API_PORT:-8051}:8008"
+    networks:
+      autobase-net:
+        ipv4_address: ${PATRONI1_IP:-172.36.0.10}
+
+  patroni2:
+    <<: *patroni-common
+    container_name: ab-node2
+    hostname: patroni2
+    environment:
+      PATRONI_NAME: patroni2
+    volumes:
+      - patroni2-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool2:/var/spool/pgbackrest
+      - pgbackrest-log2:/var/log/pgbackrest
+    ports:
+      - "${PG_NODE2_PORT:-6052}:5432"
+      - "${PATRONI2_API_PORT:-8052}:8008"
+    networks:
+      autobase-net:
+        ipv4_address: ${PATRONI2_IP:-172.36.0.11}
+
+  patroni3:
+    <<: *patroni-common
+    container_name: ab-node3
+    hostname: patroni3
+    environment:
+      PATRONI_NAME: patroni3
+    volumes:
+      - patroni3-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool3:/var/spool/pgbackrest
+      - pgbackrest-log3:/var/log/pgbackrest
+    ports:
+      - "${PG_NODE3_PORT:-6053}:5432"
+      - "${PATRONI3_API_PORT:-8053}:8008"
+    networks:
+      autobase-net:
+        ipv4_address: ${PATRONI3_IP:-172.36.0.12}
+
+  # ===========================================================================
+  # HAProxy — 4-backend PostgreSQL routing (autobase pattern)
+  # ===========================================================================
+
+  haproxy:
+    image: haproxy:3.1-alpine
+    container_name: ab-haproxy
+    hostname: haproxy
+    restart: unless-stopped
+    init: true
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "${HAPROXY_PORT_MASTER:-5000}:5000"
+      - "${HAPROXY_PORT_REPLICAS:-5001}:5001"
+      - "${HAPROXY_PORT_SYNC:-5002}:5002"
+      - "${HAPROXY_PORT_ASYNC:-5003}:5003"
+      - "${HAPROXY_STATS_PORT:-7080}:7000"
+    depends_on:
+      patroni1:
+        condition: service_healthy
+      patroni2:
+        condition: service_healthy
+      patroni3:
+        condition: service_healthy
+    networks:
+      autobase-net:
+        ipv4_address: ${HAPROXY_IP:-172.36.0.20}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:7000/stats"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ===========================================================================
+  # PgBouncer — Connection pooling
+  # ===========================================================================
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: ab-pgbouncer
+    hostname: pgbouncer
+    restart: unless-stopped
+    init: true
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    ports:
+      - "${PGBOUNCER_PORT:-6433}:6432"
+    depends_on:
+      haproxy:
+        condition: service_healthy
+    networks:
+      autobase-net:
+        ipv4_address: ${PGBOUNCER_IP:-172.36.0.21}
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "6432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ===========================================================================
+  # Valkey 9 — Caching layer (1 master + 2 replicas + 3 sentinels)
+  # ===========================================================================
+
+  valkey-master:
+    <<: *valkey-common
+    container_name: ab-valkey-master
+    hostname: valkey-master
+    command: >
+      valkey-server
+      --requirepass ${VALKEY_PASSWORD:-changeme_valkey_2025}
+      --maxmemory ${VALKEY_MAXMEMORY:-128mb}
+      --maxmemory-policy allkeys-lfu
+      --appendonly yes
+      --appendfsync everysec
+    ports:
+      - "${VALKEY_PORT:-7010}:6379"
+    volumes:
+      - valkey-master-data:/data
+    networks:
+      autobase-net:
+        ipv4_address: ${VALKEY_MASTER_IP:-172.36.0.30}
+
+  valkey-replica1:
+    <<: *valkey-common
+    container_name: ab-valkey-replica1
+    hostname: valkey-replica1
+    command: >
+      valkey-server
+      --requirepass ${VALKEY_PASSWORD:-changeme_valkey_2025}
+      --masterauth ${VALKEY_PASSWORD:-changeme_valkey_2025}
+      --replicaof valkey-master 6379
+      --maxmemory ${VALKEY_MAXMEMORY:-128mb}
+      --maxmemory-policy allkeys-lfu
+    ports:
+      - "7011:6379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    volumes:
+      - valkey-replica1-data:/data
+    networks:
+      autobase-net:
+        ipv4_address: ${VALKEY_REPLICA1_IP:-172.36.0.31}
+
+  valkey-replica2:
+    <<: *valkey-common
+    container_name: ab-valkey-replica2
+    hostname: valkey-replica2
+    command: >
+      valkey-server
+      --requirepass ${VALKEY_PASSWORD:-changeme_valkey_2025}
+      --masterauth ${VALKEY_PASSWORD:-changeme_valkey_2025}
+      --replicaof valkey-master 6379
+      --maxmemory ${VALKEY_MAXMEMORY:-128mb}
+      --maxmemory-policy allkeys-lfu
+    ports:
+      - "7012:6379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    volumes:
+      - valkey-replica2-data:/data
+    networks:
+      autobase-net:
+        ipv4_address: ${VALKEY_REPLICA2_IP:-172.36.0.32}
+
+  valkey-sentinel1:
+    <<: *valkey-common
+    container_name: ab-valkey-sentinel1
+    hostname: valkey-sentinel1
+    entrypoint: /usr/local/bin/sentinel-entrypoint.sh
+    volumes:
+      - ./scripts/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel.conf:ro
+    ports:
+      - "${VALKEY_SENTINEL_PORT:-27010}:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    networks:
+      autobase-net:
+        ipv4_address: ${VALKEY_SENTINEL1_IP:-172.36.0.33}
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "26379", "-a", "${VALKEY_PASSWORD:-changeme_valkey_2025}", "PING"]
+
+  valkey-sentinel2:
+    <<: *valkey-common
+    container_name: ab-valkey-sentinel2
+    hostname: valkey-sentinel2
+    entrypoint: /usr/local/bin/sentinel-entrypoint.sh
+    volumes:
+      - ./scripts/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel.conf:ro
+    ports:
+      - "27011:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    networks:
+      autobase-net:
+        ipv4_address: ${VALKEY_SENTINEL2_IP:-172.36.0.34}
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "26379", "-a", "${VALKEY_PASSWORD:-changeme_valkey_2025}", "PING"]
+
+  valkey-sentinel3:
+    <<: *valkey-common
+    container_name: ab-valkey-sentinel3
+    hostname: valkey-sentinel3
+    entrypoint: /usr/local/bin/sentinel-entrypoint.sh
+    volumes:
+      - ./scripts/sentinel-entrypoint.sh:/usr/local/bin/sentinel-entrypoint.sh:ro
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel.conf:ro
+    ports:
+      - "27012:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    networks:
+      autobase-net:
+        ipv4_address: ${VALKEY_SENTINEL3_IP:-172.36.0.35}
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-p", "26379", "-a", "${VALKEY_PASSWORD:-changeme_valkey_2025}", "PING"]
+
+# =============================================================================
+# Networks
+# =============================================================================
+
+networks:
+  autobase-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${CLUSTER_SUBNET:-172.36.0.0/16}
+
+# =============================================================================
+# Volumes
+# =============================================================================
+
+volumes:
+  etcd1-data:
+    driver: local
+  etcd2-data:
+    driver: local
+  etcd3-data:
+    driver: local
+  patroni1-data:
+    driver: local
+  patroni2-data:
+    driver: local
+  patroni3-data:
+    driver: local
+  # pgBackRest shared repository (all 3 PG nodes mount this)
+  pgbackrest-repo:
+    driver: local
+  # Per-node spool directories (async WAL archiving)
+  pgbackrest-spool1:
+    driver: local
+  pgbackrest-spool2:
+    driver: local
+  pgbackrest-spool3:
+    driver: local
+  # Per-node log directories
+  pgbackrest-log1:
+    driver: local
+  pgbackrest-log2:
+    driver: local
+  pgbackrest-log3:
+    driver: local
+  valkey-master-data:
+    driver: local
+  valkey-replica1-data:
+    driver: local
+  valkey-replica2-data:
+    driver: local
