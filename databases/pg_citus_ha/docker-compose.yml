@@ -1,0 +1,401 @@
+# =============================================================================
+# Citus 14.0 Distributed PostgreSQL 18 Cluster with HA + Valkey
+# =============================================================================
+# Architecture:
+#   1x Citus Coordinator     - Query router, metadata store (holds VIP)
+#   1x Coordinator Standby   - Hot standby via streaming replication
+#   2x Citus Workers         - Data shard storage
+#   failover-monitor.sh      - Shell-based health monitor for VIP failover
+#   1x Valkey master         - Cache layer
+#   2x Valkey replicas       - Cache read replicas
+#   3x Valkey Sentinels      - Cache HA / automatic failover
+#
+# Total: 10 services (4 PG + 6 Valkey)
+# VIP (172.34.0.100) floats between coordinator and coordinator-standby.
+#
+# NOTE: This setup uses a shell-based failover monitor instead of keepalived
+# because VRRP raw sockets fail under Rosetta 2 emulation on Apple Silicon.
+# In production on native Linux, switch to keepalived for faster failover.
+# See keepalived/keepalived.conf.tmpl for the VRRP config template.
+# =============================================================================
+
+name: pg-citus-ha-cluster
+
+x-valkey-common: &valkey-common
+  image: valkey/valkey:9
+  restart: unless-stopped
+  networks:
+    citus-net: {}
+
+services:
+  # ===========================================================================
+  # Citus Coordinator (Primary)
+  # ===========================================================================
+  coordinator:
+    build:
+      context: .
+      dockerfile: postgres/Dockerfile.coordinator
+    container_name: cit-coordinator
+    hostname: coordinator
+    restart: unless-stopped
+    shm_size: '256mb'
+    init: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_REPL_USER: ${POSTGRES_REPL_USER}
+      POSTGRES_REPL_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      IS_COORDINATOR_PRIMARY: "true"
+      MY_IP: ${COORDINATOR_IP:-172.34.0.10}
+      COORDINATOR_IP: ${COORDINATOR_IP:-172.34.0.10}
+      COORDINATOR_STANDBY_IP: ${COORDINATOR_STANDBY_IP:-172.34.0.11}
+      KEEPALIVED_VIP: ${KEEPALIVED_VIP:-172.34.0.100}
+      CITUS_WORKERS: "worker1,worker2"
+    volumes:
+      - coordinator-data:/var/lib/postgresql
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    networks:
+      citus-net:
+        ipv4_address: ${COORDINATOR_IP:-172.34.0.10}
+    ports:
+      - "5941:5432"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pg-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ===========================================================================
+  # Citus Coordinator Standby (streaming replica for HA)
+  # ===========================================================================
+  # Hot standby of the primary coordinator. Uses pg_basebackup on first start
+  # to clone PGDATA, then streams WAL from the primary.
+  # Keepalived runs here with lower priority (90 vs 100). If primary fails,
+  # this node gets the VIP and auto-promotes to primary.
+  coordinator-standby:
+    build:
+      context: .
+      dockerfile: postgres/Dockerfile.coordinator
+    container_name: cit-coordinator-standby
+    hostname: coordinator-standby
+    restart: unless-stopped
+    shm_size: '256mb'
+    init: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_REPL_USER: ${POSTGRES_REPL_USER}
+      POSTGRES_REPL_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      IS_COORDINATOR_PRIMARY: "false"
+      COORDINATOR_HOST: coordinator
+      MY_IP: ${COORDINATOR_STANDBY_IP:-172.34.0.11}
+      COORDINATOR_IP: ${COORDINATOR_IP:-172.34.0.10}
+      COORDINATOR_STANDBY_IP: ${COORDINATOR_STANDBY_IP:-172.34.0.11}
+      KEEPALIVED_VIP: ${KEEPALIVED_VIP:-172.34.0.100}
+    entrypoint: ["coord-standby-entrypoint.sh"]
+    command: ["postgres"]
+    volumes:
+      - coordinator-standby-data:/var/lib/postgresql
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    networks:
+      citus-net:
+        ipv4_address: ${COORDINATOR_STANDBY_IP:-172.34.0.11}
+    ports:
+      - "5942:5432"
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pg-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ===========================================================================
+  # Citus Workers
+  # ===========================================================================
+  worker1:
+    build:
+      context: .
+      dockerfile: postgres/Dockerfile.worker
+    container_name: cit-worker1
+    hostname: worker1
+    restart: unless-stopped
+    shm_size: '256mb'
+    init: true
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_REPL_USER: ${POSTGRES_REPL_USER}
+      POSTGRES_REPL_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+    volumes:
+      - worker1-data:/var/lib/postgresql
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    networks:
+      citus-net:
+        ipv4_address: 172.34.0.21
+    ports:
+      - "5943:5432"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pg-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  worker2:
+    build:
+      context: .
+      dockerfile: postgres/Dockerfile.worker
+    container_name: cit-worker2
+    hostname: worker2
+    restart: unless-stopped
+    shm_size: '256mb'
+    init: true
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_REPL_USER: ${POSTGRES_REPL_USER}
+      POSTGRES_REPL_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+    volumes:
+      - worker2-data:/var/lib/postgresql
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    networks:
+      citus-net:
+        ipv4_address: 172.34.0.22
+    ports:
+      - "5944:5432"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/pg-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ===========================================================================
+  # Valkey Cache Cluster
+  # ===========================================================================
+  valkey-master:
+    <<: *valkey-common
+    container_name: cit-valkey-master
+    hostname: valkey-master
+    command: >
+      valkey-server
+      --port 6379
+      --bind 0.0.0.0
+      --requirepass ${VALKEY_PASSWORD}
+      --masterauth ${VALKEY_PASSWORD}
+      --maxmemory ${VALKEY_MAXMEMORY:-128mb}
+      --maxmemory-policy allkeys-lfu
+      --save "900 1"
+      --save "300 10"
+      --save "60 10000"
+      --hz 100
+      --dynamic-hz yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --tcp-keepalive 300
+      --maxclients 10000
+      --repl-diskless-sync yes
+      --loglevel notice
+    volumes:
+      - valkey-master-data:/data
+    ports:
+      - "${VALKEY_PORT:-6879}:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  valkey-replica1:
+    <<: *valkey-common
+    container_name: cit-valkey-replica1
+    hostname: valkey-replica1
+    command: >
+      valkey-server
+      --port 6379
+      --bind 0.0.0.0
+      --requirepass ${VALKEY_PASSWORD}
+      --masterauth ${VALKEY_PASSWORD}
+      --replicaof valkey-master 6379
+      --maxmemory ${VALKEY_MAXMEMORY:-128mb}
+      --maxmemory-policy allkeys-lfu
+      --replica-read-only yes
+      --hz 100
+      --dynamic-hz yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --tcp-keepalive 300
+      --maxclients 10000
+      --repl-diskless-sync yes
+      --loglevel notice
+    volumes:
+      - valkey-replica1-data:/data
+    ports:
+      - "6880:6379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  valkey-replica2:
+    <<: *valkey-common
+    container_name: cit-valkey-replica2
+    hostname: valkey-replica2
+    command: >
+      valkey-server
+      --port 6379
+      --bind 0.0.0.0
+      --requirepass ${VALKEY_PASSWORD}
+      --masterauth ${VALKEY_PASSWORD}
+      --replicaof valkey-master 6379
+      --maxmemory ${VALKEY_MAXMEMORY:-128mb}
+      --maxmemory-policy allkeys-lfu
+      --replica-read-only yes
+      --hz 100
+      --dynamic-hz yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --tcp-keepalive 300
+      --maxclients 10000
+      --repl-diskless-sync yes
+      --loglevel notice
+    volumes:
+      - valkey-replica2-data:/data
+    ports:
+      - "6881:6379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  valkey-sentinel1:
+    <<: *valkey-common
+    container_name: cit-valkey-sentinel1
+    hostname: valkey-sentinel1
+    entrypoint: ["/bin/bash", "/scripts/sentinel-entrypoint.sh"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+      - ./scripts/sentinel-entrypoint.sh:/scripts/sentinel-entrypoint.sh:ro
+      - valkey-sentinel1-data:/data
+    ports:
+      - "${VALKEY_SENTINEL_PORT:-26879}:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+      valkey-replica1:
+        condition: service_healthy
+      valkey-replica2:
+        condition: service_healthy
+
+  valkey-sentinel2:
+    <<: *valkey-common
+    container_name: cit-valkey-sentinel2
+    hostname: valkey-sentinel2
+    entrypoint: ["/bin/bash", "/scripts/sentinel-entrypoint.sh"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+      - ./scripts/sentinel-entrypoint.sh:/scripts/sentinel-entrypoint.sh:ro
+      - valkey-sentinel2-data:/data
+    ports:
+      - "26880:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+      valkey-replica1:
+        condition: service_healthy
+      valkey-replica2:
+        condition: service_healthy
+
+  valkey-sentinel3:
+    <<: *valkey-common
+    container_name: cit-valkey-sentinel3
+    hostname: valkey-sentinel3
+    entrypoint: ["/bin/bash", "/scripts/sentinel-entrypoint.sh"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+      - ./scripts/sentinel-entrypoint.sh:/scripts/sentinel-entrypoint.sh:ro
+      - valkey-sentinel3-data:/data
+    ports:
+      - "26881:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+      valkey-replica1:
+        condition: service_healthy
+      valkey-replica2:
+        condition: service_healthy
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  citus-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${CLUSTER_SUBNET:-172.34.0.0/16}
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  coordinator-data:
+    driver: local
+  coordinator-standby-data:
+    driver: local
+  worker1-data:
+    driver: local
+  worker2-data:
+    driver: local
+  valkey-master-data:
+    driver: local
+  valkey-replica1-data:
+    driver: local
+  valkey-replica2-data:
+    driver: local
+  valkey-sentinel1-data:
+    driver: local
+  valkey-sentinel2-data:
+    driver: local
+  valkey-sentinel3-data:
+    driver: local

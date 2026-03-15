@@ -1,0 +1,39 @@
+FROM citusdata/citus:latest
+
+# Install utilities for coordinator HA
+# NOTE: keepalived is installed but NOT used by default — VRRP raw sockets
+# fail under Rosetta 2 emulation on Apple Silicon. The failover-monitor.sh
+# script handles VIP failover instead. In production on native Linux, you
+# can switch to keepalived for faster (~3s) failover with split-brain
+# protection. See keepalived/keepalived.conf.tmpl for the VRRP config.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    iproute2 \
+    arping \
+    curl \
+    jq \
+    gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+# Custom scripts
+COPY scripts/coord-entrypoint.sh /usr/local/bin/coord-entrypoint.sh
+COPY scripts/coord-standby-entrypoint.sh /usr/local/bin/coord-standby-entrypoint.sh
+COPY scripts/failover-monitor.sh /usr/local/bin/failover-monitor.sh
+COPY scripts/pg-healthcheck.sh /usr/local/bin/pg-healthcheck.sh
+COPY scripts/keepalived-check.sh /usr/local/bin/keepalived-check.sh
+COPY scripts/keepalived-notify.sh /usr/local/bin/keepalived-notify.sh
+COPY scripts/setup-cluster.sh /usr/local/bin/setup-cluster.sh
+RUN chmod +x /usr/local/bin/coord-entrypoint.sh \
+    /usr/local/bin/coord-standby-entrypoint.sh \
+    /usr/local/bin/failover-monitor.sh \
+    /usr/local/bin/pg-healthcheck.sh \
+    /usr/local/bin/keepalived-check.sh \
+    /usr/local/bin/keepalived-notify.sh \
+    /usr/local/bin/setup-cluster.sh
+
+# Ensure directories exist
+RUN mkdir -p /etc/postgresql && chown -R postgres:postgres /etc/postgresql
+
+EXPOSE 5432
+
+ENTRYPOINT ["coord-entrypoint.sh"]
+CMD ["postgres"]

@@ -1,0 +1,40 @@
+! Keepalived configuration for Citus coordinator HA
+! VIP floats between coordinator (priority 100) and coordinator-standby (priority 90)
+
+global_defs {
+    enable_script_security
+    script_user root
+}
+
+vrrp_script chk_pg {
+    script "/usr/local/bin/keepalived-check.sh"
+    interval 3
+    weight -20
+    fall 2
+    rise 2
+    user root
+}
+
+vrrp_instance VI_CITUS {
+    state ${KEEPALIVED_STATE}
+    interface eth0
+    virtual_router_id ${KEEPALIVED_VRID}
+    priority ${KEEPALIVED_PRIORITY}
+    nopreempt
+    advert_int 1
+
+    unicast_src_ip ${MY_IP}
+    unicast_peer {
+${UNICAST_PEERS}
+    }
+
+    virtual_ipaddress {
+        ${KEEPALIVED_VIP}/16
+    }
+
+    track_script {
+        chk_pg
+    }
+
+    notify /usr/local/bin/keepalived-notify.sh root
+}

@@ -1,0 +1,15 @@
+FROM citusdata/citus:latest
+
+# Workers: no keepalived needed, just health check
+COPY scripts/pg-healthcheck.sh /usr/local/bin/pg-healthcheck.sh
+COPY scripts/worker-entrypoint.sh /usr/local/bin/worker-entrypoint.sh
+RUN chmod +x /usr/local/bin/pg-healthcheck.sh \
+    /usr/local/bin/worker-entrypoint.sh
+
+# Ensure directories exist
+RUN mkdir -p /etc/postgresql && chown -R postgres:postgres /etc/postgresql
+
+EXPOSE 5432
+
+ENTRYPOINT ["worker-entrypoint.sh"]
+CMD ["postgres"]
