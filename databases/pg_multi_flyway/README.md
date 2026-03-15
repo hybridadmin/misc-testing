@@ -158,7 +158,7 @@ With the manual `ddl` command:
 ## Network
 
 Uses subnet `172.30.0.0/16` to avoid conflicts with:
-- `pg/` (172.28.0.0/16)
+- `pg_patroni_hap/` (172.28.0.0/16)
 - `pg_multi/` (172.29.0.0/16)
 
 ## Comparison: pg_multi vs pg_multi_flyway

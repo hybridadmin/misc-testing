@@ -10,13 +10,13 @@
 #   3x Valkey Sentinels    - Cache HA / automatic failover
 # =============================================================================
 
-name: pg-ha-cluster
+name: pg-patroni-hap-cluster
 
 x-etcd-common: &etcd-common
   image: quay.io/coreos/etcd:v3.5.17
   restart: unless-stopped
   networks:
-    - pg-cluster-net
+    - pg-patroni-hap-net
 
 x-patroni-common: &patroni-common
   build:
@@ -25,7 +25,7 @@ x-patroni-common: &patroni-common
   restart: unless-stopped
   shm_size: '512mb'
   networks:
-    - pg-cluster-net
+    - pg-patroni-hap-net
   env_file: .env
   depends_on:
     etcd1:
@@ -39,7 +39,7 @@ x-valkey-common: &valkey-common
   image: valkey/valkey:9
   restart: unless-stopped
   networks:
-    - pg-cluster-net
+    - pg-patroni-hap-net
 
 services:
   # ===========================================================================
@@ -58,7 +58,7 @@ services:
       - --advertise-client-urls=http://etcd1:2379
       - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
       - --initial-cluster-state=new
-      - --initial-cluster-token=pg-etcd-cluster
+      - --initial-cluster-token=pg-patroni-hap-etcd-cluster
       - --data-dir=/etcd-data
       - --quota-backend-bytes=8589934592
       - --auto-compaction-mode=periodic
@@ -86,7 +86,7 @@ services:
       - --advertise-client-urls=http://etcd2:2379
       - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
       - --initial-cluster-state=new
-      - --initial-cluster-token=pg-etcd-cluster
+      - --initial-cluster-token=pg-patroni-hap-etcd-cluster
       - --data-dir=/etcd-data
       - --quota-backend-bytes=8589934592
       - --auto-compaction-mode=periodic
@@ -114,7 +114,7 @@ services:
       - --advertise-client-urls=http://etcd3:2379
       - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
       - --initial-cluster-state=new
-      - --initial-cluster-token=pg-etcd-cluster
+      - --initial-cluster-token=pg-patroni-hap-etcd-cluster
       - --data-dir=/etcd-data
       - --quota-backend-bytes=8589934592
       - --auto-compaction-mode=periodic
@@ -219,7 +219,7 @@ services:
     hostname: haproxy-pg
     restart: unless-stopped
     networks:
-      - pg-cluster-net
+      - pg-patroni-hap-net
     depends_on:
       pg-node1:
         condition: service_healthy
@@ -417,7 +417,7 @@ services:
 # Networks
 # =============================================================================
 networks:
-  pg-cluster-net:
+  pg-patroni-hap-net:
     driver: bridge
     ipam:
       config:

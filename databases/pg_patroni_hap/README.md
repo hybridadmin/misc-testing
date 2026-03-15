@@ -360,7 +360,7 @@ docker exec etcd1 etcdctl endpoint health --cluster \
 
 # If etcd data is corrupted, reset:
 docker compose down
-docker volume rm pg-ha-cluster_etcd1-data pg-ha-cluster_etcd2-data pg-ha-cluster_etcd3-data
+docker volume rm pg-patroni-hap-cluster_etcd1-data pg-patroni-hap-cluster_etcd2-data pg-patroni-hap-cluster_etcd3-data
 docker compose up -d
 ```
 
@@ -370,7 +370,7 @@ This should never happen with synchronous_mode + etcd consensus. If it does:
 
 ```bash
 # Check who holds the leader lock
-docker exec etcd1 etcdctl get /service/pg-cluster/leader
+docker exec etcd1 etcdctl get /service/pg-patroni-hap/leader
 
 # Force a specific node as leader
 docker exec pg-node1 curl -s -XPATCH http://localhost:8008/config \
@@ -424,7 +424,7 @@ docker compose down -v
 ## File Structure
 
 ```
-pg/
+pg_patroni_hap/
 ├── .env                          # Environment variables (passwords, versions)
 ├── docker-compose.yml            # Full cluster definition
 ├── patroni/

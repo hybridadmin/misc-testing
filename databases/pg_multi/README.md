@@ -212,7 +212,7 @@ Benchmarks run with subscriptions disabled (each node tested independently):
 | Failed txns | 0 | 0 |
 | Write nodes | All 3 | All 3 |
 
-For comparison, the single-writer Patroni cluster (`pg/`) achieved ~1,560 write TPS and ~22,700 read TPS — but writes are limited to a single primary node.
+For comparison, the single-writer Patroni cluster (`pg_patroni_hap/`) achieved ~1,560 write TPS and ~22,700 read TPS — but writes are limited to a single primary node.
 
 > **Note**: Benchmark numbers are raw per-node performance with replication disabled.
 > Under normal operation with replication enabled, effective throughput is lower due to
@@ -221,11 +221,11 @@ For comparison, the single-writer Patroni cluster (`pg/`) achieved ~1,560 write 
 
 ## Network
 
-Uses subnet `172.29.0.0/16` (the single-writer `pg/` cluster uses `172.28.0.0/16`), so both clusters can run simultaneously.
+Uses subnet `172.29.0.0/16` (the single-writer `pg_patroni_hap/` cluster uses `172.28.0.0/16`), so both clusters can run simultaneously.
 
-## Comparison with Single-Writer (pg/)
+## Comparison with Single-Writer (pg_patroni_hap/)
 
-| Feature | Multi-Master (pg_multi/) | Single-Writer (pg/) |
+| Feature | Multi-Master (pg_multi/) | Single-Writer (pg_patroni_hap/) |
 |---------|-------------------------|---------------------|
 | Write nodes | All 3 | Primary only |
 | Failover | N/A (all nodes equal) | Patroni auto-failover |

@@ -184,7 +184,7 @@ docker logs mmp-pg-node1 2>&1 | grep -i conflict
 ## Network
 
 Uses subnet `172.31.0.0/16` to avoid conflicts with:
-- `pg/` (172.28.0.0/16) — single-writer Patroni cluster
+- `pg_patroni_hap/` (172.28.0.0/16) — single-writer Patroni cluster
 - `pg_multi/` (172.29.0.0/16) — native logical replication multi-master
 - `pg_multi_flyway/` (172.30.0.0/16) — Flyway DDL management multi-master
 
