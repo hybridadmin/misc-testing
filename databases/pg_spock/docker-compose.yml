@@ -1,0 +1,166 @@
+###############################################################################
+# PG 18 + Spock Multi-Master Cluster
+#
+# Topology:
+#   node1 (R/W) <──Spock──> node2 (R/W)   <- active-active multi-master
+#   node3 (RO)  <- streaming replica of node1
+#   node4 (RO)  <- streaming replica of node2
+#   haproxy     <- routes R/W (:15000) and RO (:15001) traffic
+#
+# 5 containers total, all native ARM64 Docker images (no Rosetta 2 emulation).
+###############################################################################
+
+x-pg-common: &pg-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: &pg-env
+    POSTGRES_USER: ${POSTGRES_USER:-postgres}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    POSTGRES_DB: ${POSTGRES_DB:-spockdb}
+  networks:
+    - spock-net
+  restart: unless-stopped
+  init: true
+  shm_size: 256mb
+
+services:
+  # ─────────────── R/W Node 1 (Spock primary) ───────────────
+  node1:
+    <<: *pg-common
+    container_name: spock-node1
+    hostname: node1
+    environment:
+      <<: *pg-env
+      NODE_ROLE: primary
+      NODE_NAME: node1
+    ports:
+      - "${PG_NODE1_PORT:-15432}:5432"
+    volumes:
+      - node1-data:/var/lib/postgresql/data
+    networks:
+      spock-net:
+        ipv4_address: ${NODE1_IP:-172.37.0.10}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d spockdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  # ─────────────── R/W Node 2 (Spock primary) ───────────────
+  node2:
+    <<: *pg-common
+    container_name: spock-node2
+    hostname: node2
+    environment:
+      <<: *pg-env
+      NODE_ROLE: primary
+      NODE_NAME: node2
+    ports:
+      - "${PG_NODE2_PORT:-15433}:5432"
+    volumes:
+      - node2-data:/var/lib/postgresql/data
+    networks:
+      spock-net:
+        ipv4_address: ${NODE2_IP:-172.37.0.11}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d spockdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  # ─────────────── RO Node 3 (streaming replica of node1) ───
+  node3:
+    <<: *pg-common
+    container_name: spock-node3
+    hostname: node3
+    environment:
+      <<: *pg-env
+      NODE_ROLE: replica
+      NODE_NAME: node3
+      REPLICA_PRIMARY_HOST: node1
+    ports:
+      - "${PG_NODE3_PORT:-15434}:5432"
+    volumes:
+      - node3-data:/var/lib/postgresql/data
+    depends_on:
+      node1:
+        condition: service_healthy
+    networks:
+      spock-net:
+        ipv4_address: ${NODE3_IP:-172.37.0.12}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  # ─────────────── RO Node 4 (streaming replica of node2) ───
+  node4:
+    <<: *pg-common
+    container_name: spock-node4
+    hostname: node4
+    environment:
+      <<: *pg-env
+      NODE_ROLE: replica
+      NODE_NAME: node4
+      REPLICA_PRIMARY_HOST: node2
+    ports:
+      - "${PG_NODE4_PORT:-15435}:5432"
+    volumes:
+      - node4-data:/var/lib/postgresql/data
+    depends_on:
+      node2:
+        condition: service_healthy
+    networks:
+      spock-net:
+        ipv4_address: ${NODE4_IP:-172.37.0.13}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  # ─────────────── HAProxy ───────────────────────────────────
+  haproxy:
+    image: haproxy:3.1-alpine
+    container_name: spock-haproxy
+    hostname: haproxy
+    init: true
+    ports:
+      - "${HAPROXY_RW_PORT:-15000}:5000"     # R/W (round-robin to node1, node2)
+      - "${HAPROXY_RO_PORT:-15001}:5001"     # RO  (round-robin to node3, node4)
+      - "${HAPROXY_STATS_PORT:-17000}:7000"  # HAProxy stats UI
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      node1:
+        condition: service_healthy
+      node2:
+        condition: service_healthy
+    networks:
+      spock-net:
+        ipv4_address: ${HAPROXY_IP:-172.37.0.20}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+
+networks:
+  spock-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${CLUSTER_SUBNET:-172.37.0.0/16}
