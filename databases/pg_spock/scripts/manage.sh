@@ -43,6 +43,9 @@ NODE2_PORT="${PG_NODE2_PORT:-15433}"
 NODE3_PORT="${PG_NODE3_PORT:-15434}"
 NODE4_PORT="${PG_NODE4_PORT:-15435}"
 
+# pgBackRest
+STANZA="${PGBACKREST_STANZA:-pg-spock}"
+
 # --- SQL helpers ---
 run_sql() {
     PGPASSWORD="$PGPASSWORD" psql -h localhost -p "$HAPROXY_RW" -U "$PG_USER" -d "$PG_DB" -tAc "$1" 2>/dev/null
@@ -415,6 +418,27 @@ cmd_test() {
     bulk_count=$(run_sql_on "$NODE1_PORT" "SELECT count(*) FROM _test_spock WHERE val LIKE 'bulk_%'")
     [ "${bulk_count:-0}" -eq 100 ] && pass || fail "Expected 100 rows, got ${bulk_count:-0}"
 
+    # --- Test 21: pgBackRest stanza exists ---
+    run_test "pgBackRest stanza exists on node1"
+    local stanza_json
+    stanza_json=$(docker exec -u postgres spock-node1 pgbackrest --stanza="$STANZA" --output=json info 2>/dev/null) || stanza_json=""
+    local stanza_name
+    stanza_name=$(echo "$stanza_json" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+    [ "$stanza_name" = "$STANZA" ] && pass || fail "stanza not found (got: $stanza_name)"
+
+    # --- Test 22: WAL archiving is enabled ---
+    run_test "WAL archiving enabled (archive_mode=on)"
+    local archive_mode
+    archive_mode=$(run_sql_on "$NODE1_PORT" "SHOW archive_mode")
+    [ "$archive_mode" = "on" ] && pass || fail "archive_mode=$archive_mode"
+
+    # --- Test 23: pgBackRest has at least one backup ---
+    run_test "pgBackRest has at least one backup"
+    local backup_count
+    backup_count=$(docker exec -u postgres spock-node1 pgbackrest --stanza="$STANZA" --output=json info 2>/dev/null \
+        | grep -o '"label"' | wc -l | tr -d ' ') || backup_count=0
+    [ "${backup_count:-0}" -ge 1 ] && pass || fail "No backups found (count=$backup_count)"
+
     # Cleanup — remove from Spock repset before dropping
     run_sql_on "$NODE1_PORT" "SELECT spock.repset_remove_table('default', '_test_spock');" >/dev/null 2>&1
     run_sql_on "$NODE2_PORT" "SELECT spock.repset_remove_table('default', '_test_spock');" >/dev/null 2>&1
@@ -500,6 +524,56 @@ cmd_logs() {
     esac
 }
 
+cmd_backup() {
+    local type="${1:-diff}"
+    local node="${2:-node1}"
+    local container="spock-${node}"
+
+    case "$type" in
+        full|diff|incr) ;;
+        *)
+            log_error "Unknown backup type: $type (use: full, diff, incr)"
+            exit 1
+            ;;
+    esac
+
+    log_head "=== pgBackRest Backup (${type}) on ${node} ==="
+    log_info "Stanza: $STANZA | Type: $type | Container: $container"
+
+    docker exec -u postgres "$container" pgbackrest --stanza="$STANZA" --type="$type" backup
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        log_ok "Backup complete"
+        # Show summary
+        docker exec -u postgres "$container" pgbackrest --stanza="$STANZA" info
+    else
+        log_error "Backup failed (exit code $rc)"
+        exit $rc
+    fi
+}
+
+cmd_backup_info() {
+    local node="${1:-node1}"
+    local container="spock-${node}"
+    log_head "=== pgBackRest Backup Info (${node}) ==="
+    docker exec -u postgres "$container" pgbackrest --stanza="$STANZA" info
+}
+
+cmd_backup_check() {
+    local node="${1:-node1}"
+    local container="spock-${node}"
+    log_head "=== pgBackRest Check (${node}) ==="
+    log_info "Verifying stanza '$STANZA' and WAL archiving..."
+    docker exec -u postgres "$container" pgbackrest --stanza="$STANZA" check
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        log_ok "pgBackRest check passed — stanza OK, WAL archiving OK"
+    else
+        log_error "pgBackRest check failed (exit code $rc)"
+        exit $rc
+    fi
+}
+
 cmd_help() {
     echo "pg_spock — PostgreSQL 18 + Spock Multi-Master (2x R/W + 2x RO + HAProxy)"
     echo ""
@@ -517,8 +591,13 @@ cmd_help() {
     echo "  setup               Run Spock setup (nodes, subscriptions, test data)"
     echo "  reinit              Full cluster reinit (DESTROYS ALL DATA)"
     echo ""
+    echo "Backup (pgBackRest):"
+    echo "  backup [type] [node]  Run backup (type: full|diff|incr, default: diff, node: node1|node2)"
+    echo "  backup-info [node]    Show backup inventory"
+    echo "  backup-check [node]   Verify stanza and WAL archiving"
+    echo ""
     echo "Test & Benchmark:"
-    echo "  test                Run integration tests (20 tests)"
+    echo "  test                Run integration tests (23 tests)"
     echo "  bench               Run pgbench benchmarks (TPC-B + SELECT-only)"
     echo ""
     echo "Connection Info:"
@@ -544,6 +623,9 @@ case "$COMMAND" in
     psql)                cmd_psql "$@" ;;
     setup)               cmd_setup ;;
     reinit)              cmd_reinit ;;
+    backup)              cmd_backup "$@" ;;
+    backup-info)         cmd_backup_info "$@" ;;
+    backup-check)        cmd_backup_check "$@" ;;
     test)                cmd_test ;;
     bench|benchmark)     cmd_bench ;;
     logs|log)            cmd_logs "$@" ;;

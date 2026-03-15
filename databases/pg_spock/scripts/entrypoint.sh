@@ -33,6 +33,12 @@ mkdir -p "$PGDATA"
 chown postgres:postgres "$PGDATA"
 chmod 0700 "$PGDATA"
 
+# --- Ensure pgBackRest directories exist and are writable ---
+for dir in /var/lib/pgbackrest /var/log/pgbackrest /var/spool/pgbackrest; do
+    mkdir -p "$dir" 2>/dev/null || true
+    chown postgres:postgres "$dir" 2>/dev/null || true
+done
+
 # --- Helper: wait for PG to accept connections ---
 wait_for_pg() {
   local host="${1:-localhost}"
@@ -71,6 +77,7 @@ init_primary() {
 # Spock / Replication (required for multi-master + streaming replicas)
 # =============================================================================
 listen_addresses = '*'
+unix_socket_directories = '/var/run/postgresql'
 wal_level = logical
 max_worker_processes = 16
 max_replication_slots = 20
@@ -105,13 +112,16 @@ maintenance_work_mem = '64MB'
 huge_pages = off
 
 # =============================================================================
-# WAL
+# WAL + Archiving (pgBackRest)
 # =============================================================================
 wal_buffers = '8MB'
 min_wal_size = '128MB'
 max_wal_size = '512MB'
 checkpoint_completion_target = 0.9
 checkpoint_timeout = '10min'
+archive_mode = on
+archive_timeout = 300
+archive_command = 'pgbackrest --stanza=pg-spock archive-push %p'
 
 # =============================================================================
 # Query Planner (SSD-optimized, autobase defaults)
@@ -176,7 +186,10 @@ host    replication     all             0.0.0.0/0               scram-sha-256
 HBA
 
   # Start temporarily to create DB, users, extensions
-  gosu postgres pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost'" -w start
+  gosu postgres pg_ctl -D "$PGDATA" -o "-c listen_addresses='localhost' -c unix_socket_directories='/var/run/postgresql'" -w start
+
+  # All psql commands must connect via /var/run/postgresql
+  export PGHOST=/var/run/postgresql
 
   # Set superuser password
   gosu postgres psql -v ON_ERROR_STOP=1 <<-SQL
@@ -247,6 +260,7 @@ init_replica() {
 # === Replica overrides ===
 hot_standby = on
 primary_conninfo = 'host=${REPLICA_PRIMARY_HOST} port=5432 user=${POSTGRES_USER} password=${POSTGRES_PASSWORD}'
+restore_command = 'pgbackrest --stanza=pg-spock archive-get %f "%p"'
 CONF
 
   # Inject node name into log_line_prefix
@@ -256,11 +270,44 @@ CONF
 }
 
 # =============================================================================
+# pgBackRest init (runs in background after PG is fully up, primaries only)
+# =============================================================================
+init_pgbackrest_bg() {
+  (
+    # Wait for PostgreSQL to be ready
+    sleep 3
+    local max_wait=60
+    for i in $(seq 1 "$max_wait"); do
+      if gosu postgres pg_isready -q 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+
+    log "Initializing pgBackRest stanza 'pg-spock'..."
+    gosu postgres pgbackrest --stanza=pg-spock stanza-create 2>&1 || log "WARN: pgbackrest stanza-create failed (may already exist)"
+
+    log "Running pgBackRest check..."
+    gosu postgres pgbackrest --stanza=pg-spock check 2>&1 || log "WARN: pgbackrest check failed"
+
+    log "Creating initial full backup (background)..."
+    gosu postgres pgbackrest --stanza=pg-spock --type=full backup > /var/log/pgbackrest/initial-backup.log 2>&1 || log "WARN: initial backup failed"
+
+    log "pgBackRest initialization complete"
+  ) &
+}
+
+# =============================================================================
 # Main
 # =============================================================================
 case "$NODE_ROLE" in
   primary)
     init_primary
+    # Start pgBackRest stanza init + initial backup in background after PG starts
+    # Only node1 creates the stanza and initial backup (shared repo, avoid race)
+    if [ "$NODE_NAME" = "node1" ]; then
+      init_pgbackrest_bg
+    fi
     ;;
   replica)
     init_replica

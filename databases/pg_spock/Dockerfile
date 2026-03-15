@@ -73,7 +73,15 @@ ENV POSTGRES_USER=postgres
 ENV POSTGRES_PASSWORD=postgres
 ENV POSTGRES_DB=spockdb
 
-# Runtime dependencies
+# Add PGDG apt repo for pgBackRest >= 2.55 (required for PG18 control version 1800)
+RUN apt-get update && apt-get install -y --no-install-recommends gnupg2 curl ca-certificates \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+       | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg \
+    && echo 'deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main' \
+       > /etc/apt/sources.list.d/pgdg.list \
+    && rm -rf /var/lib/apt/lists/*
+
+# Runtime dependencies (pgbackrest from PGDG for PG18 support)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libreadline8 \
     zlib1g \
@@ -86,6 +94,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     locales \
     gosu \
     curl \
+    pgbackrest \
     && rm -rf /var/lib/apt/lists/* \
     && localedef -i en_US -c -f UTF-8 -A /usr/share/locale/locale.alias en_US.UTF-8
 
@@ -94,10 +103,18 @@ ENV LANG=en_US.UTF-8
 # Copy PostgreSQL + Spock from builder
 COPY --from=builder /usr/local/pgsql /usr/local/pgsql
 
-# Create postgres user
-RUN groupadd -r postgres && useradd -r -g postgres -d /var/lib/postgresql -s /bin/bash postgres \
+# Create postgres user (pgbackrest pulls postgresql-common which may already create it)
+RUN (getent group postgres >/dev/null 2>&1 || groupadd -r postgres) \
+    && (id postgres >/dev/null 2>&1 || useradd -r -g postgres -d /var/lib/postgresql -s /bin/bash postgres) \
+    && usermod -d /var/lib/postgresql -s /bin/bash postgres \
     && mkdir -p /var/lib/postgresql/data /var/run/postgresql /docker-entrypoint-initdb.d \
-    && chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql
+               /etc/pgbackrest /var/lib/pgbackrest /var/log/pgbackrest /var/spool/pgbackrest \
+    && chown -R postgres:postgres /var/lib/postgresql /var/run/postgresql \
+               /etc/pgbackrest /var/lib/pgbackrest /var/log/pgbackrest /var/spool/pgbackrest
+
+# Copy pgbackrest config
+COPY pgbackrest/pgbackrest.conf /etc/pgbackrest/pgbackrest.conf
+RUN chown postgres:postgres /etc/pgbackrest/pgbackrest.conf
 
 # Copy entrypoint and scripts
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh

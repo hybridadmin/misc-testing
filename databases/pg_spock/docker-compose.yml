@@ -38,11 +38,14 @@ services:
       - "${PG_NODE1_PORT:-15432}:5432"
     volumes:
       - node1-data:/var/lib/postgresql/data
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool1:/var/spool/pgbackrest
+      - pgbackrest-log1:/var/log/pgbackrest
     networks:
       spock-net:
         ipv4_address: ${NODE1_IP:-172.37.0.10}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d spockdb"]
+      test: ["CMD-SHELL", "pg_isready -h /var/run/postgresql -U postgres -d spockdb"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -61,11 +64,14 @@ services:
       - "${PG_NODE2_PORT:-15433}:5432"
     volumes:
       - node2-data:/var/lib/postgresql/data
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool2:/var/spool/pgbackrest
+      - pgbackrest-log2:/var/log/pgbackrest
     networks:
       spock-net:
         ipv4_address: ${NODE2_IP:-172.37.0.11}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d spockdb"]
+      test: ["CMD-SHELL", "pg_isready -h /var/run/postgresql -U postgres -d spockdb"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -85,6 +91,9 @@ services:
       - "${PG_NODE3_PORT:-15434}:5432"
     volumes:
       - node3-data:/var/lib/postgresql/data
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool3:/var/spool/pgbackrest
+      - pgbackrest-log3:/var/log/pgbackrest
     depends_on:
       node1:
         condition: service_healthy
@@ -92,7 +101,7 @@ services:
       spock-net:
         ipv4_address: ${NODE3_IP:-172.37.0.12}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -h /var/run/postgresql -U postgres"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -112,6 +121,9 @@ services:
       - "${PG_NODE4_PORT:-15435}:5432"
     volumes:
       - node4-data:/var/lib/postgresql/data
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool4:/var/spool/pgbackrest
+      - pgbackrest-log4:/var/log/pgbackrest
     depends_on:
       node2:
         condition: service_healthy
@@ -119,7 +131,7 @@ services:
       spock-net:
         ipv4_address: ${NODE4_IP:-172.37.0.13}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -h /var/run/postgresql -U postgres"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -157,6 +169,18 @@ volumes:
   node2-data:
   node3-data:
   node4-data:
+  # pgBackRest shared repository (both primaries + replicas mount this)
+  pgbackrest-repo:
+  # Per-node spool directories (async WAL archiving)
+  pgbackrest-spool1:
+  pgbackrest-spool2:
+  pgbackrest-spool3:
+  pgbackrest-spool4:
+  # Per-node log directories
+  pgbackrest-log1:
+  pgbackrest-log2:
+  pgbackrest-log3:
+  pgbackrest-log4:
 
 networks:
   spock-net:

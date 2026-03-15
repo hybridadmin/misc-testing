@@ -47,7 +47,7 @@ Active-active multi-master PostgreSQL 18 cluster using [Spock v5.0.6](https://gi
 | Write scaling | Single writer | 2 writers (round-robin via HAProxy) |
 | DDL replication | Automatic (streaming) | Manual (Spock limitation) |
 | Connection pooling | PgBouncer | None (direct HAProxy) |
-| Backup solution | pgBackRest | None (add as needed) |
+| Backup solution | pgBackRest | pgBackRest |
 | DCS | etcd (3 nodes) | None required |
 | Containers | 14 | 5 |
 | PG extensions | pg_stat_statements | Spock + pg_stat_statements |
@@ -64,7 +64,7 @@ docker compose up -d
 # Check cluster status
 ./scripts/manage.sh status
 
-# Run integration tests (20 tests)
+# Run integration tests (23 tests)
 ./scripts/manage.sh test
 
 # Run pgbench benchmarks
@@ -128,8 +128,13 @@ Setup:
   setup               Run Spock setup (nodes, subscriptions, test data)
   reinit              Full cluster reinit (DESTROYS ALL DATA)
 
+Backup (pgBackRest):
+  backup [type] [node]  Run backup (type: full|diff|incr, default: diff, node: node1|node2)
+  backup-info [node]    Show backup inventory
+  backup-check [node]   Verify stanza and WAL archiving
+
 Test & Benchmark:
-  test                Run integration tests (20 tests)
+  test                Run integration tests (23 tests)
   bench               Run pgbench benchmarks (TPC-B + SELECT-only)
 ```
 
@@ -185,6 +190,9 @@ Conservative settings for a Docker VM with 4 PG nodes sharing resources, with au
 | | checkpoint_timeout | 10min | |
 | | wal_compression | on | Reduce WAL volume |
 | | wal_log_hints | on | Required for pg_rewind |
+| | archive_mode | on | Continuous WAL archiving to pgBackRest |
+| | archive_timeout | 300 | Force archive every 5 min (low-write periods) |
+| | archive_command | pgbackrest archive-push | WAL segments archived to shared repo |
 | **Replication** | wal_level | logical | Required for Spock |
 | | max_wal_senders | 20 | |
 | | max_replication_slots | 20 | |
@@ -281,7 +289,7 @@ Run tests with:
 ./scripts/manage.sh test
 ```
 
-20 tests covering:
+23 tests covering:
 
 | # | Test | What it verifies |
 |---|------|-----------------|
@@ -305,6 +313,9 @@ Run tests with:
 | 18 | Autovacuum scale factor = 0.01 | Aggressive autovacuum (autobase) |
 | 19 | SSD planner: random_page_cost = 1.1 | SSD-optimized query planner |
 | 20 | Bulk writes via HAProxy R/W | 100-row bulk insert through proxy |
+| 21 | pgBackRest stanza exists | Backup stanza configured and accessible |
+| 22 | WAL archiving enabled | archive_mode=on for continuous archiving |
+| 23 | pgBackRest has at least one backup | Initial full backup completed |
 
 ## File Structure
 
@@ -313,14 +324,16 @@ pg_spock/
 ├── .env                          # All config variables (ports, IPs, passwords)
 ├── .gitignore                    # Git ignore rules
 ├── .dockerignore                 # Docker build context exclusions
-├── Dockerfile                    # Multi-stage: PG 18.3 + Spock v5.0.6 from source
+├── Dockerfile                    # Multi-stage: PG 18.3 + Spock v5.0.6 + pgBackRest
 ├── docker-compose.yml            # 5 services (4 PG nodes + HAProxy)
 ├── haproxy.cfg                   # R/W :5000 + RO :5001 + stats :7000
 ├── README.md                     # This file
+├── pgbackrest/
+│   └── pgbackrest.conf           # pgBackRest config (POSIX repo, lz4, async archiving)
 └── scripts/
     ├── entrypoint.sh             # Container entrypoint (primary init or replica basebackup)
     ├── setup-spock.sh            # Post-startup Spock configuration
-    └── manage.sh                 # CLI (status/test/bench/psql/logs/topology/reinit)
+    └── manage.sh                 # CLI (status/test/bench/backup/psql/logs/topology/reinit)
 ```
 
 ## Docker Images
@@ -329,18 +342,65 @@ pg_spock/
 |-----------|-------|-------|
 | PostgreSQL 18.3 | Built from source (`debian:bookworm-slim`) | Patched with 5 Spock patches |
 | Spock v5.0.6 | Built from source (PGXS) | Compiled against patched PG 18 |
+| pgBackRest 2.45 | `apt-get install pgbackrest` | From Debian bookworm repos |
 | HAProxy | `haproxy:3.1-alpine` | Native ARM64 |
 
 The Dockerfile uses a multi-stage build:
 - **Stage 1 (builder)**: Clones PG 18.3 + Spock v5.0.6, applies patches, compiles PG with `--with-openssl --with-libxml --with-libxslt --with-lz4 --with-zstd --with-icu`, then builds Spock extension via PGXS.
-- **Stage 2 (runtime)**: Slim Debian image with only runtime libraries, copies PG + Spock binaries from builder.
+- **Stage 2 (runtime)**: Slim Debian image with only runtime libraries + pgBackRest, copies PG + Spock binaries from builder.
+
+## pgBackRest Backup & Archiving
+
+Both primaries and all replicas have pgBackRest installed. WAL archiving is continuous via `archive_command`, and backups are stored in a shared Docker volume (`pgbackrest-repo`).
+
+### Configuration
+
+| Setting | Value | Notes |
+|---------|-------|-------|
+| Stanza | `pg-spock` | Matches cluster name |
+| Repo type | POSIX (local) | Shared Docker volume at `/var/lib/pgbackrest` |
+| Compression | lz4 (level 1) | Fast, low CPU; level 3 for archive-push |
+| Archiving | Async | Spool at `/var/spool/pgbackrest` |
+| Retention | 2 full, 3 diff | Archive retention anchored to full backups |
+| `archive_timeout` | 300s | Force archive every 5 min |
+
+### Backup Commands
+
+```bash
+# Run a differential backup (default)
+./scripts/manage.sh backup
+
+# Run a full backup
+./scripts/manage.sh backup full
+
+# Run an incremental backup
+./scripts/manage.sh backup incr
+
+# Show backup inventory
+./scripts/manage.sh backup-info
+
+# Verify stanza and WAL archiving
+./scripts/manage.sh backup-check
+```
+
+Backups can target either primary: `./scripts/manage.sh backup full node2`
+
+### Initial Setup
+
+The stanza is created automatically during primary initialization. The first full backup runs in the background after `initdb`. Subsequent backups are manual via `manage.sh`.
+
+### Shared Backup Volume
+
+All 4 PG nodes mount the same `pgbackrest-repo` Docker volume at `/var/lib/pgbackrest`. This allows any node to access the backup repository without SSH or a dedicated backup server. Each node has its own spool and log volumes for async WAL archiving.
+
+> **Production note**: For production use, replace the POSIX repository with a remote backend (S3, GCS, Azure Blob, or SFTP) to ensure backups survive host failure.
 
 ## Limitations
 
 - **No automatic failover**: Unlike pg_autobase (Patroni), this cluster has no DCS or automatic leader election. Both primaries are always writable. If one dies, the other continues; when it returns, Spock catches up.
 - **DDL not replicated**: Schema changes must be applied manually to both primaries. This is a fundamental Spock limitation.
 - **No connection pooling**: No PgBouncer. For high-connection workloads, add PgBouncer in front of HAProxy.
-- **No backup solution**: No pgBackRest. Add as needed for production use.
+- **Shared backup volume**: pgBackRest uses a shared Docker volume — backups are local to the Docker host, not off-site. For production, configure a remote repository (S3, GCS, Azure, or SFTP).
 - **Memory constrained**: Running 4 PostgreSQL instances + HAProxy in a Docker VM. Not suitable for heavy workloads; designed for development and multi-master testing.
 - **No TLS**: All connections are unencrypted within the Docker network. Suitable for local development only.
 - **Sequence strategy**: Odd/even IDs work for exactly 2 writers. For more writers, switch to UUIDs or a different allocation strategy.
