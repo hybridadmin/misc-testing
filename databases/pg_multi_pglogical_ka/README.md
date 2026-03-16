@@ -192,8 +192,8 @@ For most development workflows, using the direct node ports (5741-5743) is simpl
 
 Uses subnet `172.32.0.0/16` to avoid conflicts with:
 - `pg_patroni_hap/` (172.28.0.0/16) — single-writer Patroni cluster
-- `pg_multi/` (172.29.0.0/16) — native logical replication multi-master
-- `pg_multi_flyway/` (172.30.0.0/16) — Flyway DDL management multi-master
+- `pg_multi_native_hap/` (172.29.0.0/16) — native logical replication multi-master
+- `pg_multi_native_flyway/` (172.30.0.0/16) — Flyway DDL management multi-master
 - `pg_multi_pglogical/` (172.31.0.0/16) — pglogical with HAProxy
 
 All containers use the `mmk-` prefix (e.g., `mmk-pg-node1`, `mmk-valkey-master`).
@@ -363,7 +363,7 @@ Using UUID primary keys (`gen_random_uuid()`) effectively eliminates this.
 
 ## Comparison: All Multi-Master Variants
 
-| Feature | pg_multi (native) | pg_multi_flyway | pg_multi_pglogical | pg_multi_pglogical_ka |
+| Feature | pg_multi_native_hap (native) | pg_multi_native_flyway | pg_multi_pglogical | pg_multi_pglogical_ka |
 |---------|-------------------|-----------------|--------------------|-----------------------|
 | DDL approach | Manual each node | Flyway per node | `replicate_ddl_command()` | `replicate_ddl_command()` |
 | Conflict resolution | None (error) | None (error) | Last-writer-wins | **Last-writer-wins** |

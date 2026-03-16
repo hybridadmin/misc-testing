@@ -2,7 +2,7 @@
 # =============================================================================
 # Custom entrypoint for PG18 multi-master nodes (native replication + keepalived)
 # =============================================================================
-# Hybrid of pg_multi/ (native replication) + pg_multi_pglogical_ka/ (keepalived).
+# Hybrid of pg_multi_native_hap/ (native replication) + pg_multi_pglogical_ka/ (keepalived).
 #   - No pglogical extension — uses PG18 native CREATE PUBLICATION / SUBSCRIPTION
 #   - No socat health agent — keepalived replaces HAProxy
 #   - Starts keepalived as a background daemon

@@ -225,7 +225,7 @@ Uses subnet `172.29.0.0/16` (the single-writer `pg_patroni_hap/` cluster uses `1
 
 ## Comparison with Single-Writer (pg_patroni_hap/)
 
-| Feature | Multi-Master (pg_multi/) | Single-Writer (pg_patroni_hap/) |
+| Feature | Multi-Master (pg_multi_native_hap/) | Single-Writer (pg_patroni_hap/) |
 |---------|-------------------------|---------------------|
 | Write nodes | All 3 | Primary only |
 | Failover | N/A (all nodes equal) | Patroni auto-failover |

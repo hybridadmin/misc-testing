@@ -37,7 +37,7 @@ A true multi-master PostgreSQL 18 cluster using the **pglogical** extension for 
 
 ## Key Advantages Over Native Logical Replication
 
-| Feature | Native (pg_multi) | pglogical (this cluster) |
+| Feature | Native (pg_multi_native_hap) | pglogical (this cluster) |
 |---------|-------------------|--------------------------|
 | DDL replication | Not supported — must run DDL on each node manually | `replicate_ddl_command()` runs DDL once, propagates to all peers |
 | Conflict resolution | None — apply errors crash the subscription worker | **Last-writer-wins** using real commit timestamps (`track_commit_timestamp`) |
@@ -185,8 +185,8 @@ docker logs mmp-pg-node1 2>&1 | grep -i conflict
 
 Uses subnet `172.31.0.0/16` to avoid conflicts with:
 - `pg_patroni_hap/` (172.28.0.0/16) — single-writer Patroni cluster
-- `pg_multi/` (172.29.0.0/16) — native logical replication multi-master
-- `pg_multi_flyway/` (172.30.0.0/16) — Flyway DDL management multi-master
+- `pg_multi_native_hap/` (172.29.0.0/16) — native logical replication multi-master
+- `pg_multi_native_flyway/` (172.30.0.0/16) — Flyway DDL management multi-master
 
 All containers use the `mmp-` prefix (e.g., `mmp-pg-node1`, `mmp-valkey-master`).
 
@@ -204,7 +204,7 @@ Benchmarks run with subscriptions disabled (each node tested independently):
 
 For comparison with the other multi-master variants:
 
-| Metric | pg_multi (native) | pg_multi_pglogical |
+| Metric | pg_multi_native_hap (native) | pg_multi_pglogical |
 |--------|-------------------|-------------------|
 | Write TPS (per node) | ~6,167 | ~6,841 |
 | Read TPS (per node) | ~37,829 | ~54,730 |
@@ -446,7 +446,7 @@ docker exec mmp-pg-node1 psql -U postgres -d appdb -c \
 
 ## Comparison: All Multi-Master Variants
 
-| Feature | pg_multi (native) | pg_multi_flyway | pg_multi_pglogical |
+| Feature | pg_multi_native_hap (native) | pg_multi_native_flyway | pg_multi_pglogical |
 |---------|-------------------|-----------------|-------------------|
 | DDL approach | Manual on each node | Flyway migrations per node | `replicate_ddl_command()` — run once |
 | Conflict resolution | None (apply error) | None (apply error) | **Last-writer-wins** (real timestamps) |

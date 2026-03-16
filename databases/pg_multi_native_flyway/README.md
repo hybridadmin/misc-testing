@@ -38,7 +38,7 @@ A true multi-master PostgreSQL 18 cluster with **Flyway** for DDL management, us
      └─────────────────────────────────────────┘
 ```
 
-**Key Difference from `pg_multi/`:**
+**Key Difference from `pg_multi_native_hap/`:**
 - Uses **Flyway** for DDL version control instead of manual `ddl` commands
 - Each node maintains its own `flyway_schema_history` table (excluded from replication)
 - Flyway runs via `manage.sh migrate` against each node sequentially
@@ -47,7 +47,7 @@ A true multi-master PostgreSQL 18 cluster with **Flyway** for DDL management, us
 
 ```bash
 # Build and start the cluster (Flyway service won't auto-start)
-cd pg_multi_flyway
+cd pg_multi_native_flyway
 docker compose up -d --build
 
 # Check status
@@ -106,14 +106,14 @@ docker compose up -d --build
 ### The DDL Problem
 Logical replication in PostgreSQL **only replicates DML** (INSERT, UPDATE, DELETE). DDL statements (`CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`) are **not replicated**.
 
-### Manual DDL Approach (pg_multi)
+### Manual DDL Approach (pg_multi_native_hap)
 With the manual `ddl` command:
 - You run DDL on each node explicitly
 - No version tracking
 - No rollback support
 - Error-prone in CI/CD
 
-### Flyway Approach (pg_multi_flyway)
+### Flyway Approach (pg_multi_native_flyway)
 - DDL is version-controlled in SQL files
 - Each node tracks which migrations have been applied
 - Idempotent — re-running is safe
@@ -159,11 +159,11 @@ With the manual `ddl` command:
 
 Uses subnet `172.30.0.0/16` to avoid conflicts with:
 - `pg_patroni_hap/` (172.28.0.0/16)
-- `pg_multi/` (172.29.0.0/16)
+- `pg_multi_native_hap/` (172.29.0.0/16)
 
-## Comparison: pg_multi vs pg_multi_flyway
+## Comparison: pg_multi_native_hap vs pg_multi_native_flyway
 
-| Feature | pg_multi (manual DDL) | pg_multi_flyway |
+| Feature | pg_multi_native_hap (manual DDL) | pg_multi_native_flyway |
 |---------|---------------------|-----------------|
 | DDL approach | `manage.sh ddl` | Flyway migrations |
 | Version control | None | SQL files in `flyway/sql/` |
@@ -175,7 +175,7 @@ Uses subnet `172.30.0.0/16` to avoid conflicts with:
 
 ## Conflict Resolution
 
-Same as `pg_multi/` — see [pg_multi/README.md](../pg_multi/README.md) for details on:
+Same as `pg_multi_native_hap/` — see [pg_multi_native_hap/README.md](../pg_multi_native_hap/README.md) for details on:
 - What PG18 can/cannot detect
 - Best practices (UUID PKs, avoid concurrent row updates)
 - Recovery procedures

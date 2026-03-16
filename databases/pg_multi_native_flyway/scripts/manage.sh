@@ -867,7 +867,7 @@ cmd_help() {
     echo "Direct ports: node1=5541, node2=5542, node3=5543"
     echo "HAProxy:      write=5532, read=5533, stats=http://localhost:7100/stats"
     echo ""
-    echo "Container prefix: mmf- (to avoid conflicts with pg/ and pg_multi/)"
+    echo "Container prefix: mmf- (to avoid conflicts with pg/ and pg_multi_native_hap/)"
 }
 
 case "${1:-help}" in

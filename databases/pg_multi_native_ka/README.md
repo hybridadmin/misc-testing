@@ -79,7 +79,7 @@ If the check fails, keepalived lowers the node's VRRP priority, causing VIP fail
 
 ### Tradeoffs vs HAProxy Variants
 
-| Aspect | HAProxy (pg_multi) | keepalived (this variant) |
+| Aspect | HAProxy (pg_multi_native_hap) | keepalived (this variant) |
 |--------|-------------------|--------------------------|
 | **Write distribution** | Round-robin across 3 nodes | Single node (VIP holder) |
 | **Read distribution** | Least-connections across 3 nodes | Single node (VIP holder) |
@@ -228,8 +228,8 @@ For most development workflows, using the direct node ports (5841-5843) is simpl
 
 Uses subnet `172.33.0.0/16` to avoid conflicts with:
 - `pg_patroni_hap/` (172.28.0.0/16)
-- `pg_multi/` (172.29.0.0/16)
-- `pg_multi_flyway/` (172.30.0.0/16)
+- `pg_multi_native_hap/` (172.29.0.0/16)
+- `pg_multi_native_flyway/` (172.30.0.0/16)
 - `pg_multi_pglogical/` (172.31.0.0/16)
 - `pg_multi_pglogical_ka/` (172.32.0.0/16)
 
@@ -350,7 +350,7 @@ Using UUID primary keys (`gen_random_uuid()`) effectively eliminates this.
 
 ## Comparison: All Multi-Master Variants
 
-| Feature | pg_multi (native) | pg_multi_flyway | pg_multi_pglogical | pg_multi_pglogical_ka | **pg_multi_native_ka** |
+| Feature | pg_multi_native_hap (native) | pg_multi_native_flyway | pg_multi_pglogical | pg_multi_pglogical_ka | **pg_multi_native_ka** |
 |---------|-------------------|-----------------|--------------------|-----------------------|----------------------|
 | Replication | Native PG18 | Native PG18 | pglogical | pglogical | **Native PG18** |
 | DDL approach | Manual each node | Flyway per node | `replicate_ddl_command()` | `replicate_ddl_command()` | **Manual each node** |

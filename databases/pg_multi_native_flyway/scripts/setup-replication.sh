@@ -3,7 +3,7 @@
 # Multi-Master Logical Replication Setup Script (Flyway variant)
 # Creates publications and subscriptions for full-mesh bidirectional replication
 #
-# KEY DIFFERENCE from pg_multi: Publications use FOR ALL TABLES but then
+# KEY DIFFERENCE from pg_multi_native_hap: Publications use FOR ALL TABLES but then
 # ALTER PUBLICATION to DROP TABLE flyway_schema_history, so each node
 # maintains its own independent migration tracking.
 #
