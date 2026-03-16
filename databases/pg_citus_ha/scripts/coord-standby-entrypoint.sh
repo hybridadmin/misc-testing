@@ -9,6 +9,7 @@
 #   1. Runs pg_basebackup from the primary coordinator
 #   2. Creates standby.signal to enter recovery mode
 #   3. Configures primary_conninfo for streaming replication
+#   4. Adds restore_command for pgBackRest WAL archive recovery
 #
 # On subsequent starts:
 #   - If standby.signal exists: resumes streaming replication
@@ -33,6 +34,68 @@ PG_USER="${POSTGRES_USER:-postgres}"
 PG_PASS="${POSTGRES_PASSWORD:-changeme_postgres_2025}"
 PG_DB="${POSTGRES_DB:-appdb}"
 MY_IP="${MY_IP:-172.34.0.11}"
+
+# pgBackRest: standby shares stanza with coordinator (same system-id from pg_basebackup)
+: "${PGBACKREST_STANZA:=pg-citus-coordinator}"
+
+# ---------------------------------------------------------------------------
+# Generate per-node pgbackrest.conf
+# ---------------------------------------------------------------------------
+generate_pgbackrest_conf() {
+    local stanza="$1"
+    mkdir -p /etc/pgbackrest
+    cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-type=posix
+
+# Retention
+repo1-retention-full=2
+repo1-retention-diff=3
+repo1-retention-archive=2
+repo1-retention-archive-type=full
+
+# Performance
+process-max=2
+compress-type=lz4
+compress-level=1
+
+# Reliability
+start-fast=y
+delta=y
+resume=n
+
+# Logging
+log-level-console=warn
+log-path=/var/log/pgbackrest
+
+# Archive async
+archive-async=y
+spool-path=/var/spool/pgbackrest
+
+[global:archive-push]
+compress-level=3
+log-level-console=info
+
+[global:archive-get]
+process-max=2
+
+[${stanza}]
+pg1-path=${PGDATA}
+pg1-port=5432
+pg1-socket-path=/var/run/postgresql
+EOF
+    chown postgres:postgres /etc/pgbackrest/pgbackrest.conf
+    echo "=== [standby] Generated pgbackrest.conf with stanza='${stanza}' ==="
+}
+
+# Ensure pgBackRest directories exist
+for dir in /var/lib/pgbackrest /var/log/pgbackrest /var/spool/pgbackrest; do
+    mkdir -p "$dir" 2>/dev/null || true
+    chown postgres:postgres "$dir" 2>/dev/null || true
+done
+
+generate_pgbackrest_conf "$PGBACKREST_STANZA"
 
 # ---------------------------------------------------------------------------
 # Initialize standby from primary via pg_basebackup (first start only)
@@ -91,6 +154,11 @@ init_standby() {
         echo "primary_slot_name = 'coordinator_standby'" >> "$PGDATA/postgresql.auto.conf"
     fi
 
+    # Add restore_command for pgBackRest WAL archive recovery
+    if ! grep -q "restore_command" "$PGDATA/postgresql.auto.conf" 2>/dev/null; then
+        echo "restore_command = 'pgbackrest --stanza=${PGBACKREST_STANZA} archive-get %f \"%p\"'" >> "$PGDATA/postgresql.auto.conf"
+    fi
+
     # Copy our custom configs (pg_basebackup copies the primary's configs,
     # but we want to use the mounted versions which may differ slightly)
     if [ -f /etc/postgresql/postgresql.conf ]; then
@@ -98,6 +166,15 @@ init_standby() {
     fi
     if [ -f /etc/postgresql/pg_hba.conf ]; then
         cp /etc/postgresql/pg_hba.conf "$PGDATA/pg_hba.conf"
+    fi
+
+    # Inject archive_command into postgresql.conf (same stanza as primary)
+    if ! grep -q "archive_command" "$PGDATA/postgresql.conf" 2>/dev/null; then
+        cat >> "$PGDATA/postgresql.conf" <<ARCHEOF
+
+# --- pgBackRest archive command (injected by standby entrypoint) ---
+archive_command = 'pgbackrest --stanza=${PGBACKREST_STANZA} archive-push %p'
+ARCHEOF
     fi
 
     chown -R postgres:postgres "$PGDATA"

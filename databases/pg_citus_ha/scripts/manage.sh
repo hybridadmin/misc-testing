@@ -41,9 +41,55 @@ WORKER_PORTS=(5943 5944)
 ALL_PG_CONTAINERS=("$COORDINATOR" "$STANDBY" "${WORKERS[@]}")
 ALL_PG_PORTS=("$COORDINATOR_PORT" "$STANDBY_PORT" "${WORKER_PORTS[@]}")
 
+# pgBackRest — per-system-id stanzas
+# Coordinator + standby share system-id (standby is pg_basebackup clone) -> 1 stanza
+# Each worker has its own system-id (independent initdb) -> 1 stanza each
+STANZA_COORDINATOR="${BACKUP_STANZA_COORDINATOR:-pg-citus-coordinator}"
+STANZA_WORKER1="${BACKUP_STANZA_WORKER1:-pg-citus-worker1}"
+STANZA_WORKER2="${BACKUP_STANZA_WORKER2:-pg-citus-worker2}"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Resolve stanza name for a given node
+stanza_for() {
+    local node="$1"
+    case "$node" in
+        coordinator|coord|standby|sb) echo "$STANZA_COORDINATOR" ;;
+        worker1|w1)                   echo "$STANZA_WORKER1" ;;
+        worker2|w2)                   echo "$STANZA_WORKER2" ;;
+        *)                            echo "$STANZA_COORDINATOR" ;;
+    esac
+}
+
+# Resolve container name for a given node
+container_for() {
+    local node="$1"
+    case "$node" in
+        coordinator|coord)  echo "$COORDINATOR" ;;
+        standby|sb)         echo "$STANDBY" ;;
+        worker1|w1)         echo "${WORKERS[0]}" ;;
+        worker2|w2)         echo "${WORKERS[1]}" ;;
+        *)                  echo "$COORDINATOR" ;;
+    esac
+}
+
+# Find which coordinator container is currently the primary (not in recovery).
+# pgBackRest check REQUIRES the primary — it fails on standbys with
+# "primary database not found".
+find_primary_coordinator() {
+    for c in "$COORDINATOR" "$STANDBY"; do
+        local is_recovery
+        is_recovery=$(docker exec "$c" bash -c "PGPASSWORD='$PG_PASS' psql -h /var/run/postgresql -U '$PG_USER' -d '$PG_DB' -tAc 'SELECT pg_is_in_recovery();'" 2>/dev/null) || continue
+        if [ "$is_recovery" = "f" ]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    echo ""
+    return 1
+}
 
 # Run SQL on coordinator (all distributed queries go through coordinator)
 run_sql() {
@@ -365,6 +411,94 @@ cmd_test() {
         log_ok "VIP $VIP assigned to $holder"
     else
         log_warn "VIP not assigned to any coordinator (monitor may be starting)"
+    fi
+
+    # --- pgBackRest Tests ---
+
+    # Test 10: pgBackRest stanza exists on coordinator
+    log_info "Test 10: pgBackRest stanza exists on coordinator (${STANZA_COORDINATOR})"
+    local stanza_json
+    stanza_json=$(docker exec -u postgres "$COORDINATOR" pgbackrest --stanza="$STANZA_COORDINATOR" --output=json info 2>/dev/null) || stanza_json=""
+    local stanza_name
+    stanza_name=$(echo "$stanza_json" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ "$stanza_name" = "$STANZA_COORDINATOR" ]; then
+        log_ok "Stanza '${STANZA_COORDINATOR}' exists"
+    else
+        log_error "Stanza not found (got: $stanza_name)"
+        errors=$((errors + 1))
+    fi
+
+    # Test 11: WAL archiving enabled
+    log_info "Test 11: WAL archiving enabled (archive_mode=on)"
+    local archive_mode
+    archive_mode=$(run_sql "SHOW archive_mode;" || echo "?")
+    if [ "$archive_mode" = "on" ]; then
+        log_ok "archive_mode=on"
+    else
+        log_error "archive_mode=$archive_mode"
+        errors=$((errors + 1))
+    fi
+
+    # Test 12: pgBackRest has at least one backup on coordinator
+    log_info "Test 12: pgBackRest has at least one backup (coordinator)"
+    local backup_count
+    backup_count=$(docker exec -u postgres "$COORDINATOR" pgbackrest --stanza="$STANZA_COORDINATOR" --output=json info 2>/dev/null \
+        | grep -o '"label"' | wc -l | tr -d ' ') || backup_count=0
+    if [ "${backup_count:-0}" -ge 1 ]; then
+        log_ok "Coordinator has $backup_count backup(s)"
+    else
+        log_error "No backups found on coordinator (count=$backup_count)"
+        errors=$((errors + 1))
+    fi
+
+    # Test 13: pgBackRest stanza exists on worker1
+    log_info "Test 13: pgBackRest stanza exists on worker1 (${STANZA_WORKER1})"
+    local stanza_json_w1
+    stanza_json_w1=$(docker exec -u postgres "${WORKERS[0]}" pgbackrest --stanza="$STANZA_WORKER1" --output=json info 2>/dev/null) || stanza_json_w1=""
+    local stanza_name_w1
+    stanza_name_w1=$(echo "$stanza_json_w1" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ "$stanza_name_w1" = "$STANZA_WORKER1" ]; then
+        log_ok "Stanza '${STANZA_WORKER1}' exists"
+    else
+        log_error "Stanza not found (got: $stanza_name_w1)"
+        errors=$((errors + 1))
+    fi
+
+    # Test 14: pgBackRest has at least one backup on worker1
+    log_info "Test 14: pgBackRest has at least one backup (worker1)"
+    local backup_count_w1
+    backup_count_w1=$(docker exec -u postgres "${WORKERS[0]}" pgbackrest --stanza="$STANZA_WORKER1" --output=json info 2>/dev/null \
+        | grep -o '"label"' | wc -l | tr -d ' ') || backup_count_w1=0
+    if [ "${backup_count_w1:-0}" -ge 1 ]; then
+        log_ok "Worker1 has $backup_count_w1 backup(s)"
+    else
+        log_error "No backups found on worker1 (count=$backup_count_w1)"
+        errors=$((errors + 1))
+    fi
+
+    # Test 15: pgBackRest stanza exists on worker2
+    log_info "Test 15: pgBackRest stanza exists on worker2 (${STANZA_WORKER2})"
+    local stanza_json_w2
+    stanza_json_w2=$(docker exec -u postgres "${WORKERS[1]}" pgbackrest --stanza="$STANZA_WORKER2" --output=json info 2>/dev/null) || stanza_json_w2=""
+    local stanza_name_w2
+    stanza_name_w2=$(echo "$stanza_json_w2" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ "$stanza_name_w2" = "$STANZA_WORKER2" ]; then
+        log_ok "Stanza '${STANZA_WORKER2}' exists"
+    else
+        log_error "Stanza not found (got: $stanza_name_w2)"
+        errors=$((errors + 1))
+    fi
+
+    # Test 16: pgBackRest has at least one backup on worker2
+    log_info "Test 16: pgBackRest has at least one backup (worker2)"
+    local backup_count_w2
+    backup_count_w2=$(docker exec -u postgres "${WORKERS[1]}" pgbackrest --stanza="$STANZA_WORKER2" --output=json info 2>/dev/null \
+        | grep -o '"label"' | wc -l | tr -d ' ') || backup_count_w2=0
+    if [ "${backup_count_w2:-0}" -ge 1 ]; then
+        log_ok "Worker2 has $backup_count_w2 backup(s)"
+    else
+        log_error "No backups found on worker2 (count=$backup_count_w2)"
+        errors=$((errors + 1))
     fi
 
     # Cleanup
@@ -735,6 +869,93 @@ cmd_reinit() {
 }
 
 # ---------------------------------------------------------------------------
+# Backup Commands (pgBackRest)
+# ---------------------------------------------------------------------------
+
+cmd_backup() {
+    local type="${1:-diff}"
+    local node="${2:-coordinator}"
+    local container
+    container=$(container_for "$node")
+    local stanza
+    stanza=$(stanza_for "$node")
+
+    # backup-check requires primary for coordinator stanza
+    if [ "$stanza" = "$STANZA_COORDINATOR" ]; then
+        local primary
+        primary=$(find_primary_coordinator)
+        if [ -n "$primary" ]; then
+            container="$primary"
+        else
+            log_error "Cannot find primary coordinator for backup"
+            return 1
+        fi
+    fi
+
+    case "$type" in
+        full|diff|incr) ;;
+        *)
+            log_error "Unknown backup type: $type (use: full, diff, incr)"
+            return 1
+            ;;
+    esac
+
+    log_head "=== pgBackRest Backup (${type}) on ${node} ==="
+    log_info "Stanza: $stanza | Type: $type | Container: $container"
+
+    docker exec -u postgres "$container" pgbackrest --stanza="$stanza" --type="$type" backup
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        log_ok "Backup complete"
+        docker exec -u postgres "$container" pgbackrest --stanza="$stanza" info
+    else
+        log_error "Backup failed (exit code $rc)"
+        return $rc
+    fi
+}
+
+cmd_backup_info() {
+    local node="${1:-coordinator}"
+    local container
+    container=$(container_for "$node")
+    local stanza
+    stanza=$(stanza_for "$node")
+    log_head "=== pgBackRest Backup Info (${node}, stanza=${stanza}) ==="
+    docker exec -u postgres "$container" pgbackrest --stanza="$stanza" info
+}
+
+cmd_backup_check() {
+    local node="${1:-coordinator}"
+    local container
+    container=$(container_for "$node")
+    local stanza
+    stanza=$(stanza_for "$node")
+
+    # pgbackrest check requires the primary for coordinator stanza
+    if [ "$stanza" = "$STANZA_COORDINATOR" ]; then
+        local primary
+        primary=$(find_primary_coordinator)
+        if [ -n "$primary" ]; then
+            container="$primary"
+        else
+            log_error "Cannot find primary coordinator for backup-check"
+            return 1
+        fi
+    fi
+
+    log_head "=== pgBackRest Check (${node}, stanza=${stanza}) ==="
+    log_info "Verifying stanza '$stanza' and WAL archiving..."
+    docker exec -u postgres "$container" pgbackrest --stanza="$stanza" check
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        log_ok "pgBackRest check passed — stanza OK, WAL archiving OK"
+    else
+        log_error "pgBackRest check failed (exit code $rc)"
+        return $rc
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 
@@ -758,8 +979,14 @@ cmd_help() {
     echo "  promote           Manual promote: promote standby (use when primary is already dead)"
     echo "  reinit            Reinitialize cluster (wipe all data, start fresh)"
     echo ""
+    echo "Backup commands (pgBackRest):"
+    echo "  backup [type] [node]  Run backup (type: full|diff|incr, default: diff)"
+    echo "                        node: coordinator|worker1|worker2 (default: coordinator)"
+    echo "  backup-info [node]    Show backup info for node (default: coordinator)"
+    echo "  backup-check [node]   Verify stanza + WAL archiving (default: coordinator)"
+    echo ""
     echo "Test commands:"
-    echo "  test              Run integration tests"
+    echo "  test              Run integration tests (16 tests)"
     echo "  bench [dur] [cli] Run pgbench benchmark (default: 10s, 8 clients)"
     echo ""
     echo "  help              Show this help"
@@ -784,6 +1011,9 @@ case "$COMMAND" in
     failover)   cmd_failover ;;
     promote)    cmd_promote ;;
     reinit)     cmd_reinit ;;
+    backup)        cmd_backup "$@" ;;
+    backup-info)   cmd_backup_info "$@" ;;
+    backup-check)  cmd_backup_check "$@" ;;
     help|--help|-h) cmd_help ;;
     *)
         log_error "Unknown command: $COMMAND"

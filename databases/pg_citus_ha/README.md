@@ -1,6 +1,6 @@
 # pg_citus_ha — Citus 14.0 Distributed PostgreSQL 18 Cluster with HA
 
-A horizontally-sharded PostgreSQL 18 cluster using **Citus 14.0** for distributed queries, with coordinator high availability via streaming replication and automatic failover, plus a Valkey 9 caching layer. This is a fundamentally different architecture from the multi-master logical replication variants — Citus shards data across workers and routes queries through a single coordinator.
+A horizontally-sharded PostgreSQL 18 cluster using **Citus 14.0** for distributed queries, with coordinator high availability via streaming replication and automatic failover, **pgBackRest** for WAL archiving and backup, plus a Valkey 9 caching layer. This is a fundamentally different architecture from the multi-master logical replication variants — Citus shards data across workers and routes queries through a single coordinator.
 
 ## Architecture
 
@@ -73,7 +73,7 @@ docker compose up -d
 # Wait ~60-90s for full initialization (pg_basebackup, cluster setup, monitors)
 ./scripts/manage.sh status
 
-# Run integration tests (9 tests)
+# Run integration tests (16 tests including pgBackRest)
 ./scripts/manage.sh test
 
 # Open psql to coordinator
@@ -152,11 +152,61 @@ HA commands:
   promote           Manual promote: promote standby (use when primary is already dead)
   reinit            Reinitialize cluster (wipe all data, start fresh)
 
+Backup commands (pgBackRest):
+  backup [type] [node]  Run backup (type: full|diff|incr, default: diff)
+                        node: coordinator|worker1|worker2 (default: coordinator)
+  backup-info [node]    Show backup info for node (default: coordinator)
+  backup-check [node]   Verify stanza + WAL archiving (default: coordinator)
+
 Test commands:
-  test              Run integration tests (9 tests)
+  test              Run integration tests (16 tests)
   bench [dur] [cli] Run pgbench benchmark (default: 10s, 8 clients)
 
   help              Show this help
+```
+
+## Backup & Recovery (pgBackRest)
+
+### Stanza Architecture
+
+Because each independent `initdb` produces a unique PostgreSQL system-id, this cluster requires **3 pgBackRest stanzas**:
+
+| Stanza | Nodes | Reason |
+|--------|-------|--------|
+| `pg-citus-coordinator` | coordinator + coordinator-standby | Standby was cloned via `pg_basebackup` — same system-id |
+| `pg-citus-worker1` | worker1 | Independent `initdb` |
+| `pg-citus-worker2` | worker2 | Independent `initdb` |
+
+### How It Works
+
+- **WAL archiving**: All nodes run `archive_command = 'pgbackrest --stanza=<stanza> archive-push %p'` to continuously ship WAL segments to the shared pgBackRest repository.
+- **Restore command**: The coordinator standby has `restore_command` configured for WAL replay from the archive.
+- **Shared repository**: A single Docker volume (`pgbackrest-repo`) is mounted on all PG nodes at `/var/lib/pgbackrest`. Per-node spool and log volumes keep async operations isolated.
+- **POSIX repo**: Local filesystem repository with lz4 compression.
+- **Async archiving**: WAL segments are archived asynchronously via spool directories for better performance.
+- **Retention**: 2 full backups, 3 differential backups, 2 archive retention.
+- **Stanza init + initial backup**: Each primary node (coordinator, worker1, worker2) creates its stanza and runs an initial full backup in the background after PostgreSQL starts (~60-90s).
+
+### Configuration
+
+pgBackRest config is generated dynamically by each node's entrypoint script (not mounted from a file) because each node needs different stanza and connection settings. A reference template is at `pgbackrest/pgbackrest.conf`.
+
+### Backup Commands
+
+```bash
+# Run a differential backup on coordinator (default)
+./scripts/manage.sh backup
+
+# Run a full backup on worker1
+./scripts/manage.sh backup full worker1
+
+# Show backup info for all stanzas
+./scripts/manage.sh backup-info coordinator
+./scripts/manage.sh backup-info worker1
+./scripts/manage.sh backup-info worker2
+
+# Verify stanza + WAL archiving is working
+./scripts/manage.sh backup-check coordinator
 ```
 
 ## Working with Distributed Tables
@@ -202,12 +252,14 @@ Key Citus-specific settings in `postgresql.conf`:
 
 | Parameter | Value | Reason |
 |-----------|-------|--------|
-| `shared_preload_libraries` | `citus` | Required for Citus |
+| `shared_preload_libraries` | `citus,pg_stat_statements` | Required for Citus + query monitoring |
 | `citus.shard_count` | `8` | Reduced from default 32 for Rosetta performance |
 | `shared_buffers` | `128MB` | Conservative for 1.9GB Docker VM with 4 PG instances |
 | `statement_timeout` | `300s` | Extended for slow distributed ops under Rosetta |
 | `max_connections` | `200` | Per node |
 | `wal_level` | `logical` | Required for Citus + supports streaming replication |
+| `archive_mode` | `on` | Enables WAL archiving to pgBackRest |
+| `archive_timeout` | `300` | Force WAL switch every 5 min for timely archiving |
 | `max_wal_senders` | `10` | Supports replication connections |
 | `hot_standby` | `on` | Allows read queries on standby |
 
@@ -294,20 +346,22 @@ pg_citus_ha/
 ├── docker-compose.yml                # 10 services: coord + standby + 2 workers + Valkey
 ├── README.md                         # This file
 ├── postgres/
-│   ├── Dockerfile.coordinator        # Citus image + iproute2/arping/gosu for HA
-│   ├── Dockerfile.worker             # Citus image (minimal)
+│   ├── Dockerfile.coordinator        # Citus image + pgBackRest + iproute2/arping/gosu for HA
+│   ├── Dockerfile.worker             # Citus image + pgBackRest
 │   ├── postgresql.conf               # Shared PG config (all nodes)
 │   └── pg_hba.conf                   # Auth rules (trust for subnet + replication)
+├── pgbackrest/
+│   └── pgbackrest.conf               # Reference template (not mounted — entrypoints generate per-node)
 ├── keepalived/
 │   └── keepalived.conf.tmpl          # VRRP config template (reference only — not used)
 ├── valkey/
 │   └── sentinel.conf                 # Sentinel config for Valkey HA
 └── scripts/
-    ├── manage.sh                     # Management CLI (status, test, failover, etc.)
-    ├── coord-entrypoint.sh           # Primary coordinator init + cluster setup
-    ├── coord-standby-entrypoint.sh   # Standby init (pg_basebackup) + failover monitor
+    ├── manage.sh                     # Management CLI (status, test, failover, backup, etc.)
+    ├── coord-entrypoint.sh           # Primary coordinator init + pgBackRest + cluster setup
+    ├── coord-standby-entrypoint.sh   # Standby init (pg_basebackup) + pgBackRest + failover monitor
     ├── failover-monitor.sh           # Shell-based VIP management + auto-promotion
-    ├── worker-entrypoint.sh          # Worker init
+    ├── worker-entrypoint.sh          # Worker init + pgBackRest
     ├── setup-cluster.sh              # Registers coordinator and adds workers
     ├── pg-healthcheck.sh             # Docker healthcheck
     ├── keepalived-check.sh           # Keepalived check script (reference only)

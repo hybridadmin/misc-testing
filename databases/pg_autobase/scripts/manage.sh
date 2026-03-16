@@ -75,6 +75,22 @@ find_patroni_node() {
     return 1
 }
 
+# --- Find the current Patroni primary node ---
+# pgBackRest check and backup should run on the primary (pgbackrest check requires it)
+find_primary_node() {
+    for node in ab-node1 ab-node2 ab-node3; do
+        if docker inspect "$node" --format='{{.State.Running}}' 2>/dev/null | grep -q true; then
+            local is_primary
+            is_primary=$(docker exec "$node" psql -U postgres -h /var/run/postgresql -tAc "SELECT NOT pg_is_in_recovery()" 2>/dev/null)
+            if [ "$is_primary" = "t" ]; then
+                echo "$node"
+                return
+            fi
+        fi
+    done
+    return 1
+}
+
 # =============================================================================
 # Commands
 # =============================================================================
@@ -418,10 +434,12 @@ cmd_test() {
 
     # Test 16: pgBackRest check passes (WAL archiving working)
     run_test "pgBackRest check (WAL archiving)"
-    if [ -n "$node" ]; then
-        docker exec "$node" pgbackrest --stanza="$STANZA" check >/dev/null 2>&1 && pass || fail "pgBackRest check failed"
+    local primary_node
+    primary_node=$(find_primary_node 2>/dev/null) || primary_node=""
+    if [ -n "$primary_node" ]; then
+        docker exec "$primary_node" pgbackrest --stanza="$STANZA" check >/dev/null 2>&1 && pass || fail "pgBackRest check failed (on $primary_node)"
     else
-        fail "No Patroni node running"
+        fail "No Patroni primary found"
     fi
 
     # Test 17: pgBackRest has at least one backup
@@ -517,7 +535,7 @@ cmd_backup() {
 
     log_head "=== pgBackRest Backup ($type) ==="
     local node
-    node=$(find_patroni_node 2>/dev/null) || { log_error "No Patroni node running"; exit 1; }
+    node=$(find_primary_node 2>/dev/null) || { log_error "No Patroni primary found"; exit 1; }
     log_info "Running $type backup on $node (stanza: $STANZA)..."
     docker exec "$node" pgbackrest --stanza="$STANZA" --type="$type" backup
     log_ok "Backup complete"
@@ -535,8 +553,8 @@ cmd_backup_info() {
 cmd_backup_check() {
     log_head "=== pgBackRest Check ==="
     local node
-    node=$(find_patroni_node 2>/dev/null) || { log_error "No Patroni node running"; exit 1; }
-    log_info "Checking stanza '$STANZA' on $node..."
+    node=$(find_primary_node 2>/dev/null) || { log_error "No Patroni primary found"; exit 1; }
+    log_info "Checking stanza '$STANZA' on $node (primary)..."
     docker exec "$node" pgbackrest --stanza="$STANZA" check
     log_ok "pgBackRest check passed"
 }

@@ -35,6 +35,13 @@ PG_DB="${POSTGRES_DB:-appdb}"
 NODES=("mm-pg-node1" "mm-pg-node2" "mm-pg-node3")
 NODE_PORTS=(5441 5442 5443)
 
+# pgBackRest — per-system-id stanzas
+# Each node is an independent initdb (multi-master logical replication) -> 3 stanzas
+STANZA_NODE1="${BACKUP_STANZA_NODE1:-pg-mm-node1}"
+STANZA_NODE2="${BACKUP_STANZA_NODE2:-pg-mm-node2}"
+STANZA_NODE3="${BACKUP_STANZA_NODE3:-pg-mm-node3}"
+ALL_STANZAS=("$STANZA_NODE1" "$STANZA_NODE2" "$STANZA_NODE3")
+
 # Execute SQL on ALL nodes (needed because logical replication does NOT replicate DDL)
 exec_on_all_nodes() {
     local sql="$1"
@@ -764,25 +771,331 @@ cmd_repair() {
     esac
 }
 
+# ---------------------------------------------------------------------------
+# pgBackRest helpers
+# ---------------------------------------------------------------------------
+# Resolve node alias to container name and stanza
+resolve_backup_node() {
+    local target="${1:-node1}"
+    case "$target" in
+        node1|pg-node1|1)  echo "mm-pg-node1|$STANZA_NODE1" ;;
+        node2|pg-node2|2)  echo "mm-pg-node2|$STANZA_NODE2" ;;
+        node3|pg-node3|3)  echo "mm-pg-node3|$STANZA_NODE3" ;;
+        *) log_error "Unknown node: $target (use node1, node2, node3)"; return 1 ;;
+    esac
+}
+
+cmd_backup() {
+    local btype="${1:-full}"
+    local target="${2:-}"
+
+    case "$btype" in
+        full|diff|incr) ;;
+        *) log_error "Unknown backup type: $btype (use full, diff, incr)"; return 1 ;;
+    esac
+
+    # If no target specified, backup all nodes
+    local targets=()
+    if [ -z "$target" ]; then
+        targets=("node1" "node2" "node3")
+    else
+        targets=("$target")
+    fi
+
+    for t in "${targets[@]}"; do
+        local resolved
+        resolved=$(resolve_backup_node "$t") || return 1
+        local container="${resolved%%|*}"
+        local stanza="${resolved##*|}"
+
+        log_head "=== pgBackRest Backup ($btype) on $container, stanza=$stanza ==="
+        docker exec "$container" gosu postgres pgbackrest --stanza="$stanza" --type="$btype" backup 2>&1
+        log_ok "Backup ($btype) complete on $container"
+        echo ""
+    done
+}
+
+cmd_backup_info() {
+    local target="${1:-}"
+
+    local targets=()
+    if [ -z "$target" ]; then
+        targets=("node1" "node2" "node3")
+    else
+        targets=("$target")
+    fi
+
+    for t in "${targets[@]}"; do
+        local resolved
+        resolved=$(resolve_backup_node "$t") || return 1
+        local container="${resolved%%|*}"
+        local stanza="${resolved##*|}"
+
+        log_head "=== pgBackRest Info ($container, stanza=$stanza) ==="
+        docker exec "$container" gosu postgres pgbackrest --stanza="$stanza" --output=text info 2>&1
+        echo ""
+    done
+}
+
+cmd_backup_check() {
+    local target="${1:-}"
+
+    local targets=()
+    if [ -z "$target" ]; then
+        targets=("node1" "node2" "node3")
+    else
+        targets=("$target")
+    fi
+
+    for t in "${targets[@]}"; do
+        local resolved
+        resolved=$(resolve_backup_node "$t") || return 1
+        local container="${resolved%%|*}"
+        local stanza="${resolved##*|}"
+
+        log_head "=== pgBackRest Check ($container, stanza=$stanza) ==="
+        log_info "Verifying stanza '$stanza' and WAL archiving..."
+        docker exec "$container" gosu postgres pgbackrest --stanza="$stanza" --log-level-console=info check 2>&1
+        log_ok "pgBackRest check passed — stanza OK, WAL archiving OK"
+        echo ""
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Integration tests (including pgBackRest tests)
+# ---------------------------------------------------------------------------
+cmd_test() {
+    log_head "=== Multi-Master Cluster Integration Tests ==="
+    echo ""
+    local PASS=0
+    local FAIL=0
+
+    run_test() {
+        local num="$1" desc="$2"
+        log_info "Test $num: $desc"
+    }
+    pass() { log_ok "$*"; PASS=$((PASS + 1)); }
+    fail() { log_error "$*"; FAIL=$((FAIL + 1)); }
+
+    # --- Test 1: Node connectivity ---
+    run_test 1 "PostgreSQL node connectivity"
+    local all_up=true
+    for i in "${!NODES[@]}"; do
+        if PGPASSWORD="$PG_PASS" psql -h localhost -p "${NODE_PORTS[$i]}" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT 1;" >/dev/null 2>&1; then
+            :
+        else
+            fail "${NODES[$i]} not accepting connections"
+            all_up=false
+        fi
+    done
+    if $all_up; then
+        pass "All 3 nodes accepting connections"
+    fi
+
+    # --- Test 2: Publications exist ---
+    run_test 2 "Publications exist on all nodes"
+    local pubs_ok=true
+    for i in "${!NODES[@]}"; do
+        local pub_count
+        pub_count=$(PGPASSWORD="$PG_PASS" psql -h localhost -p "${NODE_PORTS[$i]}" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT count(*) FROM pg_publication;" 2>/dev/null || echo "0")
+        if [ "$pub_count" -ge 1 ] 2>/dev/null; then
+            :
+        else
+            fail "${NODES[$i]}: no publications found"
+            pubs_ok=false
+        fi
+    done
+    if $pubs_ok; then
+        pass "All nodes have publications"
+    fi
+
+    # --- Test 3: Subscriptions exist and are enabled ---
+    run_test 3 "Subscriptions exist and are enabled"
+    local subs_ok=true
+    for i in "${!NODES[@]}"; do
+        local sub_count
+        sub_count=$(PGPASSWORD="$PG_PASS" psql -h localhost -p "${NODE_PORTS[$i]}" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT count(*) FROM pg_subscription WHERE subenabled;" 2>/dev/null || echo "0")
+        if [ "$sub_count" -ge 2 ] 2>/dev/null; then
+            :
+        else
+            fail "${NODES[$i]}: expected >=2 enabled subscriptions, got $sub_count"
+            subs_ok=false
+        fi
+    done
+    if $subs_ok; then
+        pass "All nodes have >=2 enabled subscriptions"
+    fi
+
+    # --- Test 4: Multi-master write + replication ---
+    run_test 4 "Multi-master write + replication"
+    # Create test table on all nodes (DDL doesn't replicate)
+    for i in "${!NODES[@]}"; do
+        local port="${NODE_PORTS[$i]}"
+        PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT subname FROM pg_subscription WHERE subenabled;" 2>/dev/null | while IFS= read -r sub; do
+            sub=$(echo "$sub" | xargs); [ -z "$sub" ] && continue
+            PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -c "ALTER SUBSCRIPTION \"$sub\" DISABLE;" 2>/dev/null
+        done
+    done
+    for port in "${NODE_PORTS[@]}"; do
+        PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -c "DROP TABLE IF EXISTS _test_repl;" 2>/dev/null
+    done
+    for i in "${!NODES[@]}"; do
+        local port="${NODE_PORTS[$i]}"
+        PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT subname FROM pg_subscription WHERE NOT subenabled;" 2>/dev/null | while IFS= read -r sub; do
+            sub=$(echo "$sub" | xargs); [ -z "$sub" ] && continue
+            PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -c "ALTER SUBSCRIPTION \"$sub\" ENABLE;" 2>/dev/null
+        done
+    done
+    for port in "${NODE_PORTS[@]}"; do
+        PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -c "CREATE TABLE IF NOT EXISTS _test_repl (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), src text, ts timestamptz DEFAULT now());" 2>/dev/null
+    done
+    # Refresh subscriptions
+    for i in "${!NODES[@]}"; do
+        local port="${NODE_PORTS[$i]}"
+        PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT subname FROM pg_subscription WHERE subenabled;" 2>/dev/null | while IFS= read -r sub; do
+            sub=$(echo "$sub" | xargs); [ -z "$sub" ] && continue
+            PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -c "ALTER SUBSCRIPTION \"$sub\" REFRESH PUBLICATION WITH (copy_data = false);" 2>/dev/null
+        done
+    done
+    sleep 2
+    # Write one row to each node
+    for i in "${!NODES[@]}"; do
+        PGPASSWORD="$PG_PASS" psql -h localhost -p "${NODE_PORTS[$i]}" -U "$PG_USER" -d "$PG_DB" -c "INSERT INTO _test_repl (src) VALUES ('${NODES[$i]}');" 2>/dev/null
+    done
+    sleep 5
+    local repl_ok=true
+    for i in "${!NODES[@]}"; do
+        local cnt
+        cnt=$(PGPASSWORD="$PG_PASS" psql -h localhost -p "${NODE_PORTS[$i]}" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT count(*) FROM _test_repl;" 2>/dev/null || echo "0")
+        if [ "$cnt" != "3" ]; then
+            repl_ok=false
+        fi
+    done
+    if $repl_ok; then
+        pass "All nodes see 3 rows (write + replication verified)"
+    else
+        # Retry after more time
+        sleep 10
+        repl_ok=true
+        for i in "${!NODES[@]}"; do
+            local cnt
+            cnt=$(PGPASSWORD="$PG_PASS" psql -h localhost -p "${NODE_PORTS[$i]}" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT count(*) FROM _test_repl;" 2>/dev/null || echo "0")
+            if [ "$cnt" != "3" ]; then
+                fail "${NODES[$i]}: expected 3 rows, got $cnt"
+                repl_ok=false
+            fi
+        done
+        if $repl_ok; then
+            pass "All nodes see 3 rows (write + replication verified after retry)"
+        fi
+    fi
+    # Cleanup test table
+    for i in "${!NODES[@]}"; do
+        local port="${NODE_PORTS[$i]}"
+        PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT subname FROM pg_subscription WHERE subenabled;" 2>/dev/null | while IFS= read -r sub; do
+            sub=$(echo "$sub" | xargs); [ -z "$sub" ] && continue
+            PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -c "ALTER SUBSCRIPTION \"$sub\" DISABLE;" 2>/dev/null
+        done
+    done
+    for port in "${NODE_PORTS[@]}"; do
+        PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -c "DROP TABLE IF EXISTS _test_repl;" 2>/dev/null
+    done
+    for i in "${!NODES[@]}"; do
+        local port="${NODE_PORTS[$i]}"
+        PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT subname FROM pg_subscription WHERE NOT subenabled;" 2>/dev/null | while IFS= read -r sub; do
+            sub=$(echo "$sub" | xargs); [ -z "$sub" ] && continue
+            PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -c "ALTER SUBSCRIPTION \"$sub\" ENABLE;" 2>/dev/null
+        done
+    done
+
+    # --- Test 5: HAProxy connectivity ---
+    run_test 5 "HAProxy connectivity"
+    if PGPASSWORD="$PG_PASS" psql -h localhost -p "${HAPROXY_WRITE_PORT:-5432}" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT 1;" >/dev/null 2>&1; then
+        pass "HAProxy write endpoint responding"
+    else
+        fail "HAProxy write endpoint not responding"
+    fi
+
+    # --- Test 6: Valkey connectivity ---
+    run_test 6 "Valkey connectivity"
+    if docker exec mm-valkey-master valkey-cli -a "${VALKEY_PASSWORD:-changeme_valkey_2025}" --no-auth-warning ping 2>/dev/null | grep -q PONG; then
+        pass "Valkey master responding"
+    else
+        fail "Valkey master not responding"
+    fi
+
+    # --- Test 7: WAL archiving enabled ---
+    run_test 7 "WAL archiving enabled (archive_mode=on)"
+    local am
+    am=$(PGPASSWORD="$PG_PASS" psql -h localhost -p "${NODE_PORTS[0]}" -U "$PG_USER" -d "$PG_DB" -tAc "SHOW archive_mode;" 2>/dev/null || echo "")
+    if [ "$am" = "on" ]; then
+        pass "archive_mode=on"
+    else
+        fail "archive_mode=$am (expected on)"
+    fi
+
+    # --- Test 8-13: pgBackRest stanza exists + backup exists per node ---
+    for i in "${!NODES[@]}"; do
+        local node="${NODES[$i]}"
+        local stanza="${ALL_STANZAS[$i]}"
+        local test_num=$((8 + i * 2))
+
+        run_test "$test_num" "pgBackRest stanza exists on $node ($stanza)"
+        local stanza_ok
+        stanza_ok=$(docker exec "$node" gosu postgres pgbackrest --stanza="$stanza" --output=json info 2>/dev/null | jq -r '.[0].name // empty' 2>/dev/null || echo "")
+        if [ "$stanza_ok" = "$stanza" ]; then
+            pass "Stanza '$stanza' exists"
+        else
+            fail "Stanza '$stanza' not found on $node"
+        fi
+
+        # --- Backup exists test ---
+        local test_num2=$((test_num + 1))
+        run_test "$test_num2" "pgBackRest has at least one backup ($node)"
+        local bcount
+        bcount=$(docker exec "$node" gosu postgres pgbackrest --stanza="$stanza" --output=json info 2>/dev/null | jq '.[0].backup | length' 2>/dev/null || echo "0")
+        if [ "$bcount" -ge 1 ] 2>/dev/null; then
+            pass "$node has $bcount backup(s)"
+        else
+            fail "$node has no backups"
+        fi
+    done
+
+    # --- Summary ---
+    echo ""
+    log_info "Cleaning up test tables..."
+    echo ""
+    if [ "$FAIL" -eq 0 ]; then
+        log_ok "All tests passed! ($PASS passed, $FAIL failed)"
+    else
+        log_error "$FAIL test(s) FAILED ($PASS passed)"
+        return 1
+    fi
+}
+
 cmd_help() {
     echo "Usage: $0 <command> [args]"
     echo ""
     echo "Commands:"
-    echo "  status              Show cluster & replication status"
-    echo "  replication         Show detailed replication info (publications/subscriptions)"
-    echo "  test                Test multi-master replication (write to each node, verify)"
+    echo "  status               Show cluster & replication status"
+    echo "  replication          Show detailed replication info (publications/subscriptions)"
+    echo "  test                 Run integration tests (replication + pgBackRest)"
+    echo "  test-multimaster     Run detailed multi-master replication test"
     echo "  ddl \"SQL\"           Execute DDL on ALL nodes (canary test on node1 first)"
     echo "  ddl -f file.sql     Execute DDL from file on ALL nodes"
-    echo "  conflicts           Show conflict stats, disabled subs, apply errors"
-    echo "  repair enable       Re-enable all disabled subscriptions"
-    echo "  repair skip <node>  Skip errored transaction and re-enable"
+    echo "  conflicts            Show conflict stats, disabled subs, apply errors"
+    echo "  repair enable        Re-enable all disabled subscriptions"
+    echo "  repair skip <node>   Skip errored transaction and re-enable"
     echo "  repair resync <node> Drop + recreate subscriptions (full resync)"
-    echo "  repair reset-stats  Reset conflict counters to zero"
-    echo "  psql [port]         Connect via psql (default: 5432=write, 5433=read)"
-    echo "  valkey-cli          Connect to Valkey CLI"
-    echo "  logs [service]      Tail logs (optionally for specific service)"
-    echo "  bench [scale]       Run pgbench benchmark (default scale=10)"
-    echo "  help                Show this help"
+    echo "  repair reset-stats   Reset conflict counters to zero"
+    echo "  backup [type] [node] Run pgBackRest backup (full|diff|incr, default: full all)"
+    echo "  backup-info [node]   Show pgBackRest backup info (default: all nodes)"
+    echo "  backup-check [node]  Verify pgBackRest stanza + WAL archiving (default: all nodes)"
+    echo "  psql [port]          Connect via psql (default: 5432=write, 5433=read)"
+    echo "  valkey-cli           Connect to Valkey CLI"
+    echo "  logs [service]       Tail logs (optionally for specific service)"
+    echo "  bench [scale]        Run pgbench benchmark (default scale=10)"
+    echo "  help                 Show this help"
     echo ""
     echo "Direct ports: node1=5441, node2=5442, node3=5443"
     echo "HAProxy:      write=5432, read=5433, stats=http://localhost:7000/stats"
@@ -792,15 +1105,19 @@ cmd_help() {
 }
 
 case "${1:-help}" in
-    status)       cmd_status ;;
-    replication)  cmd_replication_detail ;;
-    test)         cmd_test_multimaster ;;
-    ddl)          cmd_ddl "${2:-}" "${3:-}" ;;
-    conflicts)    cmd_conflicts ;;
-    repair)       cmd_repair "${2:-}" "${3:-}" ;;
-    psql)         cmd_psql "${2:-5432}" "${@:3}" ;;
-    valkey-cli)   shift; cmd_valkey_cli "$@" ;;
-    logs)         cmd_logs "${2:-}" ;;
-    bench)        cmd_bench "${2:-10}" ;;
-    help|*)       cmd_help ;;
+    status)           cmd_status ;;
+    replication)      cmd_replication_detail ;;
+    test)             cmd_test ;;
+    test-multimaster) cmd_test_multimaster ;;
+    ddl)              cmd_ddl "${2:-}" "${3:-}" ;;
+    conflicts)        cmd_conflicts ;;
+    repair)           cmd_repair "${2:-}" "${3:-}" ;;
+    backup)           cmd_backup "${2:-full}" "${3:-}" ;;
+    backup-info)      cmd_backup_info "${2:-}" ;;
+    backup-check)     cmd_backup_check "${2:-}" ;;
+    psql)             cmd_psql "${2:-5432}" "${@:3}" ;;
+    valkey-cli)       shift; cmd_valkey_cli "$@" ;;
+    logs)             cmd_logs "${2:-}" ;;
+    bench)            cmd_bench "${2:-10}" ;;
+    help|*)           cmd_help ;;
 esac

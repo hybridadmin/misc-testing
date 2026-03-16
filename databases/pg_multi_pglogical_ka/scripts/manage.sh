@@ -35,6 +35,13 @@ VIP="${KEEPALIVED_VIP:-172.32.0.100}"
 NODES=("mmk-pg-node1" "mmk-pg-node2" "mmk-pg-node3")
 NODE_PORTS=(5741 5742 5743)
 
+# pgBackRest — per-system-id stanzas
+# Each node is an independent initdb (multi-master pglogical replication) -> 3 stanzas
+STANZA_NODE1="${BACKUP_STANZA_NODE1:-pg-mmk-node1}"
+STANZA_NODE2="${BACKUP_STANZA_NODE2:-pg-mmk-node2}"
+STANZA_NODE3="${BACKUP_STANZA_NODE3:-pg-mmk-node3}"
+ALL_STANZAS=("$STANZA_NODE1" "$STANZA_NODE2" "$STANZA_NODE3")
+
 # ---------------------------------------------------------------------------
 # Run SQL on a specific node via its exposed port
 # ---------------------------------------------------------------------------
@@ -42,6 +49,21 @@ run_sql_on() {
     local port="$1"
     local sql="$2"
     PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -tAc "$sql" 2>/dev/null
+}
+
+# Enter/exit maintenance mode on all nodes.
+# Maintenance mode prevents the fencing watchdog from fencing nodes while
+# subscriptions are temporarily disabled (e.g. during test setup/teardown).
+enter_maintenance_mode() {
+    for node in "${NODES[@]}"; do
+        docker exec "$node" touch /tmp/pglogical_maintenance 2>/dev/null || true
+    done
+    sleep 1  # let watchdog pick up maintenance flag
+}
+exit_maintenance_mode() {
+    for node in "${NODES[@]}"; do
+        docker exec "$node" rm -f /tmp/pglogical_maintenance 2>/dev/null || true
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -207,7 +229,7 @@ cmd_vip_status() {
 
     # Test VIP connectivity
     echo ""
-    if PGPASSWORD="$PG_PASS" psql -h "$VIP" -p 5432 -U "$PG_USER" -d "$PG_DB" -tAc "SELECT 1;" --connect-timeout=3 >/dev/null 2>&1; then
+    if PGPASSWORD="$PG_PASS" PGCONNECT_TIMEOUT=3 psql -h "$VIP" -p 5432 -U "$PG_USER" -d "$PG_DB" -tAc "SELECT 1;" >/dev/null 2>&1; then
         log_ok "  VIP connectivity: OK (reachable at $VIP:5432)"
     else
         log_warn "  VIP connectivity: UNREACHABLE from host (expected on Docker Desktop — use direct ports 5741-5743)"
@@ -244,6 +266,297 @@ cmd_psql() {
 
 cmd_valkey_cli() {
     docker exec -it mmk-valkey-master valkey-cli -a "${VALKEY_PASSWORD:-changeme_valkey_2025}" --no-auth-warning "$@"
+}
+
+# ---------------------------------------------------------------------------
+# pgBackRest backup commands
+# ---------------------------------------------------------------------------
+
+resolve_backup_node() {
+    local target="${1:-node1}"
+    case "$target" in
+        node1|pg-node1|1)  echo "mmk-pg-node1|$STANZA_NODE1" ;;
+        node2|pg-node2|2)  echo "mmk-pg-node2|$STANZA_NODE2" ;;
+        node3|pg-node3|3)  echo "mmk-pg-node3|$STANZA_NODE3" ;;
+        *) log_error "Unknown node: $target (use node1, node2, node3)"; return 1 ;;
+    esac
+}
+
+cmd_backup() {
+    local btype="${1:-full}"
+    local target="${2:-}"
+
+    case "$btype" in
+        full|diff|incr) ;;
+        *) log_error "Unknown backup type: $btype (use full, diff, incr)"; return 1 ;;
+    esac
+
+    # If no target specified, backup all nodes
+    local targets=()
+    if [ -z "$target" ]; then
+        targets=("node1" "node2" "node3")
+    else
+        targets=("$target")
+    fi
+
+    for t in "${targets[@]}"; do
+        local resolved
+        resolved=$(resolve_backup_node "$t") || return 1
+        local container="${resolved%%|*}"
+        local stanza="${resolved##*|}"
+
+        log_head "=== pgBackRest Backup ($btype) on $container, stanza=$stanza ==="
+        docker exec "$container" gosu postgres pgbackrest --stanza="$stanza" --type="$btype" backup 2>&1
+        log_ok "Backup ($btype) complete on $container"
+        echo ""
+    done
+}
+
+cmd_backup_info() {
+    local target="${1:-}"
+
+    local targets=()
+    if [ -z "$target" ]; then
+        targets=("node1" "node2" "node3")
+    else
+        targets=("$target")
+    fi
+
+    for t in "${targets[@]}"; do
+        local resolved
+        resolved=$(resolve_backup_node "$t") || return 1
+        local container="${resolved%%|*}"
+        local stanza="${resolved##*|}"
+
+        log_head "=== pgBackRest Info ($container, stanza=$stanza) ==="
+        docker exec "$container" gosu postgres pgbackrest --stanza="$stanza" --output=text info 2>&1
+        echo ""
+    done
+}
+
+cmd_backup_check() {
+    local target="${1:-}"
+
+    local targets=()
+    if [ -z "$target" ]; then
+        targets=("node1" "node2" "node3")
+    else
+        targets=("$target")
+    fi
+
+    for t in "${targets[@]}"; do
+        local resolved
+        resolved=$(resolve_backup_node "$t") || return 1
+        local container="${resolved%%|*}"
+        local stanza="${resolved##*|}"
+
+        log_head "=== pgBackRest Check ($container, stanza=$stanza) ==="
+        log_info "Verifying stanza '$stanza' and WAL archiving..."
+        docker exec "$container" gosu postgres pgbackrest --stanza="$stanza" --log-level-console=info check 2>&1
+        log_ok "pgBackRest check passed — stanza OK, WAL archiving OK"
+        echo ""
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Integration tests (including pgBackRest tests)
+# ---------------------------------------------------------------------------
+cmd_test() {
+    log_head "=== Multi-Master Cluster Integration Tests (pglogical + keepalived) ==="
+    echo ""
+    local PASS=0
+    local FAIL=0
+
+    run_test() {
+        local num="$1" desc="$2"
+        log_info "Test $num: $desc"
+    }
+    pass() { log_ok "$*"; PASS=$((PASS + 1)); }
+    fail() { log_error "$*"; FAIL=$((FAIL + 1)); }
+
+    # --- Test 1: Node connectivity ---
+    run_test 1 "PostgreSQL node connectivity"
+    local all_up=true
+    for i in "${!NODES[@]}"; do
+        if PGPASSWORD="$PG_PASS" psql -h localhost -p "${NODE_PORTS[$i]}" -U "$PG_USER" -d "$PG_DB" -tAc "SELECT 1;" >/dev/null 2>&1; then
+            :
+        else
+            fail "${NODES[$i]} not accepting connections"
+            all_up=false
+        fi
+    done
+    if $all_up; then
+        pass "All 3 nodes accepting connections"
+    fi
+
+    # --- Test 2: pglogical nodes exist ---
+    run_test 2 "pglogical nodes exist on all nodes"
+    local pgl_ok=true
+    for i in "${!NODES[@]}"; do
+        local node_name
+        node_name=$(run_sql_on "${NODE_PORTS[$i]}" "SELECT node_name FROM pglogical.node LIMIT 1;" 2>/dev/null || echo "")
+        if [ -n "$node_name" ] && [ "$node_name" != "" ]; then
+            :
+        else
+            fail "${NODES[$i]}: no pglogical node found"
+            pgl_ok=false
+        fi
+    done
+    if $pgl_ok; then
+        pass "All nodes have pglogical node identity"
+    fi
+
+    # --- Test 3: pglogical subscriptions exist and are replicating ---
+    run_test 3 "pglogical subscriptions exist and are replicating"
+    local subs_ok=true
+    for i in "${!NODES[@]}"; do
+        local sub_count
+        sub_count=$(run_sql_on "${NODE_PORTS[$i]}" "SELECT count(*) FROM pglogical.show_subscription_status() WHERE status = 'replicating';" 2>/dev/null || echo "0")
+        if [ "$sub_count" -ge 2 ] 2>/dev/null; then
+            :
+        else
+            fail "${NODES[$i]}: expected >=2 replicating subscriptions, got $sub_count"
+            subs_ok=false
+        fi
+    done
+    if $subs_ok; then
+        pass "All nodes have >=2 replicating subscriptions"
+    fi
+
+    # --- Test 4: Multi-master write + replication ---
+    run_test 4 "Multi-master write + replication"
+    # Enter maintenance mode so watchdog won't fence while we manipulate data
+    enter_maintenance_mode
+    # Clean up any previous test table on all nodes
+    for port in "${NODE_PORTS[@]}"; do
+        PGPASSWORD="$PG_PASS" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -c \
+            "DROP TABLE IF EXISTS public._test_repl CASCADE;" 2>/dev/null || true
+    done
+    sleep 1
+    # Create test table via replicate_ddl_command on node1 (replicates to all)
+    PGPASSWORD="$PG_PASS" psql -h localhost -p "${NODE_PORTS[0]}" -U "$PG_USER" -d "$PG_DB" -c "
+        SELECT pglogical.replicate_ddl_command(\$DDL\$
+            CREATE TABLE public._test_repl (
+                id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                src text NOT NULL,
+                ts timestamptz DEFAULT now()
+            );
+            SELECT pglogical.replication_set_add_table('default', 'public._test_repl', true);
+        \$DDL\$);
+    " 2>/dev/null
+    sleep 3
+    # Write one row to each node
+    for i in "${!NODES[@]}"; do
+        PGPASSWORD="$PG_PASS" psql -h localhost -p "${NODE_PORTS[$i]}" -U "$PG_USER" -d "$PG_DB" -c \
+            "INSERT INTO public._test_repl (src) VALUES ('${NODES[$i]}');" 2>/dev/null
+    done
+    sleep 5
+    local repl_ok=true
+    for i in "${!NODES[@]}"; do
+        local cnt
+        cnt=$(run_sql_on "${NODE_PORTS[$i]}" "SELECT count(*) FROM public._test_repl;" 2>/dev/null || echo "0")
+        if [ "$cnt" != "3" ]; then
+            repl_ok=false
+        fi
+    done
+    if $repl_ok; then
+        pass "All nodes see 3 rows (write + replication verified)"
+    else
+        # Retry after more time
+        sleep 10
+        repl_ok=true
+        for i in "${!NODES[@]}"; do
+            local cnt
+            cnt=$(run_sql_on "${NODE_PORTS[$i]}" "SELECT count(*) FROM public._test_repl;" 2>/dev/null || echo "0")
+            if [ "$cnt" != "3" ]; then
+                fail "${NODES[$i]}: expected 3 rows, got $cnt"
+                repl_ok=false
+            fi
+        done
+        if $repl_ok; then
+            pass "All nodes see 3 rows (write + replication verified after retry)"
+        fi
+    fi
+    # Cleanup test table via replicate_ddl_command
+    PGPASSWORD="$PG_PASS" psql -h localhost -p "${NODE_PORTS[0]}" -U "$PG_USER" -d "$PG_DB" -c "
+        SELECT pglogical.replicate_ddl_command(\$DDL\$
+            DROP TABLE IF EXISTS public._test_repl CASCADE;
+        \$DDL\$);
+    " 2>/dev/null
+    sleep 2
+    exit_maintenance_mode
+
+    # --- Test 5: keepalived VIP connectivity ---
+    run_test 5 "keepalived VIP connectivity"
+    local vip_holder="none"
+    for i in "${!NODES[@]}"; do
+        local node="${NODES[$i]}"
+        local has_vip
+        has_vip=$(docker exec "$node" ip addr show eth0 2>/dev/null | grep "$VIP" || true)
+        if [ -n "$has_vip" ]; then
+            vip_holder="$node"
+            break
+        fi
+    done
+    if [ "$vip_holder" != "none" ]; then
+        pass "VIP $VIP assigned to $vip_holder"
+    else
+        fail "VIP $VIP not assigned to any node"
+    fi
+
+    # --- Test 6: Valkey connectivity ---
+    run_test 6 "Valkey connectivity"
+    if docker exec mmk-valkey-master valkey-cli -a "${VALKEY_PASSWORD:-changeme_valkey_2025}" --no-auth-warning ping 2>/dev/null | grep -q PONG; then
+        pass "Valkey master responding"
+    else
+        fail "Valkey master not responding"
+    fi
+
+    # --- Test 7: WAL archiving enabled ---
+    run_test 7 "WAL archiving enabled (archive_mode=on)"
+    local am
+    am=$(PGPASSWORD="$PG_PASS" psql -h localhost -p "${NODE_PORTS[0]}" -U "$PG_USER" -d "$PG_DB" -tAc "SHOW archive_mode;" 2>/dev/null || echo "")
+    if [ "$am" = "on" ]; then
+        pass "archive_mode=on"
+    else
+        fail "archive_mode=$am (expected on)"
+    fi
+
+    # --- Test 8-13: pgBackRest stanza exists + backup exists per node ---
+    for i in "${!NODES[@]}"; do
+        local node="${NODES[$i]}"
+        local stanza="${ALL_STANZAS[$i]}"
+        local test_num=$((8 + i * 2))
+
+        run_test "$test_num" "pgBackRest stanza exists on $node ($stanza)"
+        local stanza_ok
+        stanza_ok=$(docker exec "$node" gosu postgres pgbackrest --stanza="$stanza" --output=json info 2>/dev/null | jq -r '.[0].name // empty' 2>/dev/null || echo "")
+        if [ "$stanza_ok" = "$stanza" ]; then
+            pass "Stanza '$stanza' exists"
+        else
+            fail "Stanza '$stanza' not found on $node"
+        fi
+
+        # --- Backup exists test ---
+        local test_num2=$((test_num + 1))
+        run_test "$test_num2" "pgBackRest has at least one backup ($node)"
+        local bcount
+        bcount=$(docker exec "$node" gosu postgres pgbackrest --stanza="$stanza" --output=json info 2>/dev/null | jq '.[0].backup | length' 2>/dev/null || echo "0")
+        if [ "$bcount" -ge 1 ] 2>/dev/null; then
+            pass "$node has $bcount backup(s)"
+        else
+            fail "$node has no backups"
+        fi
+    done
+
+    # --- Summary ---
+    echo ""
+    if [ "$FAIL" -eq 0 ]; then
+        log_ok "All tests passed! ($PASS passed, $FAIL failed)"
+    else
+        log_error "$FAIL test(s) FAILED ($PASS passed)"
+        return 1
+    fi
 }
 
 cmd_logs() {
@@ -517,9 +830,7 @@ cmd_bench() {
 
     # Enter maintenance mode
     log_info "Entering maintenance mode on all nodes..."
-    for node in "${NODES[@]}"; do
-        docker exec "$node" touch /tmp/pglogical_maintenance
-    done
+    enter_maintenance_mode
 
     # Disable pglogical subscriptions
     log_info "Disabling pglogical subscriptions for benchmark..."
@@ -596,9 +907,7 @@ cmd_bench() {
 
     # Exit maintenance mode
     log_info "Exiting maintenance mode..."
-    for node in "${NODES[@]}"; do
-        docker exec "$node" rm -f /tmp/pglogical_maintenance
-    done
+    exit_maintenance_mode
 }
 
 cmd_repair() {
@@ -730,12 +1039,16 @@ cmd_help() {
     echo "  status               Show cluster, pglogical & keepalived VIP status"
     echo "  vip                  Show keepalived VIP status (which node holds VIP)"
     echo "  replication          Show detailed pglogical replication info"
-    echo "  test                 Full test: DDL + DML replication + VIP check"
+    echo "  test                 Run integration tests (replication + pgBackRest)"
+    echo "  test-multimaster     Run detailed pglogical multi-master replication test"
     echo "  ddl \"SQL\"            Execute DDL via pglogical.replicate_ddl_command()"
     echo "  ddl -f file.sql      Execute DDL from file via replicate_ddl_command()"
     echo "  conflicts            Show subscription status and errors"
     echo "  repair enable        Re-enable all pglogical subscriptions"
     echo "  repair resync <node> Drop + recreate subscriptions (full resync)"
+    echo "  backup [type] [node] Run pgBackRest backup (full|diff|incr, default: full all)"
+    echo "  backup-info [node]   Show pgBackRest backup info (default: all nodes)"
+    echo "  backup-check [node]  Verify pgBackRest stanza + WAL archiving (default: all nodes)"
     echo "  psql [port]          Connect via psql (5741-5743=direct)"
     echo "  valkey-cli           Connect to Valkey CLI"
     echo "  logs [service]       Tail Docker logs"
@@ -752,16 +1065,20 @@ cmd_help() {
 }
 
 case "${1:-help}" in
-    status)       cmd_status ;;
-    vip)          cmd_vip_status ;;
-    replication)  cmd_replication_detail ;;
-    test)         cmd_test_multimaster ;;
-    ddl)          cmd_ddl "${2:-}" "${3:-}" ;;
-    conflicts)    cmd_conflicts ;;
-    repair)       cmd_repair "${2:-}" "${3:-}" ;;
-    psql)         cmd_psql "${2:-5741}" "${@:3}" ;;
-    valkey-cli)   shift; cmd_valkey_cli "$@" ;;
-    logs)         cmd_logs "${2:-}" ;;
-    bench)        cmd_bench "${2:-10}" ;;
-    help|*)       cmd_help ;;
+    status)           cmd_status ;;
+    vip)              cmd_vip_status ;;
+    replication)      cmd_replication_detail ;;
+    test)             cmd_test ;;
+    test-multimaster) cmd_test_multimaster ;;
+    ddl)              cmd_ddl "${2:-}" "${3:-}" ;;
+    conflicts)        cmd_conflicts ;;
+    repair)           cmd_repair "${2:-}" "${3:-}" ;;
+    backup)           cmd_backup "${2:-full}" "${3:-}" ;;
+    backup-info)      cmd_backup_info "${2:-}" ;;
+    backup-check)     cmd_backup_check "${2:-}" ;;
+    psql)             cmd_psql "${2:-5741}" "${@:3}" ;;
+    valkey-cli)       shift; cmd_valkey_cli "$@" ;;
+    logs)             cmd_logs "${2:-}" ;;
+    bench)            cmd_bench "${2:-10}" ;;
+    help|*)           cmd_help ;;
 esac

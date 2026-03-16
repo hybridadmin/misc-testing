@@ -188,14 +188,15 @@ pgBackRest is co-installed in each Patroni/PostgreSQL container. All 3 nodes sha
 
 | Setting | Value | Notes |
 |---------|-------|-------|
-| Repo type | POSIX (local) | Shared Docker volume |
-| Compression | lz4 | Fast, low CPU |
-| archive-async | yes | Non-blocking WAL archiving |
-| repo1-bundle | yes | Bundle small files together |
-| repo1-block | yes | Block-level deduplication |
+| Stanza | `pg-autobase` | Matches Patroni scope |
+| Repo type | POSIX (local) | Shared Docker volume at `/var/lib/pgbackrest` |
+| Compression | lz4 (level 1) | Fast, low CPU; level 3 for archive-push |
+| archive-async | yes | Non-blocking WAL archiving with spool |
 | delta | yes | Only restore changed files |
 | Retention (full) | 2 | Keep last 2 full backups |
 | Retention (diff) | 3 | Keep last 3 differential backups |
+| Retention (archive) | 2 | Archive retention anchored to full backups |
+| process-max | 2 | Parallel processes for backup/restore |
 
 ## HA Operations
 
@@ -344,4 +345,3 @@ All images are native ARM64 — no Rosetta 2 emulation:
 - **Single Docker host**: All containers run on one machine. A real production deployment would spread nodes across separate hosts/availability zones.
 - **Shared backup volume**: pgBackRest uses a shared Docker volume instead of a dedicated backup server. This means backups are local to the Docker host — not off-site. For production, configure a remote repository (S3, GCS, Azure, or SFTP).
 - **Valkey is independent**: The Valkey cluster is not integrated with PostgreSQL — it's a standalone caching layer. Applications must handle cache invalidation.
-- **Backup runs on any node**: The `manage.sh backup` command runs pgBackRest on the first available Patroni node. In production, you'd typically run backups from a dedicated standby or backup host.

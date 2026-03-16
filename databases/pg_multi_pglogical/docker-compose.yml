@@ -58,10 +58,14 @@ services:
       ALL_NODES: pg-node1,pg-node2,pg-node3
       SETUP_REPLICATION: "true"
       NODE_NAME: pg-node1
+      PGBACKREST_STANZA: ${BACKUP_STANZA_NODE1:-pg-mmp-node1}
     volumes:
       - pg-node1-data:/var/lib/postgresql
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool1:/var/spool/pgbackrest
+      - pgbackrest-log1:/var/log/pgbackrest
     ports:
       - "5641:5432"
     healthcheck:
@@ -84,10 +88,14 @@ services:
       ALL_NODES: pg-node1,pg-node2,pg-node3
       SETUP_REPLICATION: "true"
       NODE_NAME: pg-node2
+      PGBACKREST_STANZA: ${BACKUP_STANZA_NODE2:-pg-mmp-node2}
     volumes:
       - pg-node2-data:/var/lib/postgresql
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool2:/var/spool/pgbackrest
+      - pgbackrest-log2:/var/log/pgbackrest
     ports:
       - "5642:5432"
     healthcheck:
@@ -110,10 +118,14 @@ services:
       ALL_NODES: pg-node1,pg-node2,pg-node3
       SETUP_REPLICATION: "true"
       NODE_NAME: pg-node3
+      PGBACKREST_STANZA: ${BACKUP_STANZA_NODE3:-pg-mmp-node3}
     volumes:
       - pg-node3-data:/var/lib/postgresql
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool3:/var/spool/pgbackrest
+      - pgbackrest-log3:/var/log/pgbackrest
     ports:
       - "5643:5432"
     healthcheck:
@@ -344,6 +356,20 @@ volumes:
   pg-node2-data:
     driver: local
   pg-node3-data:
+    driver: local
+  pgbackrest-repo:
+    driver: local
+  pgbackrest-spool1:
+    driver: local
+  pgbackrest-spool2:
+    driver: local
+  pgbackrest-spool3:
+    driver: local
+  pgbackrest-log1:
+    driver: local
+  pgbackrest-log2:
+    driver: local
+  pgbackrest-log3:
     driver: local
   valkey-master-data:
     driver: local

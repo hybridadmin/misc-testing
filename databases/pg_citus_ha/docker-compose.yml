@@ -1,17 +1,23 @@
 # =============================================================================
-# Citus 14.0 Distributed PostgreSQL 18 Cluster with HA + Valkey
+# Citus 14.0 Distributed PostgreSQL 18 Cluster with HA + Valkey + pgBackRest
 # =============================================================================
 # Architecture:
 #   1x Citus Coordinator     - Query router, metadata store (holds VIP)
 #   1x Coordinator Standby   - Hot standby via streaming replication
 #   2x Citus Workers         - Data shard storage
 #   failover-monitor.sh      - Shell-based health monitor for VIP failover
+#   pgBackRest               - WAL archiving + backup (3 stanzas)
 #   1x Valkey master         - Cache layer
 #   2x Valkey replicas       - Cache read replicas
 #   3x Valkey Sentinels      - Cache HA / automatic failover
 #
 # Total: 10 services (4 PG + 6 Valkey)
 # VIP (172.34.0.100) floats between coordinator and coordinator-standby.
+#
+# pgBackRest stanzas (based on system-id):
+#   pg-citus-coordinator: coordinator + coordinator-standby (same system-id)
+#   pg-citus-worker1:     worker1 (independent initdb)
+#   pg-citus-worker2:     worker2 (independent initdb)
 #
 # NOTE: This setup uses a shell-based failover monitor instead of keepalived
 # because VRRP raw sockets fail under Rosetta 2 emulation on Apple Silicon.
@@ -56,8 +62,12 @@ services:
       COORDINATOR_STANDBY_IP: ${COORDINATOR_STANDBY_IP:-172.34.0.11}
       KEEPALIVED_VIP: ${KEEPALIVED_VIP:-172.34.0.100}
       CITUS_WORKERS: "worker1,worker2"
+      PGBACKREST_STANZA: ${BACKUP_STANZA_COORDINATOR:-pg-citus-coordinator}
     volumes:
       - coordinator-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool-coord:/var/spool/pgbackrest
+      - pgbackrest-log-coord:/var/log/pgbackrest
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     networks:
@@ -104,10 +114,14 @@ services:
       COORDINATOR_IP: ${COORDINATOR_IP:-172.34.0.10}
       COORDINATOR_STANDBY_IP: ${COORDINATOR_STANDBY_IP:-172.34.0.11}
       KEEPALIVED_VIP: ${KEEPALIVED_VIP:-172.34.0.100}
+      PGBACKREST_STANZA: ${BACKUP_STANZA_COORDINATOR:-pg-citus-coordinator}
     entrypoint: ["coord-standby-entrypoint.sh"]
     command: ["postgres"]
     volumes:
       - coordinator-standby-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool-standby:/var/spool/pgbackrest
+      - pgbackrest-log-standby:/var/log/pgbackrest
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     networks:
@@ -144,8 +158,12 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_REPL_USER: ${POSTGRES_REPL_USER}
       POSTGRES_REPL_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      PGBACKREST_STANZA: ${BACKUP_STANZA_WORKER1:-pg-citus-worker1}
     volumes:
       - worker1-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool-w1:/var/spool/pgbackrest
+      - pgbackrest-log-w1:/var/log/pgbackrest
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     networks:
@@ -176,8 +194,12 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_REPL_USER: ${POSTGRES_REPL_USER}
       POSTGRES_REPL_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      PGBACKREST_STANZA: ${BACKUP_STANZA_WORKER2:-pg-citus-worker2}
     volumes:
       - worker2-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool-w2:/var/spool/pgbackrest
+      - pgbackrest-log-w2:/var/log/pgbackrest
       - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     networks:
@@ -387,6 +409,28 @@ volumes:
     driver: local
   worker2-data:
     driver: local
+  # pgBackRest: shared repo (all nodes read/write WAL archives + backups)
+  pgbackrest-repo:
+    driver: local
+  # pgBackRest: per-node spool dirs (async archive-push/get)
+  pgbackrest-spool-coord:
+    driver: local
+  pgbackrest-spool-standby:
+    driver: local
+  pgbackrest-spool-w1:
+    driver: local
+  pgbackrest-spool-w2:
+    driver: local
+  # pgBackRest: per-node log dirs
+  pgbackrest-log-coord:
+    driver: local
+  pgbackrest-log-standby:
+    driver: local
+  pgbackrest-log-w1:
+    driver: local
+  pgbackrest-log-w2:
+    driver: local
+  # Valkey
   valkey-master-data:
     driver: local
   valkey-replica1-data:

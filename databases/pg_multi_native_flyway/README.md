@@ -59,7 +59,7 @@ docker compose up -d --build
 # Check migration status on each node
 ./scripts/manage.sh migrate info
 
-# Run the replication test
+# Run the integration tests (13 tests: replication + pgBackRest)
 ./scripts/manage.sh test
 ```
 
@@ -126,7 +126,7 @@ With the manual `ddl` command:
 |---------|-------------|
 | `status` | Cluster overview: node health, pub/sub counts, replication lag |
 | `replication` | Detailed publication and subscription info per node |
-| `test` | Full replication test: INSERT/UPDATE/DELETE across all nodes |
+| `test` | Integration tests: replication + pgBackRest (13 tests) |
 | `migrate` | Run pending Flyway migrations on ALL nodes |
 | `migrate info` | Show migration status per node (no changes) |
 | `migrate repair` | Repair Flyway schema history |
@@ -135,6 +135,9 @@ With the manual `ddl` command:
 | `repair skip <node>` | Skip errored transaction and re-enable |
 | `repair resync <node>` | Drop + recreate subscriptions (full data resync) |
 | `repair reset-stats` | Reset conflict counters to zero |
+| `backup [type] [node]` | Run pgBackRest backup (full/diff/incr, default: full all) |
+| `backup-info [node]` | Show pgBackRest backup info (default: all nodes) |
+| `backup-check [node]` | Verify pgBackRest stanza + WAL archiving |
 | `psql [port]` | Connect via psql (5532=write, 5533=read, 5541-5543=direct) |
 | `valkey-cli` | Connect to Valkey CLI |
 | `logs [service]` | Tail Docker logs |
@@ -172,6 +175,59 @@ Uses subnet `172.30.0.0/16` to avoid conflicts with:
 | CI/CD integration | Manual | Add file + run migrate |
 | Rollback support | Manual | Via undo scripts (paid) or manual |
 | Components | 10 services | 10 + Flyway on-demand |
+
+## Backup & Recovery (pgBackRest)
+
+Each PG node has its own pgBackRest stanza because each is an independent `initdb` (different system-id). WAL archiving runs continuously via `archive_command`.
+
+### Stanzas
+
+| Stanza | Node | Description |
+|--------|------|-------------|
+| `pg-mmf-node1` | mmf-pg-node1 | Multi-master node 1 |
+| `pg-mmf-node2` | mmf-pg-node2 | Multi-master node 2 |
+| `pg-mmf-node3` | mmf-pg-node3 | Multi-master node 3 |
+
+### Configuration
+
+| Setting | Value |
+|---------|-------|
+| `repo1-type` | `posix` (shared Docker volume) |
+| `compress-type` | `lz4` |
+| `archive-async` | `y` (with spool) |
+| `repo1-retention-full` | `2` |
+| `repo1-retention-diff` | `3` |
+| `repo1-retention-archive` | `2` |
+| `start-fast` | `y` |
+| `process-max` | `2` |
+
+### Usage
+
+```bash
+# Check backup info for all nodes
+./scripts/manage.sh backup-info
+
+# Check backup info for a specific node
+./scripts/manage.sh backup-info node1
+
+# Run a full backup on all nodes
+./scripts/manage.sh backup full
+
+# Run a differential backup on node2
+./scripts/manage.sh backup diff node2
+
+# Verify stanza + WAL archiving
+./scripts/manage.sh backup-check
+./scripts/manage.sh backup-check node3
+```
+
+### How It Works
+
+1. **Stanza creation + initial full backup** run in background after PG starts
+2. **WAL archiving** is continuous via `archive_command = 'pgbackrest --stanza=... archive-push %p'`
+3. **Shared repo volume** (`pgbackrest-repo`) is mounted on all 3 nodes at `/var/lib/pgbackrest`
+4. **Per-node spool/log volumes** keep async archive spool and logs separate
+5. **Config is generated at runtime** by `pg-entrypoint.sh` using `PGBACKREST_STANZA` env var
 
 ## Conflict Resolution
 

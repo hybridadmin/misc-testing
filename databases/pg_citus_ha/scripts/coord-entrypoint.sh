@@ -3,13 +3,78 @@
 # Coordinator Entrypoint for Citus 14.0 Distributed Cluster
 # =============================================================================
 # Starts PG with Citus, launches background cluster setup (add workers,
-# set coordinator host), and the failover monitor (VIP management).
+# set coordinator host), the failover monitor (VIP management), and
+# pgBackRest stanza creation + initial backup (primary only).
 #
 # NOTE: In production on native Linux (without Rosetta 2 emulation), you can
 # use keepalived with VRRP unicast for faster failover (~3s) and split-brain
 # protection. See keepalived/keepalived.conf.tmpl for the template.
 # =============================================================================
 set -e
+
+# pgBackRest stanza: coordinator + standby share system-id (standby is
+# pg_basebackup clone), so they share the same stanza.
+: "${PGBACKREST_STANZA:=pg-citus-coordinator}"
+PGDATA="${PGDATA:-/var/lib/postgresql/18/docker}"
+
+# ---------------------------------------------------------------------------
+# Generate per-node pgbackrest.conf
+# ---------------------------------------------------------------------------
+generate_pgbackrest_conf() {
+    local stanza="$1"
+    mkdir -p /etc/pgbackrest
+    cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-type=posix
+
+# Retention
+repo1-retention-full=2
+repo1-retention-diff=3
+repo1-retention-archive=2
+repo1-retention-archive-type=full
+
+# Performance
+process-max=2
+compress-type=lz4
+compress-level=1
+
+# Reliability
+start-fast=y
+delta=y
+resume=n
+
+# Logging
+log-level-console=warn
+log-path=/var/log/pgbackrest
+
+# Archive async
+archive-async=y
+spool-path=/var/spool/pgbackrest
+
+[global:archive-push]
+compress-level=3
+log-level-console=info
+
+[global:archive-get]
+process-max=2
+
+[${stanza}]
+pg1-path=${PGDATA}
+pg1-port=5432
+pg1-socket-path=/var/run/postgresql
+EOF
+    chown postgres:postgres /etc/pgbackrest/pgbackrest.conf
+    echo "=== [entrypoint] Generated pgbackrest.conf with stanza='${stanza}' ==="
+}
+
+# Ensure pgBackRest directories exist
+for dir in /var/lib/pgbackrest /var/log/pgbackrest /var/spool/pgbackrest; do
+    mkdir -p "$dir" 2>/dev/null || true
+    chown postgres:postgres "$dir" 2>/dev/null || true
+done
+
+generate_pgbackrest_conf "$PGBACKREST_STANZA"
 
 # ---------------------------------------------------------------------------
 # Init script: copy custom configs into PGDATA on first run
@@ -18,18 +83,30 @@ set -e
 # ---------------------------------------------------------------------------
 mkdir -p /docker-entrypoint-initdb.d
 
-cat > /docker-entrypoint-initdb.d/002-copy-configs.sh << 'CONFEOF'
+# NOTE: archive_command is injected here because it needs the per-node stanza name.
+# archive_mode=on is already in postgresql.conf but archive_command cannot be there
+# since it differs per node (different stanza names).
+cat > /docker-entrypoint-initdb.d/002-copy-configs.sh << CONFEOF
 #!/bin/bash
 set -e
 echo "=== Copying custom postgresql.conf and pg_hba.conf ==="
 if [ -f /etc/postgresql/postgresql.conf ]; then
-    cp /etc/postgresql/postgresql.conf "$PGDATA/postgresql.conf"
-    echo "Copied postgresql.conf to $PGDATA"
+    cp /etc/postgresql/postgresql.conf "\$PGDATA/postgresql.conf"
+    echo "Copied postgresql.conf to \$PGDATA"
 fi
 if [ -f /etc/postgresql/pg_hba.conf ]; then
-    cp /etc/postgresql/pg_hba.conf "$PGDATA/pg_hba.conf"
-    echo "Copied pg_hba.conf to $PGDATA"
+    cp /etc/postgresql/pg_hba.conf "\$PGDATA/pg_hba.conf"
+    echo "Copied pg_hba.conf to \$PGDATA"
 fi
+
+# Inject archive_command with the per-node stanza
+echo "=== Injecting archive_command for stanza '${PGBACKREST_STANZA}' ==="
+cat >> "\$PGDATA/postgresql.conf" <<ARCHEOF
+
+# --- pgBackRest archive command (injected by entrypoint) ---
+archive_command = 'pgbackrest --stanza=${PGBACKREST_STANZA} archive-push %p'
+ARCHEOF
+echo "archive_command injected"
 CONFEOF
 chmod +x /docker-entrypoint-initdb.d/002-copy-configs.sh
 
@@ -109,6 +186,49 @@ start_failover_monitor_bg() {
 }
 
 # ---------------------------------------------------------------------------
+# Background: pgBackRest stanza creation + initial full backup
+# Only runs on the primary coordinator (workers have their own stanzas).
+# ---------------------------------------------------------------------------
+init_pgbackrest_bg() {
+    local stanza="$PGBACKREST_STANZA"
+    (
+        # Wait for PostgreSQL to be ready
+        sleep 5
+        local max_wait=60
+        for i in $(seq 1 "$max_wait"); do
+            if pg_isready -h /var/run/postgresql -p 5432 -U "${POSTGRES_USER:-postgres}" -q 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+
+        # Wait for archive_mode=on — the docker-entrypoint runs initdb.d scripts
+        # then restarts PG, so archive_mode isn't visible until after that restart.
+        echo "=== [pgbackrest] Waiting for archive_mode=on ==="
+        for i in $(seq 1 60); do
+            local am
+            am=$(gosu postgres psql -h /var/run/postgresql -U "${POSTGRES_USER:-postgres}" -d postgres -tAc "SHOW archive_mode;" 2>/dev/null) || am=""
+            if [ "$am" = "on" ]; then
+                echo "=== [pgbackrest] archive_mode=on confirmed ==="
+                break
+            fi
+            sleep 2
+        done
+
+        echo "=== [pgbackrest] Initializing stanza '${stanza}' ==="
+        gosu postgres pgbackrest --stanza="$stanza" stanza-create 2>&1 || echo "=== [pgbackrest] WARN: stanza-create failed (may already exist) ==="
+
+        echo "=== [pgbackrest] Running check ==="
+        gosu postgres pgbackrest --stanza="$stanza" check 2>&1 || echo "=== [pgbackrest] WARN: check failed ==="
+
+        echo "=== [pgbackrest] Creating initial full backup (background) ==="
+        gosu postgres pgbackrest --stanza="$stanza" --type=full backup > /var/log/pgbackrest/initial-backup.log 2>&1 || echo "=== [pgbackrest] WARN: initial backup failed ==="
+
+        echo "=== [pgbackrest] Initialization complete (stanza='${stanza}') ==="
+    ) > /tmp/pgbackrest-init.log 2>&1 &
+}
+
+# ---------------------------------------------------------------------------
 # Forward signals to PG process for clean shutdown
 # ---------------------------------------------------------------------------
 forward_signal() {
@@ -130,6 +250,7 @@ PG_PID=$!
 # Start background tasks — both are children of this shell, NOT of postgres
 if [ "${IS_COORDINATOR_PRIMARY:-false}" = "true" ]; then
     start_cluster_setup_bg
+    init_pgbackrest_bg
 fi
 start_failover_monitor_bg
 

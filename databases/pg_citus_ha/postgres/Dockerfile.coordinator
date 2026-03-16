@@ -1,6 +1,9 @@
 FROM citusdata/citus:latest
 
-# Install utilities for coordinator HA
+# Install utilities for coordinator HA + pgBackRest for backup/archiving.
+# pgBackRest >= 2.55 is required for PG18 support. The Citus image is based
+# on the official postgres image (Debian), so we add the PGDG apt repo.
+#
 # NOTE: keepalived is installed but NOT used by default — VRRP raw sockets
 # fail under Rosetta 2 emulation on Apple Silicon. The failover-monitor.sh
 # script handles VIP failover instead. In production on native Linux, you
@@ -12,7 +15,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     jq \
     gosu \
+    lsb-release \
+    gnupg \
+    && sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list' \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends pgbackrest \
     && rm -rf /var/lib/apt/lists/*
+
+# pgBackRest directories (shared repo mounted at runtime, spool + log per-node)
+RUN mkdir -p /var/lib/pgbackrest /var/log/pgbackrest /var/spool/pgbackrest /etc/pgbackrest \
+    && chown -R postgres:postgres /var/lib/pgbackrest /var/log/pgbackrest /var/spool/pgbackrest /etc/pgbackrest
 
 # Custom scripts
 COPY scripts/coord-entrypoint.sh /usr/local/bin/coord-entrypoint.sh

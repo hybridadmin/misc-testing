@@ -137,7 +137,8 @@ When two nodes update the same row concurrently, the later commit timestamp wins
 | `status` | Cluster overview: nodes, pglogical, keepalived VIP, Valkey |
 | `vip` | Show keepalived VIP status (which node holds VIP) |
 | `replication` | Detailed pglogical info: nodes, subscriptions, replication sets |
-| `test` | Full test: DDL + DML replication + VIP connectivity |
+| `test` | Integration tests: replication, VIP, Valkey, pgBackRest (13 tests) |
+| `test-multimaster` | Multi-master replication stress test |
 | `ddl "SQL"` | Execute DDL via `pglogical.replicate_ddl_command()` |
 | `ddl -f file.sql` | Execute DDL from file |
 | `conflicts` | Show subscription statuses, conflict resolution mode, lag |
@@ -146,6 +147,9 @@ When two nodes update the same row concurrently, the later commit timestamp wins
 | `psql [port]` | Connect via psql (5741-5743=direct) |
 | `valkey-cli` | Connect to Valkey CLI |
 | `logs [service]` | Tail Docker logs |
+| `backup [full\|diff\|incr] [node]` | Run pgBackRest backup (default: full, all nodes) |
+| `backup-info [node]` | Show pgBackRest backup info |
+| `backup-check [node]` | Verify stanza + WAL archiving |
 | `bench [scale]` | Run pgbench benchmark (default scale=10) |
 
 ## Ports
@@ -411,6 +415,59 @@ docker exec mmk-pg-node1 cat /etc/keepalived/keepalived.conf
 # Connect directly to a node
 ./scripts/manage.sh psql 5741
 ```
+
+## Backup & Recovery (pgBackRest)
+
+Each PG node has its own pgBackRest stanza because each is an independent `initdb` (different system-id). WAL archiving runs continuously via `archive_command`.
+
+### Stanzas
+
+| Stanza | Node | Description |
+|--------|------|-------------|
+| `pg-mmk-node1` | mmk-pg-node1 | pglogical multi-master node 1 |
+| `pg-mmk-node2` | mmk-pg-node2 | pglogical multi-master node 2 |
+| `pg-mmk-node3` | mmk-pg-node3 | pglogical multi-master node 3 |
+
+### Configuration
+
+| Setting | Value |
+|---------|-------|
+| `repo1-type` | `posix` (shared Docker volume) |
+| `compress-type` | `lz4` |
+| `archive-async` | `y` (with spool) |
+| `repo1-retention-full` | `2` |
+| `repo1-retention-diff` | `3` |
+| `repo1-retention-archive` | `2` |
+| `start-fast` | `y` |
+| `process-max` | `2` |
+
+### Usage
+
+```bash
+# Check backup info for all nodes
+./scripts/manage.sh backup-info
+
+# Check backup info for a specific node
+./scripts/manage.sh backup-info node1
+
+# Run a full backup on all nodes
+./scripts/manage.sh backup full
+
+# Run a differential backup on node2
+./scripts/manage.sh backup diff node2
+
+# Verify stanza + WAL archiving
+./scripts/manage.sh backup-check
+./scripts/manage.sh backup-check node3
+```
+
+### How It Works
+
+1. **Stanza creation + initial full backup** run in background after PG starts
+2. **WAL archiving** is continuous via `archive_command = 'pgbackrest --stanza=... archive-push %p'`
+3. **Shared repo volume** (`pgbackrest-repo`) is mounted on all 3 nodes at `/var/lib/pgbackrest`
+4. **Per-node spool/log volumes** keep async archive spool and logs separate
+5. **Config is generated at runtime** by `pg-entrypoint.sh` using `PGBACKREST_STANZA` env var
 
 ## Teardown
 

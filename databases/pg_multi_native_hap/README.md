@@ -79,8 +79,11 @@ docker compose up -d --build
 # Check status
 ./scripts/manage.sh status
 
-# Run the replication test (INSERT/UPDATE/DELETE across all nodes)
+# Run integration tests (13 tests: replication + pgBackRest)
 ./scripts/manage.sh test
+
+# Run detailed multi-master replication test (INSERT/UPDATE/DELETE across all nodes)
+./scripts/manage.sh test-multimaster
 
 # Run benchmarks
 ./scripts/manage.sh bench
@@ -129,7 +132,8 @@ The `ddl` command automatically refreshes all subscriptions when tables are crea
 |---------|-------------|
 | `status` | Cluster overview: node health, pub/sub counts, replication lag |
 | `replication` | Detailed publication and subscription info per node |
-| `test` | Full replication test: INSERT/UPDATE/DELETE across all nodes |
+| `test` | Integration tests: replication + pgBackRest (13 tests) |
+| `test-multimaster` | Detailed multi-master replication test (INSERT/UPDATE/DELETE) |
 | `ddl "SQL"` | Execute DDL on ALL nodes (canary test on node1 first) |
 | `ddl -f file.sql` | Execute DDL from file on ALL nodes |
 | `conflicts` | Show conflict stats, disabled subs, apply errors per node |
@@ -138,6 +142,9 @@ The `ddl` command automatically refreshes all subscriptions when tables are crea
 | `repair skip <node>` | Skip stuck errored transaction and re-enable |
 | `repair resync <node>` | Drop + recreate subscriptions (full data resync) |
 | `repair reset-stats` | Reset conflict counters to zero |
+| `backup [type] [node]` | Run pgBackRest backup (full/diff/incr, default: full all) |
+| `backup-info [node]` | Show pgBackRest backup info (default: all nodes) |
+| `backup-check [node]` | Verify pgBackRest stanza + WAL archiving |
 | `psql [port]` | Connect via psql (5432=write, 5433=read, 5441-5443=direct) |
 | `valkey-cli` | Connect to Valkey CLI |
 | `logs [service]` | Tail Docker logs |
@@ -264,6 +271,59 @@ When subscriptions are disabled (manually or by `disable_on_error`), WAL from pe
 ./scripts/manage.sh repair resync <node>  # drops + recreates subscriptions
 ```
 
+## Backup & Recovery (pgBackRest)
+
+Each PG node has its own pgBackRest stanza because each is an independent `initdb` (different system-id). WAL archiving runs continuously via `archive_command`.
+
+### Stanzas
+
+| Stanza | Node | Description |
+|--------|------|-------------|
+| `pg-mm-node1` | mm-pg-node1 | Multi-master node 1 |
+| `pg-mm-node2` | mm-pg-node2 | Multi-master node 2 |
+| `pg-mm-node3` | mm-pg-node3 | Multi-master node 3 |
+
+### Configuration
+
+| Setting | Value |
+|---------|-------|
+| `repo1-type` | `posix` (shared Docker volume) |
+| `compress-type` | `lz4` |
+| `archive-async` | `y` (with spool) |
+| `repo1-retention-full` | `2` |
+| `repo1-retention-diff` | `3` |
+| `repo1-retention-archive` | `2` |
+| `start-fast` | `y` |
+| `process-max` | `2` |
+
+### Usage
+
+```bash
+# Check backup info for all nodes
+./scripts/manage.sh backup-info
+
+# Check backup info for a specific node
+./scripts/manage.sh backup-info node1
+
+# Run a full backup on all nodes
+./scripts/manage.sh backup full
+
+# Run a differential backup on node2
+./scripts/manage.sh backup diff node2
+
+# Verify stanza + WAL archiving
+./scripts/manage.sh backup-check
+./scripts/manage.sh backup-check node3
+```
+
+### How It Works
+
+1. **Stanza creation + initial full backup** run in background after PG starts
+2. **WAL archiving** is continuous via `archive_command = 'pgbackrest --stanza=... archive-push %p'`
+3. **Shared repo volume** (`pgbackrest-repo`) is mounted on all 3 nodes at `/var/lib/pgbackrest`
+4. **Per-node spool/log volumes** keep async archive spool and logs separate
+5. **Config is generated at runtime** by `pg-entrypoint.sh` using `PGBACKREST_STANZA` env var
+
 ## Configuration
 
 Environment variables in `.env`:
@@ -272,6 +332,7 @@ Environment variables in `.env`:
 - `POSTGRES_DB` — Database name (default: `appdb`)
 - `VALKEY_PASSWORD` — Valkey authentication password
 - `HAPROXY_WRITE_PORT` / `HAPROXY_READ_PORT` — HAProxy ports
+- `BACKUP_STANZA_NODE1/2/3` — pgBackRest stanza names per node
 - `SUBNET` — Docker network subnet
 
 PostgreSQL tuning in `postgres/postgresql.conf` is sized for a 2GB Docker VM:
@@ -279,5 +340,6 @@ PostgreSQL tuning in `postgres/postgresql.conf` is sized for a 2GB Docker VM:
 - `effective_cache_size = 768MB`
 - `work_mem = 4MB`
 - `wal_level = logical` (required for logical replication)
+- `archive_mode = on` (WAL archiving for pgBackRest)
 - `max_logical_replication_workers = 10`
 - `track_commit_timestamp = on` (enables conflict detection)

@@ -5,8 +5,49 @@
 #   1. Custom postgresql.conf and pg_hba.conf
 #   2. Post-init hook to create replication user and appdb
 #   3. Background replication setup after PG is fully up
+#   4. pgBackRest configuration and background initialization
 # =============================================================================
 set -e
+
+# ---------------------------------------------------------------------------
+# pgBackRest configuration generator (called at container start)
+# Each node has its own stanza because each is an independent initdb.
+# ---------------------------------------------------------------------------
+generate_pgbackrest_conf() {
+    local stanza="${PGBACKREST_STANZA:-pg-mmf-node}"
+    local pgdata="${PGDATA:-/var/lib/postgresql/18/docker}"
+
+    cat > /etc/pgbackrest/pgbackrest.conf <<PGBR_EOF
+[${stanza}]
+pg1-path=${pgdata}
+pg1-port=5432
+pg1-socket-path=/var/run/postgresql
+
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-type=posix
+repo1-retention-full=2
+repo1-retention-diff=3
+repo1-retention-archive=2
+compress-type=lz4
+compress-level=1
+archive-async=y
+spool-path=/var/spool/pgbackrest
+start-fast=y
+process-max=2
+log-level-console=warn
+log-path=/var/log/pgbackrest
+
+[global:archive-push]
+compress-level=3
+log-level-console=info
+PGBR_EOF
+    chown postgres:postgres /etc/pgbackrest/pgbackrest.conf
+    echo "=== [pgbackrest] Generated config for stanza '${stanza}' ==="
+}
+
+# Generate pgBackRest config early (before PG starts)
+generate_pgbackrest_conf
 
 # ---------------------------------------------------------------------------
 # Post-init script: runs once after initdb (first boot only)
@@ -52,6 +93,105 @@ if [ -f /etc/postgresql/pg_hba.conf ]; then
 fi
 CONFEOF
 chmod +x /docker-entrypoint-initdb.d/01-copy-configs.sh
+
+# ---------------------------------------------------------------------------
+# Inject archive_command into PGDATA after initdb (per-node stanza)
+# We use an initdb.d script so it runs after configs are copied.
+# ---------------------------------------------------------------------------
+STANZA="${PGBACKREST_STANZA:-pg-mmf-node}"
+cat > /docker-entrypoint-initdb.d/02-inject-archive-command.sh << ARCHEOF
+#!/bin/bash
+set -e
+echo "=== Injecting archive_command for stanza '${STANZA}' ==="
+cat >> "\$PGDATA/postgresql.conf" <<'PGCONF'
+
+# --- pgBackRest archive commands (injected by entrypoint) ---
+archive_command = 'pgbackrest --stanza=${STANZA} archive-push %p'
+restore_command = 'pgbackrest --stanza=${STANZA} archive-get %f "%p"'
+PGCONF
+echo "archive_command set to: pgbackrest --stanza=${STANZA} archive-push %p"
+ARCHEOF
+chmod +x /docker-entrypoint-initdb.d/02-inject-archive-command.sh
+
+# ---------------------------------------------------------------------------
+# pgBackRest background initialization: stanza-create + full backup
+# Runs in background after PG is fully up with archive_mode=on.
+# ---------------------------------------------------------------------------
+init_pgbackrest_bg() {
+    nohup setsid bash -c '
+        trap "exit 0" ERR EXIT
+
+        STANZA="'"${STANZA}"'"
+        PGDATA="'"${PGDATA:-/var/lib/postgresql/18/docker}"'"
+
+        echo "=== [pgbackrest] Waiting for PG to be ready ==="
+        attempts=0
+        while ! pg_isready -h /var/run/postgresql -U "${POSTGRES_USER:-postgres}" 2>/dev/null; do
+            attempts=$((attempts + 1))
+            if [ "$attempts" -ge 90 ]; then
+                echo "=== [pgbackrest] ERROR: PG not ready after 180s, giving up ==="
+                exit 0
+            fi
+            sleep 2
+        done
+
+        # Wait for archive_mode=on to be effective (initdb.d scripts may trigger restart)
+        echo "=== [pgbackrest] Waiting for archive_mode=on ==="
+        am_attempts=0
+        while true; do
+            am=$(PGPASSWORD="${POSTGRES_PASSWORD}" psql -h /var/run/postgresql -U "${POSTGRES_USER:-postgres}" -d postgres -tAc "SHOW archive_mode;" 2>/dev/null || echo "")
+            if [ "$am" = "on" ]; then
+                echo "=== [pgbackrest] archive_mode=on confirmed ==="
+                break
+            fi
+            am_attempts=$((am_attempts + 1))
+            if [ "$am_attempts" -ge 60 ]; then
+                echo "=== [pgbackrest] WARNING: archive_mode not on after 120s, proceeding anyway ==="
+                break
+            fi
+            sleep 2
+        done
+
+        # Wait for archive_command to be set
+        echo "=== [pgbackrest] Waiting for archive_command ==="
+        ac_attempts=0
+        while true; do
+            ac=$(PGPASSWORD="${POSTGRES_PASSWORD}" psql -h /var/run/postgresql -U "${POSTGRES_USER:-postgres}" -d postgres -tAc "SHOW archive_command;" 2>/dev/null || echo "")
+            if echo "$ac" | grep -q "pgbackrest"; then
+                echo "=== [pgbackrest] archive_command confirmed: $ac ==="
+                break
+            fi
+            ac_attempts=$((ac_attempts + 1))
+            if [ "$ac_attempts" -ge 60 ]; then
+                echo "=== [pgbackrest] WARNING: archive_command not set after 120s, proceeding anyway ==="
+                break
+            fi
+            sleep 2
+        done
+
+        # Create stanza
+        echo "=== [pgbackrest] Creating stanza ${STANZA} ==="
+        if gosu postgres pgbackrest --stanza="$STANZA" stanza-create 2>&1; then
+            echo "=== [pgbackrest] Stanza ${STANZA} created ==="
+        else
+            echo "=== [pgbackrest] WARNING: stanza-create returned non-zero (may already exist) ==="
+        fi
+
+        # Run initial full backup
+        echo "=== [pgbackrest] Running initial full backup for ${STANZA} ==="
+        if gosu postgres pgbackrest --stanza="$STANZA" --type=full backup 2>&1; then
+            echo "=== [pgbackrest] Initial full backup complete for ${STANZA} ==="
+        else
+            echo "=== [pgbackrest] WARNING: full backup returned non-zero ==="
+        fi
+
+        echo "=== [pgbackrest] Background init complete ==="
+    ' > /tmp/pgbackrest-init.log 2>&1 &
+    disown
+}
+
+# Start pgBackRest init in background
+init_pgbackrest_bg
 
 # ---------------------------------------------------------------------------
 # Replication setup: launched as a DETACHED background process

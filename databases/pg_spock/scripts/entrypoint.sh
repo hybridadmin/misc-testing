@@ -69,13 +69,11 @@ compress-level=1
 
 # Reliability
 start-fast=y
-stop-auto=y
 delta=y
 resume=n
 
 # Logging
-log-level-console=info
-log-level-file=detail
+log-level-console=warn
 log-path=/var/log/pgbackrest
 
 # Archive async
@@ -84,6 +82,7 @@ spool-path=/var/spool/pgbackrest
 
 [global:archive-push]
 compress-level=3
+log-level-console=info
 
 [global:archive-get]
 process-max=2
