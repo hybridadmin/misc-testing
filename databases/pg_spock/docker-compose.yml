@@ -34,6 +34,8 @@ services:
       <<: *pg-env
       NODE_ROLE: primary
       NODE_NAME: node1
+      PGBACKREST_STANZA: pg-spock-node1
+      REPLICA_SLOT_NAME: repl_slot_node3
     ports:
       - "${PG_NODE1_PORT:-15432}:5432"
     volumes:
@@ -60,6 +62,8 @@ services:
       <<: *pg-env
       NODE_ROLE: primary
       NODE_NAME: node2
+      PGBACKREST_STANZA: pg-spock-node2
+      REPLICA_SLOT_NAME: repl_slot_node4
     ports:
       - "${PG_NODE2_PORT:-15433}:5432"
     volumes:
@@ -87,6 +91,8 @@ services:
       NODE_ROLE: replica
       NODE_NAME: node3
       REPLICA_PRIMARY_HOST: node1
+      REPLICA_SLOT_NAME: repl_slot_node3
+      PGBACKREST_STANZA: pg-spock-node1
     ports:
       - "${PG_NODE3_PORT:-15434}:5432"
     volumes:
@@ -117,6 +123,8 @@ services:
       NODE_ROLE: replica
       NODE_NAME: node4
       REPLICA_PRIMARY_HOST: node2
+      REPLICA_SLOT_NAME: repl_slot_node4
+      PGBACKREST_STANZA: pg-spock-node2
     ports:
       - "${PG_NODE4_PORT:-15435}:5432"
     volumes:

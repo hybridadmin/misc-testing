@@ -23,7 +23,13 @@ set -euo pipefail
 : "${NODE_ROLE:=primary}"
 : "${NODE_NAME:=node1}"
 : "${REPLICA_PRIMARY_HOST:=}"
+: "${REPLICA_SLOT_NAME:=}"
 : "${PGDATA:=/var/lib/postgresql/data}"
+
+# pgBackRest stanza: each independent PG cluster (unique system-id) needs its own stanza.
+# node1+node3 share a system-id (node3 is pg_basebackup of node1) -> pg-spock-node1
+# node2+node4 share a system-id (node4 is pg_basebackup of node2) -> pg-spock-node2
+: "${PGBACKREST_STANZA:=pg-spock-${NODE_NAME}}"
 
 log() { echo "[entrypoint:${NODE_NAME}] $*"; }
 
@@ -38,6 +44,61 @@ for dir in /var/lib/pgbackrest /var/log/pgbackrest /var/spool/pgbackrest; do
     mkdir -p "$dir" 2>/dev/null || true
     chown postgres:postgres "$dir" 2>/dev/null || true
 done
+
+# --- Generate per-node pgbackrest.conf ---
+# Each independent PG instance (different system-id) MUST have its own stanza.
+# node1 & node3 share system-id -> stanza pg-spock-node1
+# node2 & node4 share system-id -> stanza pg-spock-node2
+generate_pgbackrest_conf() {
+  local stanza="$1"
+  cat > /etc/pgbackrest/pgbackrest.conf <<EOF
+[global]
+repo1-path=/var/lib/pgbackrest
+repo1-type=posix
+
+# Retention
+repo1-retention-full=2
+repo1-retention-diff=3
+repo1-retention-archive=2
+repo1-retention-archive-type=full
+
+# Performance
+process-max=2
+compress-type=lz4
+compress-level=1
+
+# Reliability
+start-fast=y
+stop-auto=y
+delta=y
+resume=n
+
+# Logging
+log-level-console=info
+log-level-file=detail
+log-path=/var/log/pgbackrest
+
+# Archive async
+archive-async=y
+spool-path=/var/spool/pgbackrest
+
+[global:archive-push]
+compress-level=3
+
+[global:archive-get]
+process-max=2
+
+[${stanza}]
+pg1-path=${PGDATA}
+pg1-port=5432
+pg1-socket-path=/var/run/postgresql
+EOF
+  chown postgres:postgres /etc/pgbackrest/pgbackrest.conf
+  log "Generated pgbackrest.conf with stanza='${stanza}'"
+}
+
+mkdir -p /etc/pgbackrest
+generate_pgbackrest_conf "$PGBACKREST_STANZA"
 
 # --- Helper: wait for PG to accept connections ---
 wait_for_pg() {
@@ -71,7 +132,8 @@ init_primary() {
     --data-checksums
 
   # --- postgresql.conf (autobase-style tuning) ---
-  cat >> "$PGDATA/postgresql.conf" <<-'CONF'
+  # NOTE: archive_command uses the per-node stanza (variable interpolation required)
+  cat >> "$PGDATA/postgresql.conf" <<CONF
 
 # =============================================================================
 # Spock / Replication (required for multi-master + streaming replicas)
@@ -121,7 +183,7 @@ checkpoint_completion_target = 0.9
 checkpoint_timeout = '10min'
 archive_mode = on
 archive_timeout = 300
-archive_command = 'pgbackrest --stanza=pg-spock archive-push %p'
+archive_command = 'pgbackrest --stanza=${PGBACKREST_STANZA} archive-push %p'
 
 # =============================================================================
 # Query Planner (SSD-optimized, autobase defaults)
@@ -219,6 +281,16 @@ SQL
     CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 SQL
 
+  # Create a physical replication slot for the streaming replica.
+  # This prevents the primary from recycling WAL segments before the replica
+  # has consumed them, and silences the spock_failover_slots
+  # "primary_slot_name is not set" error on the replica side.
+  if [ -n "${REPLICA_SLOT_NAME:-}" ]; then
+    log "Creating physical replication slot '${REPLICA_SLOT_NAME}'..."
+    gosu postgres psql -v ON_ERROR_STOP=1 -c \
+      "SELECT pg_create_physical_replication_slot('${REPLICA_SLOT_NAME}');" || true
+  fi
+
   # Run any init scripts
   for f in /docker-entrypoint-initdb.d/*; do
     [ -e "$f" ] || continue
@@ -260,8 +332,19 @@ init_replica() {
 # === Replica overrides ===
 hot_standby = on
 primary_conninfo = 'host=${REPLICA_PRIMARY_HOST} port=5432 user=${POSTGRES_USER} password=${POSTGRES_PASSWORD}'
-restore_command = 'pgbackrest --stanza=pg-spock archive-get %f "%p"'
+restore_command = 'pgbackrest --stanza=${PGBACKREST_STANZA} archive-get %f "%p"'
+
+# Spock failover slot synchronization: spock_failover_slots worker uses this DSN
+# to connect to the primary for slot position sync. Without it, the worker tries
+# to connect without a password, causing recurring FATAL auth errors in primary logs.
+spock.primary_dsn = 'host=${REPLICA_PRIMARY_HOST} port=5432 dbname=${POSTGRES_DB} user=${POSTGRES_USER} password=${POSTGRES_PASSWORD}'
 CONF
+
+  # Set primary_slot_name if a dedicated replication slot was created on the primary.
+  # This also silences the spock_failover_slots "primary_slot_name is not set" error.
+  if [ -n "${REPLICA_SLOT_NAME:-}" ]; then
+    echo "primary_slot_name = '${REPLICA_SLOT_NAME}'" >> "$PGDATA/postgresql.conf"
+  fi
 
   # Inject node name into log_line_prefix
   echo "log_line_prefix = '[${NODE_NAME}] %t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '" >> "$PGDATA/postgresql.conf"
@@ -271,8 +354,10 @@ CONF
 
 # =============================================================================
 # pgBackRest init (runs in background after PG is fully up, primaries only)
+# Each primary creates its own stanza (different system-ids from separate initdb).
 # =============================================================================
 init_pgbackrest_bg() {
+  local stanza="$PGBACKREST_STANZA"
   (
     # Wait for PostgreSQL to be ready
     sleep 3
@@ -284,16 +369,16 @@ init_pgbackrest_bg() {
       sleep 1
     done
 
-    log "Initializing pgBackRest stanza 'pg-spock'..."
-    gosu postgres pgbackrest --stanza=pg-spock stanza-create 2>&1 || log "WARN: pgbackrest stanza-create failed (may already exist)"
+    log "Initializing pgBackRest stanza '${stanza}'..."
+    gosu postgres pgbackrest --stanza="$stanza" stanza-create 2>&1 || log "WARN: pgbackrest stanza-create failed (may already exist)"
 
     log "Running pgBackRest check..."
-    gosu postgres pgbackrest --stanza=pg-spock check 2>&1 || log "WARN: pgbackrest check failed"
+    gosu postgres pgbackrest --stanza="$stanza" check 2>&1 || log "WARN: pgbackrest check failed"
 
-    log "Creating initial full backup (background)..."
-    gosu postgres pgbackrest --stanza=pg-spock --type=full backup > /var/log/pgbackrest/initial-backup.log 2>&1 || log "WARN: initial backup failed"
+    log "Creating initial full backup for stanza '${stanza}' (background)..."
+    gosu postgres pgbackrest --stanza="$stanza" --type=full backup > /var/log/pgbackrest/initial-backup.log 2>&1 || log "WARN: initial backup failed"
 
-    log "pgBackRest initialization complete"
+    log "pgBackRest initialization complete (stanza='${stanza}')"
   ) &
 }
 
@@ -303,11 +388,9 @@ init_pgbackrest_bg() {
 case "$NODE_ROLE" in
   primary)
     init_primary
-    # Start pgBackRest stanza init + initial backup in background after PG starts
-    # Only node1 creates the stanza and initial backup (shared repo, avoid race)
-    if [ "$NODE_NAME" = "node1" ]; then
-      init_pgbackrest_bg
-    fi
+    # Both primaries create their own pgBackRest stanza + initial backup.
+    # Each has a unique system-id from independent initdb, so each needs its own stanza.
+    init_pgbackrest_bg
     ;;
   replica)
     init_replica

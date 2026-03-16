@@ -64,7 +64,7 @@ docker compose up -d
 # Check cluster status
 ./scripts/manage.sh status
 
-# Run integration tests (23 tests)
+# Run integration tests (26 tests)
 ./scripts/manage.sh test
 
 # Run pgbench benchmarks
@@ -130,11 +130,11 @@ Setup:
 
 Backup (pgBackRest):
   backup [type] [node]  Run backup (type: full|diff|incr, default: diff, node: node1|node2)
-  backup-info [node]    Show backup inventory
+  backup-info [node]    Show backup inventory (node resolves to correct stanza)
   backup-check [node]   Verify stanza and WAL archiving
 
 Test & Benchmark:
-  test                Run integration tests (23 tests)
+  test                Run integration tests (26 tests)
   bench               Run pgbench benchmarks (TPC-B + SELECT-only)
 ```
 
@@ -289,7 +289,7 @@ Run tests with:
 ./scripts/manage.sh test
 ```
 
-23 tests covering:
+26 tests covering:
 
 | # | Test | What it verifies |
 |---|------|-----------------|
@@ -313,9 +313,12 @@ Run tests with:
 | 18 | Autovacuum scale factor = 0.01 | Aggressive autovacuum (autobase) |
 | 19 | SSD planner: random_page_cost = 1.1 | SSD-optimized query planner |
 | 20 | Bulk writes via HAProxy R/W | 100-row bulk insert through proxy |
-| 21 | pgBackRest stanza exists | Backup stanza configured and accessible |
+| 21 | pgBackRest stanza exists (node1) | `pg-spock-node1` stanza configured and accessible |
 | 22 | WAL archiving enabled | archive_mode=on for continuous archiving |
-| 23 | pgBackRest has at least one backup | Initial full backup completed |
+| 23 | pgBackRest has backup (node1) | Initial full backup completed on node1 |
+| 24 | pgBackRest stanza exists (node2) | `pg-spock-node2` stanza configured and accessible |
+| 25 | pgBackRest has backup (node2) | Initial full backup completed on node2 |
+| 26 | Physical replication slots active | `repl_slot_node3` and `repl_slot_node4` are active |
 
 ## File Structure
 
@@ -329,7 +332,7 @@ pg_spock/
 ├── haproxy.cfg                   # R/W :5000 + RO :5001 + stats :7000
 ├── README.md                     # This file
 ├── pgbackrest/
-│   └── pgbackrest.conf           # pgBackRest config (POSIX repo, lz4, async archiving)
+│   └── pgbackrest.conf           # pgBackRest reference config (actual configs generated per-node by entrypoint)
 └── scripts/
     ├── entrypoint.sh             # Container entrypoint (primary init or replica basebackup)
     ├── setup-spock.sh            # Post-startup Spock configuration
@@ -342,7 +345,7 @@ pg_spock/
 |-----------|-------|-------|
 | PostgreSQL 18.3 | Built from source (`debian:bookworm-slim`) | Patched with 5 Spock patches |
 | Spock v5.0.6 | Built from source (PGXS) | Compiled against patched PG 18 |
-| pgBackRest 2.45 | `apt-get install pgbackrest` | From Debian bookworm repos |
+| pgBackRest 2.58 | PGDG apt repo (`apt.postgresql.org`) | Required for PG 18 support (Debian bookworm default 2.45 fails) |
 | HAProxy | `haproxy:3.1-alpine` | Native ARM64 |
 
 The Dockerfile uses a multi-stage build:
@@ -353,11 +356,38 @@ The Dockerfile uses a multi-stage build:
 
 Both primaries and all replicas have pgBackRest installed. WAL archiving is continuous via `archive_command`, and backups are stored in a shared Docker volume (`pgbackrest-repo`).
 
+### Multi-Stanza Architecture
+
+Because node1 and node2 are independently initialized (`initdb` creates a unique system-id per instance), pgBackRest requires **separate stanzas** for each primary+replica pair:
+
+| Stanza | Nodes | Notes |
+|--------|-------|-------|
+| `pg-spock-node1` | node1 (primary) + node3 (replica) | Share same system-id (node3 cloned via pg_basebackup) |
+| `pg-spock-node2` | node2 (primary) + node4 (replica) | Share same system-id (node4 cloned via pg_basebackup) |
+
+Both stanzas coexist in the same shared repository volume. The entrypoint dynamically generates a per-node `/etc/pgbackrest/pgbackrest.conf` at startup with the correct stanza name.
+
+### Physical Replication Slots
+
+Each primary creates a named physical replication slot for its streaming replica (`repl_slot_node3` on node1, `repl_slot_node4` on node2). This:
+- Prevents the primary from recycling WAL segments before the replica consumes them
+- Works with `spock_failover_slots` to synchronize logical replication slots to replicas
+
+### Spock Failover Slots on Replicas
+
+Spock ships a background worker (`spock_failover_slots`) that runs on streaming replicas. It connects back to the primary to synchronize logical replication slot positions — useful for promoting a replica to primary without losing replication state.
+
+This worker requires two settings on each replica:
+- **`primary_slot_name`**: The physical replication slot assigned to this replica on the primary.
+- **`spock.primary_dsn`**: A full connection string (including password) that the worker uses to connect to the primary. Without this, the worker constructs a connection without credentials, causing recurring `FATAL: password authentication failed` errors in primary logs every 60 seconds.
+
+Both settings are configured automatically by the entrypoint script during replica initialization.
+
 ### Configuration
 
 | Setting | Value | Notes |
 |---------|-------|-------|
-| Stanza | `pg-spock` | Matches cluster name |
+| Stanzas | `pg-spock-node1`, `pg-spock-node2` | One per independent system-id |
 | Repo type | POSIX (local) | Shared Docker volume at `/var/lib/pgbackrest` |
 | Compression | lz4 (level 1) | Fast, low CPU; level 3 for archive-push |
 | Archiving | Async | Spool at `/var/spool/pgbackrest` |
@@ -385,9 +415,11 @@ Both primaries and all replicas have pgBackRest installed. WAL archiving is cont
 
 Backups can target either primary: `./scripts/manage.sh backup full node2`
 
+The `node` argument automatically resolves to the correct stanza (`pg-spock-node1` or `pg-spock-node2`).
+
 ### Initial Setup
 
-The stanza is created automatically during primary initialization. The first full backup runs in the background after `initdb`. Subsequent backups are manual via `manage.sh`.
+Stanzas are created automatically during primary initialization. **Both** primaries (node1 and node2) independently create their own stanza and run an initial full backup in the background after `initdb`. Subsequent backups are manual via `manage.sh`.
 
 ### Shared Backup Volume
 

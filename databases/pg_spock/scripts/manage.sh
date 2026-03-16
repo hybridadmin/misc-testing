@@ -43,8 +43,19 @@ NODE2_PORT="${PG_NODE2_PORT:-15433}"
 NODE3_PORT="${PG_NODE3_PORT:-15434}"
 NODE4_PORT="${PG_NODE4_PORT:-15435}"
 
-# pgBackRest
-STANZA="${PGBACKREST_STANZA:-pg-spock}"
+# pgBackRest — per-node stanzas (each primary has unique system-id from independent initdb)
+STANZA_NODE1="pg-spock-node1"
+STANZA_NODE2="pg-spock-node2"
+
+# Helper: resolve stanza name for a given node
+stanza_for() {
+    local node="$1"
+    case "$node" in
+        node1|node3) echo "$STANZA_NODE1" ;;
+        node2|node4) echo "$STANZA_NODE2" ;;
+        *) echo "$STANZA_NODE1" ;;
+    esac
+}
 
 # --- SQL helpers ---
 run_sql() {
@@ -418,13 +429,13 @@ cmd_test() {
     bulk_count=$(run_sql_on "$NODE1_PORT" "SELECT count(*) FROM _test_spock WHERE val LIKE 'bulk_%'")
     [ "${bulk_count:-0}" -eq 100 ] && pass || fail "Expected 100 rows, got ${bulk_count:-0}"
 
-    # --- Test 21: pgBackRest stanza exists ---
-    run_test "pgBackRest stanza exists on node1"
+    # --- Test 21: pgBackRest stanza exists on node1 ---
+    run_test "pgBackRest stanza exists on node1 (pg-spock-node1)"
     local stanza_json
-    stanza_json=$(docker exec -u postgres spock-node1 pgbackrest --stanza="$STANZA" --output=json info 2>/dev/null) || stanza_json=""
+    stanza_json=$(docker exec -u postgres spock-node1 pgbackrest --stanza="$STANZA_NODE1" --output=json info 2>/dev/null) || stanza_json=""
     local stanza_name
     stanza_name=$(echo "$stanza_json" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
-    [ "$stanza_name" = "$STANZA" ] && pass || fail "stanza not found (got: $stanza_name)"
+    [ "$stanza_name" = "$STANZA_NODE1" ] && pass || fail "stanza not found (got: $stanza_name)"
 
     # --- Test 22: WAL archiving is enabled ---
     run_test "WAL archiving enabled (archive_mode=on)"
@@ -432,12 +443,34 @@ cmd_test() {
     archive_mode=$(run_sql_on "$NODE1_PORT" "SHOW archive_mode")
     [ "$archive_mode" = "on" ] && pass || fail "archive_mode=$archive_mode"
 
-    # --- Test 23: pgBackRest has at least one backup ---
-    run_test "pgBackRest has at least one backup"
+    # --- Test 23: pgBackRest has at least one backup on node1 ---
+    run_test "pgBackRest has at least one backup (node1)"
     local backup_count
-    backup_count=$(docker exec -u postgres spock-node1 pgbackrest --stanza="$STANZA" --output=json info 2>/dev/null \
+    backup_count=$(docker exec -u postgres spock-node1 pgbackrest --stanza="$STANZA_NODE1" --output=json info 2>/dev/null \
         | grep -o '"label"' | wc -l | tr -d ' ') || backup_count=0
     [ "${backup_count:-0}" -ge 1 ] && pass || fail "No backups found (count=$backup_count)"
+
+    # --- Test 24: pgBackRest stanza exists on node2 ---
+    run_test "pgBackRest stanza exists on node2 (pg-spock-node2)"
+    local stanza_json2
+    stanza_json2=$(docker exec -u postgres spock-node2 pgbackrest --stanza="$STANZA_NODE2" --output=json info 2>/dev/null) || stanza_json2=""
+    local stanza_name2
+    stanza_name2=$(echo "$stanza_json2" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+    [ "$stanza_name2" = "$STANZA_NODE2" ] && pass || fail "stanza not found (got: $stanza_name2)"
+
+    # --- Test 25: pgBackRest has at least one backup on node2 ---
+    run_test "pgBackRest has at least one backup (node2)"
+    local backup_count2
+    backup_count2=$(docker exec -u postgres spock-node2 pgbackrest --stanza="$STANZA_NODE2" --output=json info 2>/dev/null \
+        | grep -o '"label"' | wc -l | tr -d ' ') || backup_count2=0
+    [ "${backup_count2:-0}" -ge 1 ] && pass || fail "No backups found (count=$backup_count2)"
+
+    # --- Test 26: Streaming replicas use physical replication slots ---
+    run_test "Streaming replicas use physical replication slots"
+    local slot3 slot4
+    slot3=$(run_sql_on "$NODE1_PORT" "SELECT active FROM pg_replication_slots WHERE slot_name = 'repl_slot_node3'")
+    slot4=$(run_sql_on "$NODE2_PORT" "SELECT active FROM pg_replication_slots WHERE slot_name = 'repl_slot_node4'")
+    [ "$slot3" = "t" ] && [ "$slot4" = "t" ] && pass || fail "slot3_active=$slot3, slot4_active=$slot4"
 
     # Cleanup — remove from Spock repset before dropping
     run_sql_on "$NODE1_PORT" "SELECT spock.repset_remove_table('default', '_test_spock');" >/dev/null 2>&1
@@ -528,6 +561,8 @@ cmd_backup() {
     local type="${1:-diff}"
     local node="${2:-node1}"
     local container="spock-${node}"
+    local stanza
+    stanza=$(stanza_for "$node")
 
     case "$type" in
         full|diff|incr) ;;
@@ -538,14 +573,14 @@ cmd_backup() {
     esac
 
     log_head "=== pgBackRest Backup (${type}) on ${node} ==="
-    log_info "Stanza: $STANZA | Type: $type | Container: $container"
+    log_info "Stanza: $stanza | Type: $type | Container: $container"
 
-    docker exec -u postgres "$container" pgbackrest --stanza="$STANZA" --type="$type" backup
+    docker exec -u postgres "$container" pgbackrest --stanza="$stanza" --type="$type" backup
     local rc=$?
     if [ $rc -eq 0 ]; then
         log_ok "Backup complete"
         # Show summary
-        docker exec -u postgres "$container" pgbackrest --stanza="$STANZA" info
+        docker exec -u postgres "$container" pgbackrest --stanza="$stanza" info
     else
         log_error "Backup failed (exit code $rc)"
         exit $rc
@@ -555,16 +590,20 @@ cmd_backup() {
 cmd_backup_info() {
     local node="${1:-node1}"
     local container="spock-${node}"
-    log_head "=== pgBackRest Backup Info (${node}) ==="
-    docker exec -u postgres "$container" pgbackrest --stanza="$STANZA" info
+    local stanza
+    stanza=$(stanza_for "$node")
+    log_head "=== pgBackRest Backup Info (${node}, stanza=${stanza}) ==="
+    docker exec -u postgres "$container" pgbackrest --stanza="$stanza" info
 }
 
 cmd_backup_check() {
     local node="${1:-node1}"
     local container="spock-${node}"
-    log_head "=== pgBackRest Check (${node}) ==="
-    log_info "Verifying stanza '$STANZA' and WAL archiving..."
-    docker exec -u postgres "$container" pgbackrest --stanza="$STANZA" check
+    local stanza
+    stanza=$(stanza_for "$node")
+    log_head "=== pgBackRest Check (${node}, stanza=${stanza}) ==="
+    log_info "Verifying stanza '$stanza' and WAL archiving..."
+    docker exec -u postgres "$container" pgbackrest --stanza="$stanza" check
     local rc=$?
     if [ $rc -eq 0 ]; then
         log_ok "pgBackRest check passed — stanza OK, WAL archiving OK"
@@ -593,11 +632,11 @@ cmd_help() {
     echo ""
     echo "Backup (pgBackRest):"
     echo "  backup [type] [node]  Run backup (type: full|diff|incr, default: diff, node: node1|node2)"
-    echo "  backup-info [node]    Show backup inventory"
+    echo "  backup-info [node]    Show backup inventory (node resolves to correct stanza)"
     echo "  backup-check [node]   Verify stanza and WAL archiving"
     echo ""
     echo "Test & Benchmark:"
-    echo "  test                Run integration tests (23 tests)"
+    echo "  test                Run integration tests (26 tests)"
     echo "  bench               Run pgbench benchmarks (TPC-B + SELECT-only)"
     echo ""
     echo "Connection Info:"
