@@ -1,6 +1,6 @@
 FROM postgres:18
 
-# Install Patroni and dependencies
+# Install Patroni dependencies + pgBackRest
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
@@ -15,6 +15,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     jq \
     procps \
     pgbouncer \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    && sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list' \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends pgbackrest \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Patroni with etcd3 support into a venv
@@ -25,13 +32,16 @@ RUN python3 -m venv /opt/patroni && \
     && ln -s /opt/patroni/bin/patroni /usr/local/bin/patroni \
     && ln -s /opt/patroni/bin/patronictl /usr/local/bin/patronictl
 
-# Create directories
+# Create directories (Patroni + pgBackRest)
 RUN mkdir -p /etc/patroni /var/lib/postgresql/data /run/postgresql \
-    && chown -R postgres:postgres /var/lib/postgresql /run/postgresql /etc/patroni
+    /var/lib/pgbackrest /var/spool/pgbackrest /var/log/pgbackrest /etc/pgbackrest \
+    && chown -R postgres:postgres /var/lib/postgresql /run/postgresql /etc/patroni \
+    /var/lib/pgbackrest /var/spool/pgbackrest /var/log/pgbackrest /etc/pgbackrest
 
 # Copy configuration and scripts
 COPY postgres/patroni.yml /etc/patroni/patroni.yml
 COPY postgres/pg_hba.conf /etc/postgresql/pg_hba.conf
+COPY pgbackrest/pgbackrest.conf /etc/pgbackrest/pgbackrest.conf
 COPY scripts/patroni-entrypoint.sh /usr/local/bin/patroni-entrypoint.sh
 COPY scripts/pg-healthcheck.sh /usr/local/bin/pg-healthcheck.sh
 COPY scripts/post-bootstrap.sh /usr/local/bin/post-bootstrap.sh

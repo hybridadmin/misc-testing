@@ -49,6 +49,10 @@ bootstrap:
         checkpoint_completion_target: 0.9
         checkpoint_timeout: '10min'
 
+        # WAL Archiving (pgBackRest)
+        archive_mode: 'on'
+        archive_timeout: 300
+
         # Logging
         log_destination: 'stderr'
         logging_collector: 'off'
@@ -106,9 +110,18 @@ postgresql:
 
   parameters:
     unix_socket_directories: '/var/run/postgresql'
+    archive_command: 'pgbackrest --stanza=pg-patroni archive-push %p'
+
+  recovery_conf:
+    restore_command: 'pgbackrest --stanza=pg-patroni archive-get %f "%p"'
 
   create_replica_methods:
+    - pgbackrest
     - basebackup
+  pgbackrest:
+    command: 'pgbackrest --stanza=pg-patroni --delta restore'
+    keep_data: true
+    no_params: true
   basebackup:
     checkpoint: fast
     max-rate: '100M'

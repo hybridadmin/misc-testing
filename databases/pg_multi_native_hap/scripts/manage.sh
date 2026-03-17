@@ -123,7 +123,7 @@ cmd_status() {
     done
 
     echo ""
-    log_info "HAProxy Stats: http://localhost:${HAPROXY_STATS_PORT:-7000}/stats"
+    log_info "HAProxy Stats: http://localhost:${HAPROXY_STATS_PORT:-7060}/stats"
     log_info "  Write endpoint (all nodes): localhost:${HAPROXY_WRITE_PORT:-5432}"
     log_info "  Read endpoint (all nodes):  localhost:${HAPROXY_READ_PORT:-5433}"
 
@@ -1098,7 +1098,7 @@ cmd_help() {
     echo "  help                 Show this help"
     echo ""
     echo "Direct ports: node1=5441, node2=5442, node3=5443"
-    echo "HAProxy:      write=5432, read=5433, stats=http://localhost:7000/stats"
+    echo "HAProxy:      write=5432, read=5433, stats=http://localhost:7060/stats"
     echo ""
     echo "IMPORTANT: Logical replication does NOT replicate DDL (CREATE/ALTER/DROP TABLE)."
     echo "Use '$0 ddl' to execute DDL on all nodes simultaneously."

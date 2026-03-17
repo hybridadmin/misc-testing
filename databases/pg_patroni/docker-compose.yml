@@ -141,8 +141,12 @@ services:
     hostname: patroni1
     environment:
       PATRONI_NAME: patroni1
+      PGBACKREST_STANZA: ${BACKUP_STANZA:-pg-patroni}
     volumes:
       - patroni1-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool1:/var/spool/pgbackrest
+      - pgbackrest-log1:/var/log/pgbackrest
     ports:
       - "${PG_NODE1_PORT:-6041}:5432"
       - "${PATRONI1_API_PORT:-8041}:8008"
@@ -156,8 +160,12 @@ services:
     hostname: patroni2
     environment:
       PATRONI_NAME: patroni2
+      PGBACKREST_STANZA: ${BACKUP_STANZA:-pg-patroni}
     volumes:
       - patroni2-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool2:/var/spool/pgbackrest
+      - pgbackrest-log2:/var/log/pgbackrest
     ports:
       - "${PG_NODE2_PORT:-6042}:5432"
       - "${PATRONI2_API_PORT:-8042}:8008"
@@ -171,8 +179,12 @@ services:
     hostname: patroni3
     environment:
       PATRONI_NAME: patroni3
+      PGBACKREST_STANZA: ${BACKUP_STANZA:-pg-patroni}
     volumes:
       - patroni3-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool3:/var/spool/pgbackrest
+      - pgbackrest-log3:/var/log/pgbackrest
     ports:
       - "${PG_NODE3_PORT:-6043}:5432"
       - "${PATRONI3_API_PORT:-8043}:8008"
@@ -398,4 +410,18 @@ volumes:
   valkey-replica1-data:
     driver: local
   valkey-replica2-data:
+    driver: local
+  pgbackrest-repo:
+    driver: local
+  pgbackrest-spool1:
+    driver: local
+  pgbackrest-spool2:
+    driver: local
+  pgbackrest-spool3:
+    driver: local
+  pgbackrest-log1:
+    driver: local
+  pgbackrest-log2:
+    driver: local
+  pgbackrest-log3:
     driver: local

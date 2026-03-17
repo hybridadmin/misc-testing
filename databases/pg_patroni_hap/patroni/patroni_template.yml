@@ -90,6 +90,10 @@ bootstrap:
         autovacuum_vacuum_cost_delay: '2ms'
         autovacuum_vacuum_cost_limit: 1000
 
+        # --- WAL Archiving (pgBackRest) ---
+        archive_mode: 'on'
+        archive_timeout: 300
+
         # --- Misc ---
         hot_standby: 'on'
         hot_standby_feedback: 'on'
@@ -124,8 +128,7 @@ bootstrap:
       options:
         - replication
 
-  post_bootstrap: >-
-    /usr/lib/postgresql/18/bin/psql -c "CREATE DATABASE appdb OWNER postgres;"
+  post_bootstrap: /usr/local/bin/post-bootstrap.sh
 
 postgresql:
   listen: 0.0.0.0:5432
@@ -142,6 +145,24 @@ postgresql:
     rewind:
       username: postgres
       password: changeme_postgres_2025
+
+  parameters:
+    unix_socket_directories: '/var/run/postgresql'
+    archive_command: 'pgbackrest --stanza=pg-patroni-hap archive-push %p'
+
+  recovery_conf:
+    restore_command: 'pgbackrest --stanza=pg-patroni-hap archive-get %f "%p"'
+
+  create_replica_methods:
+    - pgbackrest
+    - basebackup
+  pgbackrest:
+    command: 'pgbackrest --stanza=pg-patroni-hap --delta restore'
+    keep_data: true
+    no_params: true
+  basebackup:
+    checkpoint: fast
+    max-rate: '100M'
 
 tags:
   nofailover: false

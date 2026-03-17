@@ -158,7 +158,7 @@ services:
     ports:
       - "${HAPROXY_WRITE_PORT:-5432}:5432"    # Write endpoint -> round-robin all nodes
       - "${HAPROXY_READ_PORT:-5433}:5433"      # Read endpoint -> leastconn all nodes
-      - "${HAPROXY_STATS_PORT:-7000}:7000"     # Stats dashboard
+      - "${HAPROXY_STATS_PORT:-7060}:7000"     # Stats dashboard
     healthcheck:
       test: ["CMD-SHELL", "haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg || exit 1"]
       interval: 30s

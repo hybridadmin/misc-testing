@@ -34,6 +34,9 @@ PGPASSWORD="${POSTGRES_PASSWORD:-changeme_postgres_2025}"
 PG_USER="${POSTGRES_USER:-postgres}"
 PG_DB="${POSTGRES_DB:-appdb}"
 
+# pgBackRest
+STANZA="${BACKUP_STANZA:-pg-patroni}"
+
 # Ports
 HAPROXY_RW_PORT="${HAPROXY_PORT_RW:-5050}"
 HAPROXY_RO_PORT="${HAPROXY_PORT_RO:-5051}"
@@ -62,6 +65,32 @@ run_sql_on() {
 run_sql_fmt() {
     local port="$1"; local sql="$2"
     PGPASSWORD="$PGPASSWORD" psql -h localhost -p "$port" -U "$PG_USER" -d "$PG_DB" -c "$sql" 2>/dev/null
+}
+
+# --- Find a running Patroni node ---
+find_patroni_node() {
+    for node in pat-node1 pat-node2 pat-node3; do
+        if docker inspect "$node" --format='{{.State.Running}}' 2>/dev/null | grep -q true; then
+            echo "$node"
+            return
+        fi
+    done
+    return 1
+}
+
+# --- Find the current Patroni primary node ---
+find_primary_node() {
+    for node in pat-node1 pat-node2 pat-node3; do
+        if docker inspect "$node" --format='{{.State.Running}}' 2>/dev/null | grep -q true; then
+            local is_primary
+            is_primary=$(docker exec "$node" psql -U postgres -h /var/run/postgresql -tAc "SELECT NOT pg_is_in_recovery()" 2>/dev/null)
+            if [ "$is_primary" = "t" ]; then
+                echo "$node"
+                return
+            fi
+        fi
+    done
+    return 1
 }
 
 # =============================================================================
@@ -123,6 +152,16 @@ cmd_status() {
     local vk
     vk=$(docker exec pat-valkey-master valkey-cli -a "${VALKEY_PASSWORD:-changeme_valkey_2025}" --no-auth-warning INFO replication 2>/dev/null | grep "role:") || vk="unreachable"
     echo "  Master: ${vk:-unreachable}"
+
+    # pgBackRest summary
+    log_head "--- pgBackRest ---"
+    local br_status_node
+    br_status_node=$(find_patroni_node 2>/dev/null) || br_status_node=""
+    if [ -n "$br_status_node" ]; then
+        docker exec "$br_status_node" pgbackrest --stanza="$STANZA" info --output=text 2>/dev/null | head -20 || echo "  pgBackRest info unavailable"
+    else
+        echo "  No Patroni node running"
+    fi
 }
 
 cmd_topology() {
@@ -226,7 +265,7 @@ cmd_switchover() {
 
 cmd_reinit() {
     log_head "=== Full Cluster Reinit ==="
-    log_warn "This will DESTROY ALL DATA and recreate the cluster."
+    log_warn "This will DESTROY ALL DATA (including pgBackRest backups) and recreate the cluster."
     read -r -p "Type 'yes' to confirm: " confirm
     if [ "$confirm" != "yes" ]; then
         log_info "Cancelled."
@@ -357,6 +396,38 @@ cmd_test() {
         "SELECT count(*) FROM _test_patroni WHERE val LIKE 'bulk_%'" 2>/dev/null)
     [ "${bulk_count:-0}" -eq 100 ] && pass || fail "Expected 100 rows, got ${bulk_count:-0}"
 
+    # Test 13: pgBackRest stanza exists
+    run_test "pgBackRest stanza exists"
+    local br_node
+    br_node=$(find_patroni_node 2>/dev/null) || br_node=""
+    if [ -n "$br_node" ]; then
+        local stanza_ok
+        stanza_ok=$(docker exec "$br_node" pgbackrest --stanza="$STANZA" info --output=json 2>/dev/null | jq -r '.[0].name // empty' 2>/dev/null)
+        [ "$stanza_ok" = "$STANZA" ] && pass || fail "Stanza '$STANZA' not found"
+    else
+        fail "No Patroni node running"
+    fi
+
+    # Test 14: pgBackRest check passes (WAL archiving working)
+    run_test "pgBackRest check (WAL archiving)"
+    local primary_node
+    primary_node=$(find_primary_node 2>/dev/null) || primary_node=""
+    if [ -n "$primary_node" ]; then
+        docker exec "$primary_node" pgbackrest --stanza="$STANZA" check >/dev/null 2>&1 && pass || fail "pgBackRest check failed (on $primary_node)"
+    else
+        fail "No Patroni primary found"
+    fi
+
+    # Test 15: pgBackRest has at least one backup
+    run_test "pgBackRest has at least one backup"
+    if [ -n "$br_node" ]; then
+        local backup_count
+        backup_count=$(docker exec "$br_node" pgbackrest --stanza="$STANZA" info --output=json 2>/dev/null | jq '.[0].backup | length' 2>/dev/null) || backup_count=0
+        [ "${backup_count:-0}" -ge 1 ] && pass || fail "No backups found (got: ${backup_count:-0})"
+    else
+        fail "No Patroni node running"
+    fi
+
     # Cleanup
     run_sql "DROP TABLE IF EXISTS _test_patroni;" >/dev/null 2>&1
     docker exec pat-valkey-master valkey-cli -a "${VALKEY_PASSWORD:-changeme_valkey_2025}" --no-auth-warning DEL _test_patroni >/dev/null 2>&1
@@ -432,8 +503,46 @@ cmd_patronictl() {
     docker exec -it "$node" patronictl -c /etc/patroni/patroni.yml "$@"
 }
 
+# --- pgBackRest commands ---
+
+cmd_backup() {
+    local type="${1:-diff}"
+    case "$type" in
+        full|diff|incr) ;;
+        *)
+            log_error "Unknown backup type: $type (use full, diff, or incr)"
+            exit 1
+            ;;
+    esac
+
+    log_head "=== pgBackRest Backup ($type) ==="
+    local node
+    node=$(find_primary_node 2>/dev/null) || { log_error "No Patroni primary found"; exit 1; }
+    log_info "Running $type backup on $node (stanza: $STANZA)..."
+    docker exec "$node" pgbackrest --stanza="$STANZA" --type="$type" backup
+    log_ok "Backup complete"
+    echo ""
+    docker exec "$node" pgbackrest --stanza="$STANZA" info
+}
+
+cmd_backup_info() {
+    log_head "=== pgBackRest Backup Info ==="
+    local node
+    node=$(find_patroni_node 2>/dev/null) || { log_error "No Patroni node running"; exit 1; }
+    docker exec "$node" pgbackrest --stanza="$STANZA" info
+}
+
+cmd_backup_check() {
+    log_head "=== pgBackRest Check ==="
+    local node
+    node=$(find_primary_node 2>/dev/null) || { log_error "No Patroni primary found"; exit 1; }
+    log_info "Checking stanza '$STANZA' on $node (primary)..."
+    docker exec "$node" pgbackrest --stanza="$STANZA" check
+    log_ok "pgBackRest check passed"
+}
+
 cmd_help() {
-    echo "pg_patroni — PostgreSQL 18 HA with Patroni + etcd + HAProxy + PgBouncer + Valkey"
+    echo "pg_patroni — PostgreSQL 18 HA with Patroni + etcd + HAProxy + PgBouncer + pgBackRest + Valkey"
     echo ""
     echo "Usage: ./manage.sh [command] [args...]"
     echo ""
@@ -451,8 +560,13 @@ cmd_help() {
     echo "  failover            Emergency failover (promotes best candidate)"
     echo "  reinit              Full cluster reinit (DESTROYS ALL DATA)"
     echo ""
+    echo "pgBackRest:"
+    echo "  backup [type]       Run backup (full|diff|incr, default: diff)"
+    echo "  backup-info         Show backup inventory"
+    echo "  backup-check        Verify stanza and WAL archiving"
+    echo ""
     echo "Test & Benchmark:"
-    echo "  test                Run integration tests (12 tests)"
+    echo "  test                Run integration tests (15 tests)"
     echo "  bench               Run pgbench benchmarks (TPC-B + SELECT-only + PgBouncer)"
     echo ""
     echo "Connection Info:"
@@ -483,6 +597,9 @@ case "$COMMAND" in
     bench|benchmark)     cmd_bench ;;
     logs|log)            cmd_logs "$@" ;;
     patronictl|pctl)     cmd_patronictl "$@" ;;
+    backup)              cmd_backup "$@" ;;
+    backup-info|info)    cmd_backup_info ;;
+    backup-check|check)  cmd_backup_check ;;
     help|--help|-h)      cmd_help ;;
     *)
         log_error "Unknown command: $COMMAND"

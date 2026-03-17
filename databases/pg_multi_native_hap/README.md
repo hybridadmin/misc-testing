@@ -9,7 +9,7 @@ A true multi-master PostgreSQL 18 cluster where **all nodes accept writes**, usi
                     │          HAProxy             │
                     │   Write :5432 (round-robin)  │
                     │   Read  :5433 (leastconn)    │
-                    │   Stats :7000                │
+                     │   Stats :7060                │
                     └──────┬──────┬──────┬─────────┘
                            │      │      │
               ┌────────────┘      │      └────────────┐
@@ -198,7 +198,7 @@ docker logs mm-pg-node1 2>&1 | grep -i conflict
 |---------|------|---------|
 | HAProxy Write | 5432 | Round-robin writes to all PG nodes |
 | HAProxy Read | 5433 | Least-connections reads from all PG nodes |
-| HAProxy Stats | 7000 | Web dashboard at http://localhost:7000/stats |
+| HAProxy Stats | 7060 | Web dashboard at http://localhost:7060/stats |
 | pg-node1 | 5441 | Direct access to node 1 |
 | pg-node2 | 5442 | Direct access to node 2 |
 | pg-node3 | 5443 | Direct access to node 3 |

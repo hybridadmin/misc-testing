@@ -1,7 +1,7 @@
-# PostgreSQL 18 High-Availability Cluster
+# PostgreSQL 18 High-Availability Cluster with pgBackRest
 
 Production-ready PostgreSQL 18.3 cluster with automatic failover, load balancing,
-and distributed caching.
+distributed caching, and continuous backup/WAL archiving via pgBackRest.
 
 ## Architecture
 
@@ -20,11 +20,17 @@ and distributed caching.
           |pg-node1|  |pg-node2|  |pg-node3|
           |PRIMARY |  |SYNC    |  |SYNC    |
           |Patroni |  |REPLICA |  |REPLICA |
+          |pgBackR.|  |pgBackR.|  |pgBackR.|
           +--------+  +--------+  +--------+
                \          |          /
             +------+  +------+  +------+
             |etcd1 |  |etcd2 |  |etcd3 |  (consensus)
             +------+  +------+  +------+
+
+               +---------------------------+
+               |  pgBackRest shared repo   |  (Docker volume)
+               |  WAL archive + backups    |
+               +---------------------------+
 
           +--------+  +--------+  +--------+
           |Valkey  |  |Valkey  |  |Valkey  |
@@ -44,6 +50,7 @@ and distributed caching.
 | Patroni | 4.0.x | 3 | Automatic failover & cluster management |
 | etcd | 3.5.17 | 3 | Distributed consensus (leader election) |
 | HAProxy | 3.1 | 1 | Load balancer & health-check routing |
+| pgBackRest | 2.x | 3 | Backup & WAL archiving (co-installed in PG containers) |
 | Valkey | 9.0.3 | 3 | Distributed cache (1 master + 2 replicas) |
 | Valkey Sentinel | 9.0.3 | 3 | Cache automatic failover |
 
@@ -87,6 +94,9 @@ pg-node2 | INFO: no action. I am (pg-node2), a]secondary, and following a leader
 
 ```bash
 ./scripts/manage.sh status
+
+# Run integration tests (13 tests including pgBackRest verification)
+./scripts/manage.sh test
 ```
 
 ### 4. Connect
@@ -119,7 +129,7 @@ docker exec -it valkey-master valkey-cli -a changeme_valkey_2025 --no-auth-warni
 | 5432 | HAProxy | **Write endpoint** -> PostgreSQL primary |
 | 5433 | HAProxy | **Read endpoint** -> PostgreSQL replicas (load balanced) |
 | 5434 | HAProxy | **Any healthy** -> Round-robin all healthy nodes |
-| 7000 | HAProxy | Stats dashboard (http://localhost:7000/stats) |
+| 7001 | HAProxy | Stats dashboard (http://localhost:7001/stats) |
 | 5441-5443 | PostgreSQL | Direct node access (debugging only) |
 | 8008-8010 | Patroni | REST API for each node |
 | 6379 | Valkey | Cache master |
@@ -157,6 +167,23 @@ docker exec -it valkey-master valkey-cli -a changeme_valkey_2025 --no-auth-warni
 
 # Run pgbench benchmark
 ./scripts/manage.sh bench
+
+# --- pgBackRest ---
+
+# Run a differential backup (default)
+./scripts/manage.sh backup
+
+# Run a full backup
+./scripts/manage.sh backup full
+
+# Run an incremental backup
+./scripts/manage.sh backup incr
+
+# Show backup inventory
+./scripts/manage.sh backup-info
+
+# Verify stanza and WAL archiving
+./scripts/manage.sh backup-check
 ```
 
 ### Patroni REST API
@@ -181,7 +208,7 @@ curl -s -XPOST http://localhost:8008/restart \
 
 ### HAProxy Stats Dashboard
 
-Open http://localhost:7000/stats in a browser.
+Open http://localhost:7001/stats in a browser.
 
 - **Green** = healthy backend
 - **Red** = backend down
@@ -259,6 +286,49 @@ If the Valkey master dies:
 5. Other replicas reconfigure to follow new master
 6. **Cache failover time: ~10-15 seconds**
 
+## pgBackRest
+
+### How Backups Work
+
+pgBackRest is co-installed in each Patroni/PostgreSQL container. All 3 nodes share a single backup repository via a Docker volume mounted at `/var/lib/pgbackrest` — no SSH or TLS needed.
+
+- **WAL archiving**: PostgreSQL's `archive_command` pushes WAL segments to pgBackRest asynchronously (`archive-async=y`, `lz4` compression).
+- **Stanza auto-creation**: The `post-bootstrap.sh` script creates the pgBackRest stanza and kicks off an initial full backup after Patroni bootstraps the cluster.
+- **Replica provisioning**: New replicas try `pgbackrest --delta restore` first, falling back to `pg_basebackup` if no backup is available.
+
+### Backup Commands
+
+```bash
+# Run a differential backup (default)
+./scripts/manage.sh backup
+
+# Run a full backup
+./scripts/manage.sh backup full
+
+# Run an incremental backup
+./scripts/manage.sh backup incr
+
+# Show backup inventory
+./scripts/manage.sh backup-info
+
+# Verify stanza and WAL archiving
+./scripts/manage.sh backup-check
+```
+
+### pgBackRest Configuration
+
+| Setting | Value | Notes |
+|---------|-------|-------|
+| Stanza | `pg-patroni-hap` | Matches Patroni scope |
+| Repo type | POSIX (local) | Shared Docker volume at `/var/lib/pgbackrest` |
+| Compression | lz4 (level 1) | Fast, low CPU; level 3 for archive-push |
+| archive-async | yes | Non-blocking WAL archiving with spool |
+| delta | yes | Only restore changed files |
+| Retention (full) | 2 | Keep last 2 full backups |
+| Retention (diff) | 3 | Keep last 3 differential backups |
+| Retention (archive) | 2 | Archive retention anchored to full backups |
+| process-max | 2 | Parallel processes for backup/restore |
+
 ## Production Checklist
 
 ### Security
@@ -295,10 +365,11 @@ If the Valkey master dies:
 
 ### Backup
 
-- [ ] Configure `pgBackRest` or `WAL-G` for continuous archiving
-- [ ] Set up automated base backups (daily)
+- [x] Configure pgBackRest for continuous WAL archiving (done)
+- [x] Initial full backup created automatically on bootstrap (done)
+- [ ] Set up automated scheduled backups (cron: daily diff, weekly full)
 - [ ] Test restore procedure regularly
-- [ ] Store backups in object storage (S3/GCS/MinIO)
+- [ ] Store backups in object storage (S3/GCS/MinIO) for production
 
 ### Host OS Sysctl (apply before production)
 
@@ -428,8 +499,10 @@ pg_patroni_hap/
 ├── .env                          # Environment variables (passwords, versions)
 ├── docker-compose.yml            # Full cluster definition
 ├── patroni/
-│   ├── Dockerfile                # PG18 + Patroni image
-│   └── patroni_template.yml      # Patroni configuration
+│   ├── Dockerfile                # PG18 + Patroni + pgBackRest image
+│   └── patroni_template.yml      # Patroni configuration (incl. archive settings)
+├── pgbackrest/
+│   └── pgbackrest.conf           # pgBackRest configuration (stanza, retention, compression)
 ├── haproxy/
 │   └── haproxy.cfg               # Load balancer configuration
 ├── valkey/
@@ -437,7 +510,8 @@ pg_patroni_hap/
 │   ├── valkey-replica.conf       # Replica configuration (reference)
 │   └── sentinel.conf             # Sentinel configuration
 ├── scripts/
-│   ├── manage.sh                 # Cluster management CLI
+│   ├── manage.sh                 # Cluster management CLI (incl. backup commands + tests)
+│   ├── post-bootstrap.sh         # Stanza creation + initial full backup
 │   ├── patroni-healthcheck.sh    # Docker health check
 │   └── sentinel-entrypoint.sh    # Valkey Sentinel startup script
 └── README.md                     # This file

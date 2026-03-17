@@ -5,7 +5,7 @@
 # =============================================================================
 set -euo pipefail
 
-STANZA="${PGBACKREST_STANZA:-pg-patroni}"
+STANZA="${PGBACKREST_STANZA:-pg-patroni-hap}"
 
 echo "[post-bootstrap] Creating application database 'appdb'..."
 psql -U postgres -c "CREATE DATABASE appdb;" 2>/dev/null || echo "[post-bootstrap] appdb already exists"

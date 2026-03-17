@@ -145,8 +145,12 @@ services:
       PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node1:5432
       PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
       PATRONI_REPLICATION_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      PGBACKREST_STANZA: ${BACKUP_STANZA:-pg-patroni-hap}
     volumes:
       - pg-node1-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool1:/var/spool/pgbackrest
+      - pgbackrest-log1:/var/log/pgbackrest
       - ./patroni/patroni_template.yml:/etc/patroni/patroni.yml:ro
     ports:
       - "5441:5432"    # Direct access (debugging only)
@@ -171,8 +175,12 @@ services:
       PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node2:5432
       PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
       PATRONI_REPLICATION_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      PGBACKREST_STANZA: ${BACKUP_STANZA:-pg-patroni-hap}
     volumes:
       - pg-node2-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool2:/var/spool/pgbackrest
+      - pgbackrest-log2:/var/log/pgbackrest
       - ./patroni/patroni_template.yml:/etc/patroni/patroni.yml:ro
     ports:
       - "5442:5432"
@@ -197,8 +205,12 @@ services:
       PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node3:5432
       PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
       PATRONI_REPLICATION_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      PGBACKREST_STANZA: ${BACKUP_STANZA:-pg-patroni-hap}
     volumes:
       - pg-node3-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool3:/var/spool/pgbackrest
+      - pgbackrest-log3:/var/log/pgbackrest
       - ./patroni/patroni_template.yml:/etc/patroni/patroni.yml:ro
     ports:
       - "5443:5432"
@@ -233,7 +245,7 @@ services:
       - "${HAPROXY_WRITE_PORT:-5432}:5432"    # Write endpoint -> primary
       - "${HAPROXY_READ_PORT:-5433}:5433"      # Read endpoint -> replicas
       - "5434:5434"                             # Any healthy node
-      - "${HAPROXY_STATS_PORT:-7000}:7000"     # Stats dashboard
+      - "${HAPROXY_STATS_PORT:-7001}:7000"     # Stats dashboard
     healthcheck:
       test: ["CMD-SHELL", "haproxy -c -f /usr/local/etc/haproxy/haproxy.cfg || exit 1"]
       interval: 30s
@@ -450,4 +462,18 @@ volumes:
   valkey-sentinel2-data:
     driver: local
   valkey-sentinel3-data:
+    driver: local
+  pgbackrest-repo:
+    driver: local
+  pgbackrest-spool1:
+    driver: local
+  pgbackrest-spool2:
+    driver: local
+  pgbackrest-spool3:
+    driver: local
+  pgbackrest-log1:
+    driver: local
+  pgbackrest-log2:
+    driver: local
+  pgbackrest-log3:
     driver: local

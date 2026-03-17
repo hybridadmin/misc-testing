@@ -22,5 +22,9 @@ if [ -d /var/lib/postgresql/data ]; then
     chmod 700 /var/lib/postgresql/data 2>/dev/null || true
 fi
 
+# Ensure pgBackRest directories exist with correct ownership
+mkdir -p /var/lib/pgbackrest /var/spool/pgbackrest /var/log/pgbackrest /etc/pgbackrest
+chown postgres:postgres /var/lib/pgbackrest /var/spool/pgbackrest /var/log/pgbackrest /etc/pgbackrest 2>/dev/null || true
+
 echo "[patroni-entrypoint] Starting Patroni as node: ${PATRONI_NAME:-$(hostname)}"
 exec patroni "$PATRONI_CONFIG"
