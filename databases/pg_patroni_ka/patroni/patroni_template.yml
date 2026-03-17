@@ -1,0 +1,175 @@
+# =============================================================================
+# Patroni Configuration — pg_patroni_ka
+# =============================================================================
+# Per-node values (name, connect_address) are set via environment variables:
+#   PATRONI_NAME, PATRONI_SCOPE
+#   PATRONI_RESTAPI_CONNECT_ADDRESS
+#   PATRONI_POSTGRESQL_CONNECT_ADDRESS
+#   PATRONI_SUPERUSER_PASSWORD, PATRONI_REPLICATION_PASSWORD
+# =============================================================================
+namespace: /service/
+
+restapi:
+  listen: 0.0.0.0:8008
+  authentication:
+    username: patroni
+    password: changeme_patroni_2025
+
+etcd3:
+  hosts:
+    - etcd1:2379
+    - etcd2:2379
+    - etcd3:2379
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576    # 1MB - tight for data safety
+    synchronous_mode: true               # at least 1 sync replica
+    synchronous_mode_strict: false       # allow async if all replicas down
+    synchronous_node_count: 1
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        # --- Connection Handling ---
+        max_connections: 200
+        superuser_reserved_connections: 5
+
+        # --- Memory (auto-scaled; override in DCS for production) ---
+        shared_buffers: '256MB'
+        effective_cache_size: '768MB'
+        work_mem: '4MB'
+        maintenance_work_mem: '64MB'
+        huge_pages: 'off'
+
+        # --- WAL & Replication ---
+        wal_level: replica
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_keep_size: '512MB'
+        wal_buffers: '16MB'
+        min_wal_size: '256MB'
+        max_wal_size: '1GB'
+        wal_compression: 'zstd'
+        synchronous_commit: 'on'
+
+        # --- Checkpointing ---
+        checkpoint_timeout: '15min'
+        checkpoint_completion_target: 0.9
+
+        # --- Query Planner ---
+        random_page_cost: 1.1            # SSD-optimized
+        effective_io_concurrency: 200     # SSD-optimized
+        default_statistics_target: 200
+
+        # --- Parallelism ---
+        max_worker_processes: 8
+        max_parallel_workers_per_gather: 4
+        max_parallel_workers: 8
+        max_parallel_maintenance_workers: 4
+
+        # --- Logging ---
+        log_min_duration_statement: 500   # log queries > 500ms
+        log_checkpoints: 'on'
+        log_connections: 'off'            # too noisy at 10k conn/s
+        log_disconnections: 'off'
+        log_lock_waits: 'on'
+        log_temp_files: 0
+        log_autovacuum_min_duration: 0
+        log_line_prefix: '%t [%p]: user=%u,db=%d,app=%a,client=%h '
+
+        # --- Autovacuum (aggressive for high-write workloads) ---
+        autovacuum_max_workers: 5
+        autovacuum_naptime: '30s'
+        autovacuum_vacuum_threshold: 50
+        autovacuum_vacuum_scale_factor: 0.02
+        autovacuum_analyze_threshold: 50
+        autovacuum_analyze_scale_factor: 0.01
+        autovacuum_vacuum_cost_delay: '2ms'
+        autovacuum_vacuum_cost_limit: 1000
+
+        # --- WAL Archiving (pgBackRest) ---
+        archive_mode: 'on'
+        archive_timeout: 300
+
+        # --- Misc ---
+        hot_standby: 'on'
+        hot_standby_feedback: 'on'
+        jit: 'on'
+        track_activity_query_size: 4096
+        idle_in_transaction_session_timeout: '10min'
+        statement_timeout: '60s'
+        tcp_keepalives_idle: 60
+        tcp_keepalives_interval: 10
+        tcp_keepalives_count: 6
+
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+    - locale: en_US.UTF-8
+
+  pg_hba:
+    - local   all         all                          trust
+    - host    all         all         127.0.0.1/32     scram-sha-256
+    - host    all         all         0.0.0.0/0        scram-sha-256
+    - host    replication replicator  0.0.0.0/0        scram-sha-256
+
+  users:
+    postgres:
+      password: changeme_postgres_2025
+      options:
+        - superuser
+        - createrole
+        - createdb
+    replicator:
+      password: changeme_repl_2025
+      options:
+        - replication
+
+  post_bootstrap: /usr/local/bin/post-bootstrap.sh
+
+postgresql:
+  listen: 0.0.0.0:5432
+  data_dir: /var/lib/postgresql/18/docker
+  bin_dir: /usr/lib/postgresql/18/bin
+  pgpass: /tmp/pgpass0
+  authentication:
+    superuser:
+      username: postgres
+      password: changeme_postgres_2025
+    replication:
+      username: replicator
+      password: changeme_repl_2025
+    rewind:
+      username: postgres
+      password: changeme_postgres_2025
+
+  parameters:
+    unix_socket_directories: '/var/run/postgresql'
+    archive_command: 'pgbackrest --stanza=pg-patroni-ka archive-push %p'
+
+  recovery_conf:
+    restore_command: 'pgbackrest --stanza=pg-patroni-ka archive-get %f "%p"'
+
+  create_replica_methods:
+    - pgbackrest
+    - basebackup
+  pgbackrest:
+    command: 'pgbackrest --stanza=pg-patroni-ka --delta restore'
+    keep_data: true
+    no_params: true
+  basebackup:
+    checkpoint: fast
+    max-rate: '100M'
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false
+
+watchdog:
+  mode: off    # requires privileged container; enable in bare-metal

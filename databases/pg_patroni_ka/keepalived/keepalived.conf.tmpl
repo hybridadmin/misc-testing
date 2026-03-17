@@ -1,0 +1,52 @@
+# =============================================================================
+# keepalived Configuration Template for Patroni VIP
+# =============================================================================
+# This is a TEMPLATE — the entrypoint script generates the actual config
+# by substituting environment variables for each node.
+#
+# keepalived manages a floating VIP (Virtual IP) that points to the current
+# Patroni PRIMARY. Only one node holds the VIP at a time.
+#
+# VRRP unicast mode is required because Docker bridge networks do not support
+# multicast. Each node must know the static IPs of all peers.
+# =============================================================================
+
+global_defs {
+    enable_script_security
+    script_user root
+}
+
+vrrp_script chk_patroni {
+    script "/usr/local/bin/keepalived-check.sh"
+    interval 3
+    weight -30
+    fall 2
+    rise 2
+}
+
+vrrp_instance PG_VIP {
+    state ${KEEPALIVED_STATE}
+    interface eth0
+    virtual_router_id ${KEEPALIVED_VRID}
+    priority ${KEEPALIVED_PRIORITY}
+    advert_int 1
+    nopreempt
+
+    unicast_src_ip ${MY_IP}
+    unicast_peer {
+${UNICAST_PEERS}
+    }
+
+    authentication {
+        auth_type PASS
+        auth_pass pgvip2025
+    }
+
+    virtual_ipaddress {
+        ${KEEPALIVED_VIP}/16 dev eth0
+    }
+
+    track_script {
+        chk_patroni
+    }
+}

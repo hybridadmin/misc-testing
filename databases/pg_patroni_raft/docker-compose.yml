@@ -1,0 +1,395 @@
+# =============================================================================
+# PostgreSQL 18 HA Cluster with Patroni + Raft (built-in DCS) + keepalived VIP
+# =============================================================================
+# Architecture:
+#   3x PostgreSQL/Patroni      - 1 primary + 2 synchronous replicas
+#     + Raft (pysyncobj)       - Built-in distributed consensus (no etcd!)
+#     + keepalived co-installed - Floating VIP tracks Patroni primary
+#     + pgBackRest co-installed - Backup and WAL archiving
+#   1x Valkey master           - Cache layer
+#   2x Valkey replicas         - Cache read replicas
+#   3x Valkey Sentinels        - Cache HA / automatic failover
+#
+# Total: 9 containers (no etcd, no HAProxy — Raft + VIP replaces both)
+#
+# The VIP (172.31.0.100) floats between PG nodes. Only the Patroni primary
+# holds the VIP. If the primary changes (failover/switchover), keepalived
+# moves the VIP to the new primary within ~3-5 seconds.
+# =============================================================================
+
+name: pg-patroni-raft-cluster
+
+x-patroni-common: &patroni-common
+  build:
+    context: .
+    dockerfile: patroni/Dockerfile
+  restart: unless-stopped
+  shm_size: '512mb'
+  # NET_ADMIN + NET_RAW required for keepalived to add/remove VIP on eth0
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  networks:
+    pg-patroni-raft-net:
+      {}
+  env_file: .env
+
+x-valkey-common: &valkey-common
+  image: valkey/valkey:9
+  restart: unless-stopped
+  networks:
+    pg-patroni-raft-net:
+      {}
+
+services:
+  # ===========================================================================
+  # PostgreSQL + Patroni + Raft + keepalived Cluster (3 nodes)
+  # Each node runs: Patroni (PID 1) + keepalived (background daemon)
+  # Raft consensus is built into Patroni — no external DCS needed.
+  # keepalived manages the floating VIP — only the primary holds it.
+  # ===========================================================================
+  pg-node1:
+    <<: *patroni-common
+    container_name: prf-pg-node1
+    hostname: pg-node1
+    environment:
+      PATRONI_NAME: pg-node1
+      PATRONI_SCOPE: ${PATRONI_SCOPE}
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node1:8008
+      PATRONI_RESTAPI_USERNAME: ${PATRONI_RESTAPI_USERNAME}
+      PATRONI_RESTAPI_PASSWORD: ${PATRONI_RESTAPI_PASSWORD}
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node1:5432
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
+      PATRONI_REPLICATION_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      PGBACKREST_STANZA: ${BACKUP_STANZA:-pg-patroni-raft}
+      MY_IP: ${PG_NODE1_IP}
+      KEEPALIVED_VIP: ${KEEPALIVED_VIP}
+      KEEPALIVED_VRID: ${KEEPALIVED_VRID}
+      PG_NODE1_IP: ${PG_NODE1_IP}
+      PG_NODE2_IP: ${PG_NODE2_IP}
+      PG_NODE3_IP: ${PG_NODE3_IP}
+      RAFT_PORT: ${RAFT_PORT:-8009}
+    volumes:
+      - pg-node1-data:/var/lib/postgresql
+      - raft-node1-data:/var/lib/patroni/raft
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool1:/var/spool/pgbackrest
+      - pgbackrest-log1:/var/log/pgbackrest
+    networks:
+      pg-patroni-raft-net:
+        ipv4_address: ${PG_NODE1_IP:-172.31.0.11}
+    ports:
+      - "5471:5432"    # Direct PostgreSQL access
+      - "8031:8008"    # Patroni REST API
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/patroni-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  pg-node2:
+    <<: *patroni-common
+    container_name: prf-pg-node2
+    hostname: pg-node2
+    environment:
+      PATRONI_NAME: pg-node2
+      PATRONI_SCOPE: ${PATRONI_SCOPE}
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node2:8008
+      PATRONI_RESTAPI_USERNAME: ${PATRONI_RESTAPI_USERNAME}
+      PATRONI_RESTAPI_PASSWORD: ${PATRONI_RESTAPI_PASSWORD}
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node2:5432
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
+      PATRONI_REPLICATION_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      PGBACKREST_STANZA: ${BACKUP_STANZA:-pg-patroni-raft}
+      MY_IP: ${PG_NODE2_IP}
+      KEEPALIVED_VIP: ${KEEPALIVED_VIP}
+      KEEPALIVED_VRID: ${KEEPALIVED_VRID}
+      PG_NODE1_IP: ${PG_NODE1_IP}
+      PG_NODE2_IP: ${PG_NODE2_IP}
+      PG_NODE3_IP: ${PG_NODE3_IP}
+      RAFT_PORT: ${RAFT_PORT:-8009}
+    volumes:
+      - pg-node2-data:/var/lib/postgresql
+      - raft-node2-data:/var/lib/patroni/raft
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool2:/var/spool/pgbackrest
+      - pgbackrest-log2:/var/log/pgbackrest
+    networks:
+      pg-patroni-raft-net:
+        ipv4_address: ${PG_NODE2_IP:-172.31.0.12}
+    ports:
+      - "5472:5432"    # Direct PostgreSQL access
+      - "8032:8008"    # Patroni REST API
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/patroni-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  pg-node3:
+    <<: *patroni-common
+    container_name: prf-pg-node3
+    hostname: pg-node3
+    environment:
+      PATRONI_NAME: pg-node3
+      PATRONI_SCOPE: ${PATRONI_SCOPE}
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node3:8008
+      PATRONI_RESTAPI_USERNAME: ${PATRONI_RESTAPI_USERNAME}
+      PATRONI_RESTAPI_PASSWORD: ${PATRONI_RESTAPI_PASSWORD}
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node3:5432
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
+      PATRONI_REPLICATION_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      PGBACKREST_STANZA: ${BACKUP_STANZA:-pg-patroni-raft}
+      MY_IP: ${PG_NODE3_IP}
+      KEEPALIVED_VIP: ${KEEPALIVED_VIP}
+      KEEPALIVED_VRID: ${KEEPALIVED_VRID}
+      PG_NODE1_IP: ${PG_NODE1_IP}
+      PG_NODE2_IP: ${PG_NODE2_IP}
+      PG_NODE3_IP: ${PG_NODE3_IP}
+      RAFT_PORT: ${RAFT_PORT:-8009}
+    volumes:
+      - pg-node3-data:/var/lib/postgresql
+      - raft-node3-data:/var/lib/patroni/raft
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool3:/var/spool/pgbackrest
+      - pgbackrest-log3:/var/log/pgbackrest
+    networks:
+      pg-patroni-raft-net:
+        ipv4_address: ${PG_NODE3_IP:-172.31.0.13}
+    ports:
+      - "5473:5432"    # Direct PostgreSQL access
+      - "8033:8008"    # Patroni REST API
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/patroni-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ===========================================================================
+  # Valkey Cache Cluster (Master + 2 Replicas + 3 Sentinels)
+  # ===========================================================================
+  valkey-master:
+    <<: *valkey-common
+    container_name: prf-valkey-master
+    hostname: valkey-master
+    command: >
+      valkey-server
+      --port 6379
+      --bind 0.0.0.0
+      --requirepass ${VALKEY_PASSWORD}
+      --masterauth ${VALKEY_PASSWORD}
+      --maxmemory ${VALKEY_MAXMEMORY:-2gb}
+      --maxmemory-policy allkeys-lfu
+      --save "900 1"
+      --save "300 10"
+      --save "60 10000"
+      --hz 100
+      --dynamic-hz yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --tcp-keepalive 300
+      --maxclients 10000
+      --repl-diskless-sync yes
+      --loglevel notice
+    volumes:
+      - valkey-master-data:/data
+    ports:
+      - "6392:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  valkey-replica1:
+    <<: *valkey-common
+    container_name: prf-valkey-replica1
+    hostname: valkey-replica1
+    command: >
+      valkey-server
+      --port 6379
+      --bind 0.0.0.0
+      --requirepass ${VALKEY_PASSWORD}
+      --masterauth ${VALKEY_PASSWORD}
+      --replicaof valkey-master 6379
+      --maxmemory ${VALKEY_MAXMEMORY:-2gb}
+      --maxmemory-policy allkeys-lfu
+      --replica-read-only yes
+      --hz 100
+      --dynamic-hz yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --tcp-keepalive 300
+      --maxclients 10000
+      --repl-diskless-sync yes
+      --loglevel notice
+    volumes:
+      - valkey-replica1-data:/data
+    ports:
+      - "6393:6379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  valkey-replica2:
+    <<: *valkey-common
+    container_name: prf-valkey-replica2
+    hostname: valkey-replica2
+    command: >
+      valkey-server
+      --port 6379
+      --bind 0.0.0.0
+      --requirepass ${VALKEY_PASSWORD}
+      --masterauth ${VALKEY_PASSWORD}
+      --replicaof valkey-master 6379
+      --maxmemory ${VALKEY_MAXMEMORY:-2gb}
+      --maxmemory-policy allkeys-lfu
+      --replica-read-only yes
+      --hz 100
+      --dynamic-hz yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --tcp-keepalive 300
+      --maxclients 10000
+      --repl-diskless-sync yes
+      --loglevel notice
+    volumes:
+      - valkey-replica2-data:/data
+    ports:
+      - "6394:6379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  valkey-sentinel1:
+    <<: *valkey-common
+    container_name: prf-valkey-sentinel1
+    hostname: valkey-sentinel1
+    entrypoint: ["/bin/bash", "/scripts/sentinel-entrypoint.sh"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+      - ./scripts/sentinel-entrypoint.sh:/scripts/sentinel-entrypoint.sh:ro
+      - valkey-sentinel1-data:/data
+    ports:
+      - "26392:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+      valkey-replica1:
+        condition: service_healthy
+      valkey-replica2:
+        condition: service_healthy
+
+  valkey-sentinel2:
+    <<: *valkey-common
+    container_name: prf-valkey-sentinel2
+    hostname: valkey-sentinel2
+    entrypoint: ["/bin/bash", "/scripts/sentinel-entrypoint.sh"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+      - ./scripts/sentinel-entrypoint.sh:/scripts/sentinel-entrypoint.sh:ro
+      - valkey-sentinel2-data:/data
+    ports:
+      - "26393:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+      valkey-replica1:
+        condition: service_healthy
+      valkey-replica2:
+        condition: service_healthy
+
+  valkey-sentinel3:
+    <<: *valkey-common
+    container_name: prf-valkey-sentinel3
+    hostname: valkey-sentinel3
+    entrypoint: ["/bin/bash", "/scripts/sentinel-entrypoint.sh"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+      - ./scripts/sentinel-entrypoint.sh:/scripts/sentinel-entrypoint.sh:ro
+      - valkey-sentinel3-data:/data
+    ports:
+      - "26394:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+      valkey-replica1:
+        condition: service_healthy
+      valkey-replica2:
+        condition: service_healthy
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  pg-patroni-raft-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${CLUSTER_SUBNET:-172.31.0.0/16}
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  pg-node1-data:
+    driver: local
+  pg-node2-data:
+    driver: local
+  pg-node3-data:
+    driver: local
+  raft-node1-data:
+    driver: local
+  raft-node2-data:
+    driver: local
+  raft-node3-data:
+    driver: local
+  valkey-master-data:
+    driver: local
+  valkey-replica1-data:
+    driver: local
+  valkey-replica2-data:
+    driver: local
+  valkey-sentinel1-data:
+    driver: local
+  valkey-sentinel2-data:
+    driver: local
+  valkey-sentinel3-data:
+    driver: local
+  pgbackrest-repo:
+    driver: local
+  pgbackrest-spool1:
+    driver: local
+  pgbackrest-spool2:
+    driver: local
+  pgbackrest-spool3:
+    driver: local
+  pgbackrest-log1:
+    driver: local
+  pgbackrest-log2:
+    driver: local
+  pgbackrest-log3:
+    driver: local

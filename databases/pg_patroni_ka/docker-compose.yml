@@ -1,0 +1,492 @@
+# =============================================================================
+# PostgreSQL 18 HA Cluster with Patroni + keepalived VIP + Valkey
+# =============================================================================
+# Architecture:
+#   3x etcd nodes              - Distributed consensus store for Patroni
+#   3x PostgreSQL/Patroni      - 1 primary + 2 synchronous replicas
+#     + keepalived co-installed - Floating VIP tracks Patroni primary
+#     + pgBackRest co-installed - Backup and WAL archiving
+#   1x Valkey master           - Cache layer
+#   2x Valkey replicas         - Cache read replicas
+#   3x Valkey Sentinels        - Cache HA / automatic failover
+#
+# Total: 15 containers (no HAProxy — VIP replaces load balancer)
+#
+# The VIP (172.30.0.100) floats between PG nodes. Only the Patroni primary
+# holds the VIP. If the primary changes (failover/switchover), keepalived
+# moves the VIP to the new primary within ~3-5 seconds.
+# =============================================================================
+
+name: pg-patroni-ka-cluster
+
+x-etcd-common: &etcd-common
+  image: quay.io/coreos/etcd:v3.5.17
+  restart: unless-stopped
+  networks:
+    pg-patroni-ka-net:
+      {}
+
+x-patroni-common: &patroni-common
+  build:
+    context: .
+    dockerfile: patroni/Dockerfile
+  restart: unless-stopped
+  shm_size: '512mb'
+  # NET_ADMIN + NET_RAW required for keepalived to add/remove VIP on eth0
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+  networks:
+    pg-patroni-ka-net:
+      {}
+  env_file: .env
+  depends_on:
+    etcd1:
+      condition: service_healthy
+    etcd2:
+      condition: service_healthy
+    etcd3:
+      condition: service_healthy
+
+x-valkey-common: &valkey-common
+  image: valkey/valkey:9
+  restart: unless-stopped
+  networks:
+    pg-patroni-ka-net:
+      {}
+
+services:
+  # ===========================================================================
+  # etcd Cluster (3 nodes for consensus)
+  # ===========================================================================
+  etcd1:
+    <<: *etcd-common
+    container_name: pka-etcd1
+    hostname: etcd1
+    command:
+      - etcd
+      - --name=etcd1
+      - --initial-advertise-peer-urls=http://etcd1:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd1:2379
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=pg-patroni-ka-etcd-cluster
+      - --data-dir=/etcd-data
+      - --quota-backend-bytes=8589934592
+      - --auto-compaction-mode=periodic
+      - --auto-compaction-retention=1h
+      - --snapshot-count=5000
+    volumes:
+      - etcd1-data:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health", "--endpoints=http://localhost:2379"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  etcd2:
+    <<: *etcd-common
+    container_name: pka-etcd2
+    hostname: etcd2
+    command:
+      - etcd
+      - --name=etcd2
+      - --initial-advertise-peer-urls=http://etcd2:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd2:2379
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=pg-patroni-ka-etcd-cluster
+      - --data-dir=/etcd-data
+      - --quota-backend-bytes=8589934592
+      - --auto-compaction-mode=periodic
+      - --auto-compaction-retention=1h
+      - --snapshot-count=5000
+    volumes:
+      - etcd2-data:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health", "--endpoints=http://localhost:2379"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  etcd3:
+    <<: *etcd-common
+    container_name: pka-etcd3
+    hostname: etcd3
+    command:
+      - etcd
+      - --name=etcd3
+      - --initial-advertise-peer-urls=http://etcd3:2380
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd3:2379
+      - --initial-cluster=etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=pg-patroni-ka-etcd-cluster
+      - --data-dir=/etcd-data
+      - --quota-backend-bytes=8589934592
+      - --auto-compaction-mode=periodic
+      - --auto-compaction-retention=1h
+      - --snapshot-count=5000
+    volumes:
+      - etcd3-data:/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health", "--endpoints=http://localhost:2379"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ===========================================================================
+  # PostgreSQL + Patroni + keepalived Cluster (3 nodes)
+  # Each node runs: Patroni (PID 1) + keepalived (background daemon)
+  # keepalived manages the floating VIP — only the primary holds it.
+  # ===========================================================================
+  pg-node1:
+    <<: *patroni-common
+    container_name: pka-pg-node1
+    hostname: pg-node1
+    environment:
+      PATRONI_NAME: pg-node1
+      PATRONI_SCOPE: ${PATRONI_SCOPE}
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node1:8008
+      PATRONI_RESTAPI_USERNAME: ${PATRONI_RESTAPI_USERNAME}
+      PATRONI_RESTAPI_PASSWORD: ${PATRONI_RESTAPI_PASSWORD}
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node1:5432
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
+      PATRONI_REPLICATION_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      PGBACKREST_STANZA: ${BACKUP_STANZA:-pg-patroni-ka}
+      MY_IP: ${PG_NODE1_IP}
+      KEEPALIVED_VIP: ${KEEPALIVED_VIP}
+      KEEPALIVED_VRID: ${KEEPALIVED_VRID}
+      PG_NODE1_IP: ${PG_NODE1_IP}
+      PG_NODE2_IP: ${PG_NODE2_IP}
+      PG_NODE3_IP: ${PG_NODE3_IP}
+    volumes:
+      - pg-node1-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool1:/var/spool/pgbackrest
+      - pgbackrest-log1:/var/log/pgbackrest
+      - ./patroni/patroni_template.yml:/etc/patroni/patroni.yml:ro
+    networks:
+      pg-patroni-ka-net:
+        ipv4_address: ${PG_NODE1_IP:-172.30.0.11}
+    ports:
+      - "5461:5432"    # Direct PostgreSQL access
+      - "8011:8008"    # Patroni REST API
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/patroni-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  pg-node2:
+    <<: *patroni-common
+    container_name: pka-pg-node2
+    hostname: pg-node2
+    environment:
+      PATRONI_NAME: pg-node2
+      PATRONI_SCOPE: ${PATRONI_SCOPE}
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node2:8008
+      PATRONI_RESTAPI_USERNAME: ${PATRONI_RESTAPI_USERNAME}
+      PATRONI_RESTAPI_PASSWORD: ${PATRONI_RESTAPI_PASSWORD}
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node2:5432
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
+      PATRONI_REPLICATION_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      PGBACKREST_STANZA: ${BACKUP_STANZA:-pg-patroni-ka}
+      MY_IP: ${PG_NODE2_IP}
+      KEEPALIVED_VIP: ${KEEPALIVED_VIP}
+      KEEPALIVED_VRID: ${KEEPALIVED_VRID}
+      PG_NODE1_IP: ${PG_NODE1_IP}
+      PG_NODE2_IP: ${PG_NODE2_IP}
+      PG_NODE3_IP: ${PG_NODE3_IP}
+    volumes:
+      - pg-node2-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool2:/var/spool/pgbackrest
+      - pgbackrest-log2:/var/log/pgbackrest
+      - ./patroni/patroni_template.yml:/etc/patroni/patroni.yml:ro
+    networks:
+      pg-patroni-ka-net:
+        ipv4_address: ${PG_NODE2_IP:-172.30.0.12}
+    ports:
+      - "5462:5432"    # Direct PostgreSQL access
+      - "8012:8008"    # Patroni REST API
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/patroni-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  pg-node3:
+    <<: *patroni-common
+    container_name: pka-pg-node3
+    hostname: pg-node3
+    environment:
+      PATRONI_NAME: pg-node3
+      PATRONI_SCOPE: ${PATRONI_SCOPE}
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg-node3:8008
+      PATRONI_RESTAPI_USERNAME: ${PATRONI_RESTAPI_USERNAME}
+      PATRONI_RESTAPI_PASSWORD: ${PATRONI_RESTAPI_PASSWORD}
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg-node3:5432
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_PASSWORD}
+      PATRONI_REPLICATION_PASSWORD: ${POSTGRES_REPL_PASSWORD}
+      PGBACKREST_STANZA: ${BACKUP_STANZA:-pg-patroni-ka}
+      MY_IP: ${PG_NODE3_IP}
+      KEEPALIVED_VIP: ${KEEPALIVED_VIP}
+      KEEPALIVED_VRID: ${KEEPALIVED_VRID}
+      PG_NODE1_IP: ${PG_NODE1_IP}
+      PG_NODE2_IP: ${PG_NODE2_IP}
+      PG_NODE3_IP: ${PG_NODE3_IP}
+    volumes:
+      - pg-node3-data:/var/lib/postgresql
+      - pgbackrest-repo:/var/lib/pgbackrest
+      - pgbackrest-spool3:/var/spool/pgbackrest
+      - pgbackrest-log3:/var/log/pgbackrest
+      - ./patroni/patroni_template.yml:/etc/patroni/patroni.yml:ro
+    networks:
+      pg-patroni-ka-net:
+        ipv4_address: ${PG_NODE3_IP:-172.30.0.13}
+    ports:
+      - "5463:5432"    # Direct PostgreSQL access
+      - "8013:8008"    # Patroni REST API
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/patroni-healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ===========================================================================
+  # Valkey Cache Cluster (Master + 2 Replicas + 3 Sentinels)
+  # ===========================================================================
+  valkey-master:
+    <<: *valkey-common
+    container_name: pka-valkey-master
+    hostname: valkey-master
+    command: >
+      valkey-server
+      --port 6379
+      --bind 0.0.0.0
+      --requirepass ${VALKEY_PASSWORD}
+      --masterauth ${VALKEY_PASSWORD}
+      --maxmemory ${VALKEY_MAXMEMORY:-2gb}
+      --maxmemory-policy allkeys-lfu
+      --save "900 1"
+      --save "300 10"
+      --save "60 10000"
+      --hz 100
+      --dynamic-hz yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --tcp-keepalive 300
+      --maxclients 10000
+      --repl-diskless-sync yes
+      --loglevel notice
+    volumes:
+      - valkey-master-data:/data
+    ports:
+      - "6382:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  valkey-replica1:
+    <<: *valkey-common
+    container_name: pka-valkey-replica1
+    hostname: valkey-replica1
+    command: >
+      valkey-server
+      --port 6379
+      --bind 0.0.0.0
+      --requirepass ${VALKEY_PASSWORD}
+      --masterauth ${VALKEY_PASSWORD}
+      --replicaof valkey-master 6379
+      --maxmemory ${VALKEY_MAXMEMORY:-2gb}
+      --maxmemory-policy allkeys-lfu
+      --replica-read-only yes
+      --hz 100
+      --dynamic-hz yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --tcp-keepalive 300
+      --maxclients 10000
+      --repl-diskless-sync yes
+      --loglevel notice
+    volumes:
+      - valkey-replica1-data:/data
+    ports:
+      - "6383:6379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  valkey-replica2:
+    <<: *valkey-common
+    container_name: pka-valkey-replica2
+    hostname: valkey-replica2
+    command: >
+      valkey-server
+      --port 6379
+      --bind 0.0.0.0
+      --requirepass ${VALKEY_PASSWORD}
+      --masterauth ${VALKEY_PASSWORD}
+      --replicaof valkey-master 6379
+      --maxmemory ${VALKEY_MAXMEMORY:-2gb}
+      --maxmemory-policy allkeys-lfu
+      --replica-read-only yes
+      --hz 100
+      --dynamic-hz yes
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --tcp-keepalive 300
+      --maxclients 10000
+      --repl-diskless-sync yes
+      --loglevel notice
+    volumes:
+      - valkey-replica2-data:/data
+    ports:
+      - "6384:6379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD}", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  valkey-sentinel1:
+    <<: *valkey-common
+    container_name: pka-valkey-sentinel1
+    hostname: valkey-sentinel1
+    entrypoint: ["/bin/bash", "/scripts/sentinel-entrypoint.sh"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+      - ./scripts/sentinel-entrypoint.sh:/scripts/sentinel-entrypoint.sh:ro
+      - valkey-sentinel1-data:/data
+    ports:
+      - "26382:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+      valkey-replica1:
+        condition: service_healthy
+      valkey-replica2:
+        condition: service_healthy
+
+  valkey-sentinel2:
+    <<: *valkey-common
+    container_name: pka-valkey-sentinel2
+    hostname: valkey-sentinel2
+    entrypoint: ["/bin/bash", "/scripts/sentinel-entrypoint.sh"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+      - ./scripts/sentinel-entrypoint.sh:/scripts/sentinel-entrypoint.sh:ro
+      - valkey-sentinel2-data:/data
+    ports:
+      - "26383:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+      valkey-replica1:
+        condition: service_healthy
+      valkey-replica2:
+        condition: service_healthy
+
+  valkey-sentinel3:
+    <<: *valkey-common
+    container_name: pka-valkey-sentinel3
+    hostname: valkey-sentinel3
+    entrypoint: ["/bin/bash", "/scripts/sentinel-entrypoint.sh"]
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD}
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+      - ./scripts/sentinel-entrypoint.sh:/scripts/sentinel-entrypoint.sh:ro
+      - valkey-sentinel3-data:/data
+    ports:
+      - "26384:26379"
+    depends_on:
+      valkey-master:
+        condition: service_healthy
+      valkey-replica1:
+        condition: service_healthy
+      valkey-replica2:
+        condition: service_healthy
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  pg-patroni-ka-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${CLUSTER_SUBNET:-172.30.0.0/16}
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  etcd1-data:
+    driver: local
+  etcd2-data:
+    driver: local
+  etcd3-data:
+    driver: local
+  pg-node1-data:
+    driver: local
+  pg-node2-data:
+    driver: local
+  pg-node3-data:
+    driver: local
+  valkey-master-data:
+    driver: local
+  valkey-replica1-data:
+    driver: local
+  valkey-replica2-data:
+    driver: local
+  valkey-sentinel1-data:
+    driver: local
+  valkey-sentinel2-data:
+    driver: local
+  valkey-sentinel3-data:
+    driver: local
+  pgbackrest-repo:
+    driver: local
+  pgbackrest-spool1:
+    driver: local
+  pgbackrest-spool2:
+    driver: local
+  pgbackrest-spool3:
+    driver: local
+  pgbackrest-log1:
+    driver: local
+  pgbackrest-log2:
+    driver: local
+  pgbackrest-log3:
+    driver: local
