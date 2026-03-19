@@ -368,49 +368,61 @@ DATABASE_POOL_SIZE=50
 ### Services won't start
 ```bash
 # Check logs
-docker compose logs postgres
-docker compose logs valkey
-docker compose logs app_fastapi
-docker compose logs app_turbo
+docker compose -f docker-compose-cluster.yml logs postgres_provider
+docker compose -f docker-compose-cluster.yml logs valkey
+docker compose -f docker-compose-cluster.yml logs app_fastapi
+docker compose -f docker-compose-cluster.yml logs app_turbo
 ```
+
+### PostgreSQL 18 hot_standby error
+If you see: `FATAL: unrecognized configuration parameter "_hot_standby"`
+Fix: Change `-c-hot_standby=on` to `-chot_standby=on` in docker-compose-cluster.yml
 
 ### Database connection issues
 ```bash
 # Remove volumes and restart fresh
-docker compose down -v
-docker compose up -d
+docker compose -f docker-compose-cluster.yml down -v
+docker compose -f docker-compose-cluster.yml up -d
 ```
 
 ### Clear all data
 ```bash
-docker compose down -v --remove-orphans
-docker compose up -d
+docker compose -f docker-compose-cluster.yml down -v --remove-orphans
+docker compose -f docker-compose-cluster.yml up -d
 ```
 
 ## Project Structure
 
 ```
 .
-├── docker-compose.yml          # Main orchestration
-├── app_fastapi/               # FastAPI service
-│   ├── main.py               # Application code
-│   ├── config.py             # Settings
+├── docker-compose.yml              # Main orchestration (single PG)
+├── docker-compose-cluster.yml      # 3-node PostgreSQL cluster
+├── app_fastapi/                   # FastAPI service
+│   ├── main.py                    # Application code
+│   ├── config.py                  # Settings (env var loading)
+│   ├── entrypoint.sh               # Configurable uvicorn startup
 │   ├── Dockerfile
 │   └── requirements.txt
-├── app_turbo/                # TurboAPI service
-│   ├── main.py               # Application code
-│   ├── config.py             # Settings
+├── app_turbo/                     # TurboAPI service
+│   ├── main.py                    # Application code
+│   ├── config.py                  # Settings
+│   ├── entrypoint.sh               # Configurable uvicorn startup
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── postgres/
-│   └── init.sql              # Database initialization
+│   ├── Dockerfile                  # Custom PG image with pglogical
+│   ├── init.sql                    # Tables + extensions
+│   ├── pg_hba.conf                 # Replication auth config
+│   ├── .pgpass                     # Credentials file
+│   ├── setup_cluster.sh            # 3-node cluster setup script
+│   └── setup_replication.sh        # Single replica setup
 ├── valkey/
-│   └── valkey.conf           # Redis/Valkey config
+│   └── valkey.conf                # Production Valkey config
 ├── benchmarks/
-│   ├── locustfile.py         # Locust test file
-│   ├── run_benchmarks.sh     # Benchmark runner
+│   ├── locustfile.py              # Locust test file
+│   ├── run_benchmarks.sh          # Benchmark runner
 │   └── Dockerfile
-├── .env                      # Environment variables
+├── .env.example                   # Environment template
 └── README.md
 ```
 
@@ -483,6 +495,134 @@ TurboAPI:
 2. **Database Operations**: TurboAPI's higher concurrency and cache optimization reduces connection exhaustion
 3. **Cache Operations**: FastAPI's simpler architecture is faster for pure cache hits
 4. **Overall**: TurboAPI's two-tier caching and higher concurrency wins for mixed workloads
+
+## PostgreSQL Replication (3-Node Cluster)
+
+### Architecture
+
+```
+┌─────────────────────┐          ┌─────────────────────┐
+│   Provider (Write)   │ ───────► │   Replica1 (Read)   │
+│   postgres_provider │  WAL     │  postgres_replica1   │
+│   Port: 5432        │          │   Port: 5432        │
+└─────────────────────┘          └─────────────────────┘
+          │
+          └──────────────────────► ┌─────────────────────┐
+               WAL                │   Replica2 (Read)   │
+                                  │  postgres_replica2   │
+                                  │   Port: 5432        │
+                                  └─────────────────────┘
+```
+
+### Start Cluster
+
+```bash
+# Start 3-node cluster
+docker compose -f docker-compose-cluster.yml up -d
+
+# Wait for all nodes to be healthy
+docker compose -f docker-compose-cluster.yml ps
+```
+
+### Manual Replication Setup
+
+```bash
+# 1. Create publication on provider
+docker exec turboapi_postgres_provider psql -U appuser -d app_db << 'EOSQL'
+CREATE PUBLICATION app_replication_set FOR TABLE benchmark_table, users, posts;
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'repl_password_secure_2024';
+GRANT CONNECT ON DATABASE app_db TO replicator;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO replicator;
+ALTER TABLE benchmark_table REPLICA IDENTITY DEFAULT;
+ALTER TABLE users REPLICA IDENTITY DEFAULT;
+ALTER TABLE posts REPLICA IDENTITY DEFAULT;
+EOSQL
+
+# 2. Create subscription on replica1
+docker exec turboapi_postgres_replica1 psql -U appuser -d app_db << 'EOSQL'
+CREATE SUBSCRIPTION replica1_subscription 
+CONNECTION 'host=postgres_provider port=5432 dbname=app_db user=replicator password=repl_password_secure_2024'
+PUBLICATION app_replication_set
+WITH (slot_name = 'replica1_subscription', create_slot = true, copy_data = true);
+EOSQL
+
+# 3. Create subscription on replica2
+docker exec turboapi_postgres_replica2 psql -U appuser -d app_db << 'EOSQL'
+CREATE SUBSCRIPTION replica2_subscription 
+CONNECTION 'host=postgres_provider port=5432 dbname=app_db user=replicator password=repl_password_secure_2024'
+PUBLICATION app_replication_set
+WITH (slot_name = 'replica2_subscription', create_slot = true, copy_data = true);
+EOSQL
+```
+
+### Verify Replication
+
+```bash
+# Check publications on provider
+docker exec turboapi_postgres_provider psql -U appuser -d app_db -c "SELECT * FROM pg_publication_tables;"
+
+# Check subscription status
+docker exec turboapi_postgres_replica1 psql -U appuser -d app_db -c "SELECT * FROM pg_stat_subscription;"
+
+# Check replication stats
+docker exec turboapi_postgres_provider psql -U appuser -d app_db -c "SELECT * FROM pg_stat_replication;"
+
+# Test replication
+docker exec turboapi_postgres_provider psql -U appuser -d app_db -c "INSERT INTO benchmark_table (id, data) VALUES (999, 'test') RETURNING *;"
+docker exec turboapi_postgres_replica1 psql -U appuser -d app_db -c "SELECT * FROM benchmark_table WHERE id = 999;"
+```
+
+### Replication Requirements
+
+- Tables must have PRIMARY KEY for UPDATE/DELETE replication
+- Set `REPLICA IDENTITY` for tables without PRIMARY KEY
+- wal_level must be `logical`
+- `max_replication_slots` >= number of subscriptions
+- `max_wal_senders` >= number of subscriptions
+
+### PostgreSQL 18 Compatibility
+
+Note: pglogical extension has known issues with PostgreSQL 18.3. If you need full pglogical functionality:
+- Use PostgreSQL 15 or 16
+- Or use native PostgreSQL logical replication (shown above)
+
+Key PostgreSQL 18 differences:
+- `hot_standby` (not `-hot_standby`) in config
+- `pg_subscription_rel` behavior differs from earlier versions
+- Some pglogical views have changed column names
+
+## Current Status
+
+### Working ✓
+- **Single PostgreSQL** (docker-compose.yml) - Full functionality
+- **3-Node Cluster** (docker-compose-cluster.yml) - Containers healthy, native logical replication configured
+- **FastAPI Service** (Port 8001) - All endpoints working, connects to PostgreSQL and Valkey
+- **TurboAPI Service** (Port 8002) - All endpoints working, connects to PostgreSQL and Valkey
+- **Valkey Cache** - Healthy, AOF persistence enabled
+- **Custom PostgreSQL Image** - Successfully built with pglogical extension
+
+### Replication Status
+- Provider/Subscriber structure created
+- `app_replication_set` publication exists on provider
+- `replicator` role with REPLICATION privilege created
+- Subscriptions connecting between nodes
+- **Note**: Native PostgreSQL logical replication in progress; pglogical extension has compatibility issues with PostgreSQL 18.3
+
+### Quick Test
+```bash
+# Health checks
+curl http://localhost:8001/health
+curl http://localhost:8002/health
+
+# DB test
+curl http://localhost:8001/db-test
+
+# Cache test
+curl http://localhost:8001/cache-test
+
+# Complex query
+curl http://localhost:8001/complex-query
+```
 
 ## License
 

@@ -3,7 +3,7 @@ CREATE EXTENSION IF NOT EXISTS "pg_stat_statements";
 CREATE EXTENSION IF NOT EXISTS "pglogical";
 
 CREATE TABLE IF NOT EXISTS benchmark_table (
-    id SERIAL PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
     data VARCHAR(255) NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -29,6 +29,29 @@ CREATE TABLE IF NOT EXISTS posts (
 CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id);
 CREATE INDEX IF NOT EXISTS idx_posts_published ON posts(published);
 
-INSERT INTO benchmark_table (data) 
-VALUES ('initial') 
-ON CONFLICT DO NOTHING;
+CREATE OR REPLACE FUNCTION update_modified_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'benchmark_table') THEN
+        ALTER TABLE benchmark_table ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW();
+    END IF;
+END
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pglogical.node WHERE node_name = 'subscriber') THEN
+        PERFORM pglogical.create_node(
+            node_name := 'subscriber',
+            dsn := 'host=localhost port=5432 dbname=app_db user=appuser'
+        );
+    END IF;
+END
+$$;

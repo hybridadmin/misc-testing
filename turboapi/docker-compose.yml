@@ -29,24 +29,33 @@ services:
       - postgres_data:/var/lib/postgresql
       - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     command:
-      - postgres
-      - -cmax_connections=200
-      - -cshared_buffers=256MB
-      - -ceffective_cache_size=512MB
-      - -cwork_mem=16MB
-      - -cmaintenance_work_mem=128MB
-      - -ccheckpoint_completion_target=0.9
-      - -cwal_buffers=16MB
-      - -cdefault_statistics_target=100
-      - -crandom_page_cost=1.1
-      - -cdynamic_shared_memory_type=posix
-      - -cmax_wal_size=2GB
-      - -cmin_wal_size=80MB
-      - -clog_duration=off
-      - -clog_min_duration_statement=1000
-      - -clog_lock_waits=off
-      - -clog_connections=off
-      - -clog_disconnections=off
+      - bash
+      - -c
+      - |
+        apt-get update && apt-get install -y postgresql-18-pglogical
+        docker-entrypoint.sh postgres \
+          -cshared_preload_libraries=pglogical \
+          -cmax_connections=200 \
+          -cshared_buffers=256MB \
+          -ceffective_cache_size=512MB \
+          -cwork_mem=16MB \
+          -cmaintenance_work_mem=128MB \
+          -ccheckpoint_completion_target=0.9 \
+          -cwal_buffers=16MB \
+          -cdefault_statistics_target=100 \
+          -crandom_page_cost=1.1 \
+          -cdynamic_shared_memory_type=posix \
+          -cmax_wal_size=2GB \
+          -cmin_wal_size=80MB \
+          -clog_duration=off \
+          -clog_min_duration_statement=1000 \
+          -clog_lock_waits=off \
+          -clog_connections=off \
+          -clog_disconnections=off \
+          -cwal_level=logical \
+          -cmax_replication_slots=10 \
+          -cmax_wal_senders=10 \
+          -cwal_keep_size=1GB
     healthcheck:
       <<: *healthcheck
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser} -d app_db"]
