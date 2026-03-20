@@ -224,7 +224,7 @@ async def cache_test():
 
 
 @app.get("/cached-endpoint")
-@limiter.limit("100/second")
+@limiter.limit("10000/second")
 async def cached_endpoint(request: Request, key: str = "default"):
     cache_key = f"fastapi:cached:{key}"
     cached = await redis_client.get(cache_key)

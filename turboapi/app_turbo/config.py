@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     database_pool_recycle: int = 3600
     database_echo: bool = False
 
-    valkey_url: str = "redis://valkey:6379/0"
+    valkey_url: str = "valkey://valkey:6379/0"
     valkey_pool_size: int = 20
     valkey_socket_timeout: int = 5
     valkey_socket_connect_timeout: int = 5

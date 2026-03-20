@@ -33,7 +33,7 @@ class APIUser(HttpUser):
 
     @task(15)
     def cached_endpoint(self):
-        self.client.get("/cached-endpoint")
+        self.client.get("/cached-endpoint?key=bench")
 
     @task(3)
     def complex_query(self):
@@ -41,7 +41,7 @@ class APIUser(HttpUser):
 
     @task(2)
     def bulk_insert(self):
-        self.client.post("/bulk-insert?count=100")
+        self.client.post("/bulk-insert?count=100", json={})
 
 
 @events.test_start.add_listener

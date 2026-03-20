@@ -92,16 +92,16 @@ curl http://localhost:8001/cache-test
 curl http://localhost:8002/cache-test
 
 # Cached endpoint (DB on first call, cache on subsequent)
-curl http://localhost:8001/cached-endpoint
-curl http://localhost:8002/cached-endpoint
+curl "http://localhost:8001/cached-endpoint"
+curl "http://localhost:8002/cached-endpoint?key=test"
 
 # Complex query
 curl "http://localhost:8001/complex-query?n=100"
 curl "http://localhost:8002/complex-query?n=100"
 
-# Bulk insert
+# Bulk insert (POST requires JSON body)
 curl -X POST "http://localhost:8001/bulk-insert?count=1000"
-curl -X POST "http://localhost:8002/bulk-insert?count=1000"
+curl -X POST "http://localhost:8002/bulk-insert?count=1000" -d '{}'
 ```
 
 ## API Endpoints

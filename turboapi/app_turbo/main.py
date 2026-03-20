@@ -1,18 +1,13 @@
 import asyncio
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse, ORJSONResponse
+from turboapi import TurboAPI, HTTPException, Request
+from turboapi.responses import JSONResponse
+from turboapi.params import Query
 from sqlalchemy.ext.asyncio import (
     create_async_engine,
     AsyncSession,
     async_sessionmaker,
 )
 from sqlalchemy import text
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.middleware import SlowAPIMiddleware
 import redis.asyncio as redis
 from redis.asyncio.sentinel import Sentinel
 from redis.asyncio import ConnectionPool
@@ -25,7 +20,6 @@ from typing import Optional
 from config import get_settings
 
 settings = get_settings()
-limiter = Limiter(key_func=get_remote_address)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -160,38 +154,39 @@ async def close_redis():
         await redis_client.aclose()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+async def startup():
     logger.info("Starting TurboAPI application ...")
     await init_db()
     await init_redis()
-    yield
+
+
+async def shutdown():
     logger.info("Shutting down TurboAPI application ...")
     _local_cache.clear()
     await close_redis()
     await close_db()
 
 
-app = FastAPI(
+app = TurboAPI(
     title="TurboAPI Performance Test",
     description="Optimized TurboAPI with PostgreSQL and Valkey caching",
     version="1.0.0",
-    lifespan=lifespan,
-    default_response_class=ORJSONResponse,
+    on_startup=[startup],
+    on_shutdown=[shutdown],
     docs_url="/docs" if settings.debug else None,
     redoc_url="/redoc" if settings.debug else None,
 )
 
-app.add_middleware(SlowAPIMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if settings.debug else [],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.add_middleware(GZipMiddleware, minimum_size=1000)
-app.state.limiter = limiter
+
+@app.middleware("http")
+async def add_cors_headers(request, call_next):
+    if settings.debug or True:
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
+    return await call_next(request)
 
 
 @app.exception_handler(Exception)
@@ -268,8 +263,8 @@ async def cache_test():
 
 
 @app.get("/cached-endpoint")
-@limiter.limit("200/second")
-async def cached_endpoint(request: Request, key: str = "default"):
+async def cached_endpoint(request: Request):
+    key = request.query_params.get("key", "default")
     cache_key = f"turbo:cached:{key}"
     cached = await turbo_cache.get(cache_key)
 
@@ -295,9 +290,8 @@ async def cached_endpoint(request: Request, key: str = "default"):
 
 
 @app.get("/complex-query")
-async def complex_query(n: int = 100):
-    if n < 1 or n > 10000:
-        raise HTTPException(status_code=400, detail="n must be between 1 and 10000")
+async def complex_query(n=Query(default=100, ge=1, le=10000)):
+    n = int(n)
     start = time.perf_counter()
     async with db_session_maker() as session:
         result = await session.execute(
@@ -314,7 +308,8 @@ async def complex_query(n: int = 100):
 
 
 @app.post("/bulk-insert")
-async def bulk_insert(count: int = 1000):
+async def bulk_insert(request: Request):
+    count = int(request.query_params.get("count", 1000))
     if count < 1 or count > 50000:
         raise HTTPException(status_code=400, detail="count must be between 1 and 50000")
     start = time.perf_counter()
