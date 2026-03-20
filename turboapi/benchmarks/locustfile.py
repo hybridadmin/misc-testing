@@ -1,16 +1,22 @@
+"""
+Locust benchmark file.
+
+Run against ONE target at a time for fair comparison:
+    locust -f locustfile.py --host http://app_fastapi:8001 --headless -u 100 -r 10 -t 60s
+    locust -f locustfile.py --host http://app_turbo:8002  --headless -u 100 -r 10 -t 60s
+
+Or with the web UI:
+    locust -f locustfile.py --host http://app_fastapi:8001
+"""
+
 import os
-import time
-import statistics
 from locust import HttpUser, task, between, events
-from locust.runners import MasterRunner
 import requests
 
-FASTAPI_URL = os.getenv("FASTAPI_URL", "http://app_fastapi:8001")
-TURBOAPI_URL = os.getenv("TURBOAPI_URL", "http://app_turbo:8002")
 
+class APIUser(HttpUser):
+    """Generic user class -- set --host to target FastAPI or TurboAPI."""
 
-class FastAPIUser(HttpUser):
-    host = FASTAPI_URL
     wait_time = between(0.001, 0.01)
 
     @task(10)
@@ -27,79 +33,50 @@ class FastAPIUser(HttpUser):
 
     @task(15)
     def cached_endpoint(self):
-        self.client.get("/cached endpoint")
+        self.client.get("/cached-endpoint")
 
     @task(3)
     def complex_query(self):
         self.client.get("/complex-query?n=100")
 
-
-class TurboAPIUser(HttpUser):
-    host = TURBOAPI_URL
-    wait_time = between(0.001, 0.01)
-
-    @task(10)
-    def health_check(self):
-        self.client.get("/health")
-
-    @task(5)
-    def db_test(self):
-        self.client.get("/db-test")
-
-    @task(5)
-    def cache_test(self):
-        self.client.get("/cache-test")
-
-    @task(15)
-    def cached_endpoint(self):
-        self.client.get("/cached endpoint")
-
-    @task(3)
-    def complex_query(self):
-        self.client.get("/complex-query?n=100")
+    @task(2)
+    def bulk_insert(self):
+        self.client.post("/bulk-insert?count=100")
 
 
 @events.test_start.add_listener
 def on_test_start(environment, **kwargs):
+    host = environment.host or "unknown"
     print(f"\n{'=' * 60}")
-    print("BENCHMARK TEST STARTING")
+    print(f"BENCHMARK: {host}")
     print(f"{'=' * 60}")
-    print(f"FastAPI Target: {FASTAPI_URL}")
-    print(f"TurboAPI Target: {TURBOAPI_URL}")
-
-    for url, name in [(FASTAPI_URL, "FastAPI"), (TURBOAPI_URL, "TurboAPI")]:
-        try:
-            response = requests.get(f"{url}/health", timeout=10)
-            print(f"{name} Status: {response.status_code} - {response.json()}")
-        except Exception as e:
-            print(f"{name} Connection Failed: {e}")
+    try:
+        resp = requests.get(f"{host}/health", timeout=5)
+        print(f"Health: {resp.json()}")
+    except Exception as e:
+        print(f"Health check failed: {e}")
     print(f"{'=' * 60}\n")
 
 
 @events.test_stop.add_listener
 def on_test_stop(environment, **kwargs):
+    stats = environment.stats
     print(f"\n{'=' * 60}")
-    print("BENCHMARK TEST COMPLETE")
+    print("RESULTS SUMMARY")
     print(f"{'=' * 60}")
-
-    if isinstance(environment.runner, MasterRunner):
-        stats = environment.stats
-        print("\nFastAPI Results:")
-        print_stats(stats.get("GET /health", None))
-        print_stats(stats.get("GET /db-test", None))
-        print_stats(stats.get("GET /cached endpoint", None))
-
-        print("\nTurboAPI Results:")
-        print_stats(stats.get("GET /health", None))
-        print_stats(stats.get("GET /db-test", None))
-        print_stats(stats.get("GET /cached endpoint", None))
-
-
-def print_stats(request_stats):
-    if request_stats:
-        print(f"  Requests: {request_stats.num_requests}")
-        print(f"  Failures: {request_stats.num_failures}")
-        print(f"  Median: {request_stats.median_response_time}ms")
-        print(f"  Avg: {request_stats.avg_response_time}ms")
-        print(f"  Max: {request_stats.max_response_time}ms")
-        print(f"  RPS: {request_stats.total_rps:.2f}")
+    for entry in stats.entries.values():
+        print(
+            f"  {entry.method} {entry.name:30s}  "
+            f"reqs={entry.num_requests:>6d}  "
+            f"fails={entry.num_failures:>4d}  "
+            f"avg={entry.avg_response_time:>7.1f}ms  "
+            f"p50={entry.get_response_time_percentile(0.5) or 0:>7.1f}ms  "
+            f"p95={entry.get_response_time_percentile(0.95) or 0:>7.1f}ms  "
+            f"p99={entry.get_response_time_percentile(0.99) or 0:>7.1f}ms  "
+            f"rps={entry.total_rps:>8.1f}"
+        )
+    total = stats.total
+    print(
+        f"\n  TOTAL: reqs={total.num_requests} fails={total.num_failures} rps={total.total_rps:.1f}"
+    )
+    print(f"{'=' * 60}")

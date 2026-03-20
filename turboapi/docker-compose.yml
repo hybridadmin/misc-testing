@@ -1,61 +1,89 @@
-
 x-common-env: &common-env
-  POSTGRES_HOST: postgres
-  POSTGRES_PORT: 5432
   POSTGRES_USER: ${POSTGRES_USER:-appuser}
   POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_prod_2024}
-  VALKEY_HOST: valkey
-  VALKEY_PORT: 6379
   PYTHONUNBUFFERED: "1"
   LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
-x-healthcheck: &healthcheck
+x-healthcheck-defaults: &healthcheck
   interval: 10s
   timeout: 5s
   retries: 5
-  start_period: 10s
+  start_period: 30s
+
+x-pg-tuning: &pg-tuning
+  - -c
+  - shared_preload_libraries=pglogical,pg_stat_statements
+  - -c
+  - max_connections=200
+  - -c
+  - shared_buffers=256MB
+  - -c
+  - effective_cache_size=512MB
+  - -c
+  - work_mem=16MB
+  - -c
+  - maintenance_work_mem=128MB
+  - -c
+  - checkpoint_completion_target=0.9
+  - -c
+  - wal_buffers=16MB
+  - -c
+  - default_statistics_target=100
+  - -c
+  - random_page_cost=1.1
+  - -c
+  - effective_io_concurrency=200
+  - -c
+  - max_wal_size=2GB
+  - -c
+  - min_wal_size=80MB
+  - -c
+  - wal_level=logical
+  - -c
+  - max_replication_slots=10
+  - -c
+  - max_wal_senders=10
+  - -c
+  - max_worker_processes=16
+  - -c
+  - max_logical_replication_workers=4
+  - -c
+  - max_sync_workers_per_subscription=2
+  - -c
+  - wal_keep_size=1GB
+  - -c
+  - log_min_duration_statement=1000
+  - -c
+  - log_lock_waits=on
+  - -c
+  - log_temp_files=0
+  - -c
+  - idle_in_transaction_session_timeout=60000
+  - -c
+  - statement_timeout=300000
+  - -c
+  - hba_file=/etc/postgresql/pg_hba.conf
 
 services:
-  postgres:
-    image: postgres:18.3
-    container_name: turboapi_postgres
+  # ─── PostgreSQL Node 1 (FastAPI writes here) ───
+  pg_node1:
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    container_name: turboapi_pg_node1
+    hostname: pg_node1
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-appuser}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_prod_2024}
       POSTGRES_DB: app_db
-      POSTGRES_INITDB_ARGS: "-E UTF8"
-      POSTGRES_HOST_AUTH_METHOD: "md5"
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      PGLOGICAL_NODE_NAME: node1
+      PGLOGICAL_PEER_HOST: pg_node2
+      PGLOGICAL_PEER_NAME: node2
+    command: *pg-tuning
     volumes:
-      - postgres_data:/var/lib/postgresql
-      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    command:
-      - bash
-      - -c
-      - |
-        apt-get update && apt-get install -y postgresql-18-pglogical
-        docker-entrypoint.sh postgres \
-          -cshared_preload_libraries=pglogical \
-          -cmax_connections=200 \
-          -cshared_buffers=256MB \
-          -ceffective_cache_size=512MB \
-          -cwork_mem=16MB \
-          -cmaintenance_work_mem=128MB \
-          -ccheckpoint_completion_target=0.9 \
-          -cwal_buffers=16MB \
-          -cdefault_statistics_target=100 \
-          -crandom_page_cost=1.1 \
-          -cdynamic_shared_memory_type=posix \
-          -cmax_wal_size=2GB \
-          -cmin_wal_size=80MB \
-          -clog_duration=off \
-          -clog_min_duration_statement=1000 \
-          -clog_lock_waits=off \
-          -clog_connections=off \
-          -clog_disconnections=off \
-          -cwal_level=logical \
-          -cmax_replication_slots=10 \
-          -cmax_wal_senders=10 \
-          -cwal_keep_size=1GB
+      - pg_node1_data:/var/lib/postgresql
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
     healthcheck:
       <<: *healthcheck
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser} -d app_db"]
@@ -68,16 +96,138 @@ services:
         reservations:
           memory: 512M
 
-  valkey:
-    image: valkey/valkey:9.0.1
-    container_name: turboapi_valkey
-    command: valkey-server /usr/local/etc/valkey/valkey.conf
+  # ─── PostgreSQL Node 2 (TurboAPI writes here) ───
+  pg_node2:
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    container_name: turboapi_pg_node2
+    hostname: pg_node2
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-appuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_prod_2024}
+      POSTGRES_DB: app_db
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      PGLOGICAL_NODE_NAME: node2
+      PGLOGICAL_PEER_HOST: pg_node1
+      PGLOGICAL_PEER_NAME: node1
+    command: *pg-tuning
     volumes:
-      - valkey_data:/data
-      - ./valkey/valkey.conf:/usr/local/etc/valkey/valkey.conf:ro
+      - pg_node2_data:/var/lib/postgresql
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser} -d app_db"]
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # ─── PostgreSQL Node 3 (read replica / mesh participant) ───
+  pg_node3:
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    container_name: turboapi_pg_node3
+    hostname: pg_node3
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-appuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_prod_2024}
+      POSTGRES_DB: app_db
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      PGLOGICAL_NODE_NAME: node3
+    command: *pg-tuning
+    volumes:
+      - pg_node3_data:/var/lib/postgresql
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser} -d app_db"]
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+
+  # ─── pglogical setup (runs once after all PG nodes are healthy) ───
+  pg_setup:
+    build:
+      context: ./postgres
+      dockerfile: Dockerfile
+    container_name: turboapi_pg_setup
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-appuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_prod_2024}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-changeme_prod_2024}
+      POSTGRES_DB: app_db
+    entrypoint: ["/usr/local/bin/setup_replication.sh"]
+    depends_on:
+      pg_node1:
+        condition: service_healthy
+      pg_node2:
+        condition: service_healthy
+      pg_node3:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - backend
+
+  # ─── Valkey primary ───
+  valkey:
+    image: valkey/valkey:9
+    container_name: turboapi_valkey
+    command: >
+      valkey-server
+      --bind 0.0.0.0
+      --protected-mode no
+      --port 6379
+      --tcp-backlog 511
+      --timeout 0
+      --tcp-keepalive 300
+      --databases 16
+      --save 900 1
+      --save 300 100
+      --save 60 10000
+      --stop-writes-on-bgsave-error yes
+      --rdbcompression yes
+      --rdbchecksum yes
+      --dbfilename dump.rdb
+      --dir /data
+      --maxmemory 384mb
+      --maxmemory-policy allkeys-lru
+      --maxmemory-samples 10
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --lazyfree-lazy-server-del yes
+      --appendonly yes
+      --appendfilename appendonly.aof
+      --appendfsync everysec
+      --auto-aof-rewrite-percentage 100
+      --auto-aof-rewrite-min-size 64mb
+      --aof-use-rdb-preamble yes
+      --slowlog-log-slower-than 1000
+      --slowlog-max-len 256
+      --latency-monitor-threshold 100
+      --activerehashing yes
+      --hz 10
+      --dynamic-hz yes
+      --aof-rewrite-incremental-fsync yes
+      --rdb-save-incremental-fsync yes
+      --io-threads 2
+      --io-threads-do-reads yes
+    volumes:
+      - valkey_primary_data:/data
     healthcheck:
       <<: *healthcheck
       test: ["CMD", "valkey-cli", "ping"]
+      start_period: 5s
     networks:
       - backend
     deploy:
@@ -87,6 +237,143 @@ services:
         reservations:
           memory: 128M
 
+  # ─── Valkey replica 1 ───
+  valkey_replica1:
+    image: valkey/valkey:9
+    container_name: turboapi_valkey_replica1
+    command: >
+      valkey-server
+      --bind 0.0.0.0
+      --protected-mode no
+      --port 6379
+      --replicaof valkey 6379
+      --replica-read-only yes
+      --replica-lazy-flush yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly no
+      --hz 10
+      --dynamic-hz yes
+    volumes:
+      - valkey_replica1_data:/data
+    depends_on:
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "valkey-cli", "ping"]
+      start_period: 5s
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+        reservations:
+          memory: 128M
+
+  # ─── Valkey replica 2 ───
+  valkey_replica2:
+    image: valkey/valkey:9
+    container_name: turboapi_valkey_replica2
+    command: >
+      valkey-server
+      --bind 0.0.0.0
+      --protected-mode no
+      --port 6379
+      --replicaof valkey 6379
+      --replica-read-only yes
+      --replica-lazy-flush yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly no
+      --hz 10
+      --dynamic-hz yes
+    volumes:
+      - valkey_replica2_data:/data
+    depends_on:
+      valkey:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "valkey-cli", "ping"]
+      start_period: 5s
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+        reservations:
+          memory: 128M
+
+  # ─── Valkey Sentinel 1 ───
+  valkey_sentinel1:
+    image: valkey/valkey:9
+    container_name: turboapi_valkey_sentinel1
+    command: >
+      sh -c "cp /etc/valkey/sentinel-template.conf /tmp/sentinel.conf && valkey-sentinel /tmp/sentinel.conf"
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+    depends_on:
+      valkey:
+        condition: service_healthy
+      valkey_replica1:
+        condition: service_healthy
+      valkey_replica2:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "valkey-cli", "-p", "26379", "ping"]
+      start_period: 10s
+    networks:
+      - backend
+
+  # ─── Valkey Sentinel 2 ───
+  valkey_sentinel2:
+    image: valkey/valkey:9
+    container_name: turboapi_valkey_sentinel2
+    command: >
+      sh -c "cp /etc/valkey/sentinel-template.conf /tmp/sentinel.conf && valkey-sentinel /tmp/sentinel.conf"
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+    depends_on:
+      valkey:
+        condition: service_healthy
+      valkey_replica1:
+        condition: service_healthy
+      valkey_replica2:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "valkey-cli", "-p", "26379", "ping"]
+      start_period: 10s
+    networks:
+      - backend
+
+  # ─── Valkey Sentinel 3 ───
+  valkey_sentinel3:
+    image: valkey/valkey:9
+    container_name: turboapi_valkey_sentinel3
+    command: >
+      sh -c "cp /etc/valkey/sentinel-template.conf /tmp/sentinel.conf && valkey-sentinel /tmp/sentinel.conf"
+    volumes:
+      - ./valkey/sentinel.conf:/etc/valkey/sentinel-template.conf:ro
+    depends_on:
+      valkey:
+        condition: service_healthy
+      valkey_replica1:
+        condition: service_healthy
+      valkey_replica2:
+        condition: service_healthy
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "valkey-cli", "-p", "26379", "ping"]
+      start_period: 10s
+    networks:
+      - backend
+
+  # ─── FastAPI application (writes to pg_node1, reads from both, cache via sentinel) ───
   app_fastapi:
     build:
       context: ./app_fastapi
@@ -95,29 +382,31 @@ services:
     environment:
       <<: *common-env
       APP_NAME: "fastapi"
-      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-changeme_prod_2024}@postgres:5432/app_db"
-      DATABASE_URL_SYNC: "postgresql+psycopg2://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-changeme_prod_2024}@postgres:5432/app_db"
-      VALKEY_URL: "redis://${VALKEY_HOST:-valkey}:6379/0"
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-changeme_prod_2024}@pg_node1:5432/app_db"
+      DATABASE_URL_SYNC: "postgresql+psycopg2://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-changeme_prod_2024}@pg_node1:5432/app_db"
+      VALKEY_SENTINEL_HOSTS: "valkey_sentinel1:26379,valkey_sentinel2:26379,valkey_sentinel3:26379"
+      VALKEY_SENTINEL_MASTER: "valkey-primary"
+      VALKEY_URL: "redis://valkey:6379/0"
       DATABASE_POOL_SIZE: "${DATABASE_POOL_SIZE:-20}"
       DATABASE_MAX_OVERFLOW: "${DATABASE_MAX_OVERFLOW:-10}"
       CACHE_DEFAULT_TTL: "${CACHE_DEFAULT_TTL:-300}"
       UVICORN_WORKERS: "${UVICORN_WORKERS:-4}"
-      UVICORN_HOST: "${UVICORN_HOST:-0.0.0.0}"
-      UVICORN_PORT: "${UVICORN_PORT:-8001}"
-      UVICORN_TIMEOUT_KEEP_ALIVE: "${UVICORN_TIMEOUT_KEEP_ALIVE:-65}"
-      UVICORN_LIMIT_CONCURRENCY: "${UVICORN_LIMIT_CONCURRENCY:-1000}"
-      UVICORN_ACCESS_LOG: "${UVICORN_ACCESS_LOG:-false}"
-      VALKEY_MAX_CONNECTIONS: "${VALKEY_MAX_CONNECTIONS:-100}"
+      UVICORN_HOST: "0.0.0.0"
+      UVICORN_PORT: "8001"
+      UVICORN_TIMEOUT_KEEP_ALIVE: "65"
+      UVICORN_LIMIT_CONCURRENCY: "1000"
+      UVICORN_ACCESS_LOG: "false"
+      VALKEY_MAX_CONNECTIONS: "100"
     ports:
       - "8001:8001"
     depends_on:
-      postgres:
-        condition: service_healthy
-      valkey:
+      pg_setup:
+        condition: service_completed_successfully
+      valkey_sentinel1:
         condition: service_healthy
     healthcheck:
       <<: *healthcheck
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
     networks:
       - backend
     deploy:
@@ -127,6 +416,7 @@ services:
         reservations:
           memory: 256M
 
+  # ─── TurboAPI application (writes to pg_node2, reads from both, cache via sentinel) ───
   app_turbo:
     build:
       context: ./app_turbo
@@ -135,29 +425,31 @@ services:
     environment:
       <<: *common-env
       APP_NAME: "turboapi"
-      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-changeme_prod_2024}@postgres:5432/app_db"
-      DATABASE_URL_SYNC: "postgresql+psycopg2://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-changeme_prod_2024}@postgres:5432/app_db"
-      VALKEY_URL: "redis://${VALKEY_HOST:-valkey}:6379/0"
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-changeme_prod_2024}@pg_node2:5432/app_db"
+      DATABASE_URL_SYNC: "postgresql+psycopg2://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-changeme_prod_2024}@pg_node2:5432/app_db"
+      VALKEY_SENTINEL_HOSTS: "valkey_sentinel1:26379,valkey_sentinel2:26379,valkey_sentinel3:26379"
+      VALKEY_SENTINEL_MASTER: "valkey-primary"
+      VALKEY_URL: "redis://valkey:6379/0"
       DATABASE_POOL_SIZE: "${DATABASE_POOL_SIZE:-20}"
       DATABASE_MAX_OVERFLOW: "${DATABASE_MAX_OVERFLOW:-10}"
       CACHE_DEFAULT_TTL: "${CACHE_DEFAULT_TTL:-300}"
       UVICORN_WORKERS: "${UVICORN_WORKERS:-4}"
-      UVICORN_HOST: "${UVICORN_HOST:-0.0.0.0}"
-      UVICORN_PORT: "${UVICORN_PORT:-8002}"
-      UVICORN_TIMEOUT_KEEP_ALIVE: "${UVICORN_TIMEOUT_KEEP_ALIVE:-65}"
-      UVICORN_LIMIT_CONCURRENCY: "${UVICORN_LIMIT_CONCURRENCY:-2000}"
-      UVICORN_ACCESS_LOG: "${UVICORN_ACCESS_LOG:-false}"
-      VALKEY_MAX_CONNECTIONS: "${VALKEY_MAX_CONNECTIONS:-100}"
+      UVICORN_HOST: "0.0.0.0"
+      UVICORN_PORT: "8002"
+      UVICORN_TIMEOUT_KEEP_ALIVE: "65"
+      UVICORN_LIMIT_CONCURRENCY: "2000"
+      UVICORN_ACCESS_LOG: "false"
+      VALKEY_MAX_CONNECTIONS: "100"
     ports:
       - "8002:8002"
     depends_on:
-      postgres:
-        condition: service_healthy
-      valkey:
+      pg_setup:
+        condition: service_completed_successfully
+      valkey_sentinel1:
         condition: service_healthy
     healthcheck:
       <<: *healthcheck
-      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8002/health"]
     networks:
       - backend
     deploy:
@@ -167,15 +459,17 @@ services:
         reservations:
           memory: 256M
 
+  # ─── Benchmark runner (on-demand via profile) ───
   benchmark:
     build:
       context: ./benchmarks
       dockerfile: Dockerfile
     container_name: turboapi_benchmark
     environment:
-      <<: *common-env
       FASTAPI_URL: "http://app_fastapi:8001"
       TURBOAPI_URL: "http://app_turbo:8002"
+    volumes:
+      - ./benchmarks/results:/app/results
     depends_on:
       app_fastapi:
         condition: service_healthy
@@ -187,9 +481,16 @@ services:
       - benchmark
 
 volumes:
-  postgres_data:
-  valkey_data:
+  pg_node1_data:
+  pg_node2_data:
+  pg_node3_data:
+  valkey_primary_data:
+  valkey_replica1_data:
+  valkey_replica2_data:
 
 networks:
   backend:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

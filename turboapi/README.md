@@ -1,93 +1,99 @@
 # TurboAPI Performance Benchmark
 
-A production-ready Docker Compose setup comparing FastAPI vs TurboAPI performance with PostgreSQL 18.3 and Valkey 9 caching.
+A unified Docker Compose setup comparing **FastAPI** vs **TurboAPI** performance, backed by a **3-node PostgreSQL 18 cluster** with bidirectional pglogical replication and a **Valkey HA cluster** (primary + replicas + sentinels) for caching.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Docker Network                        │
-│                                                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐   │
-│  │   FastAPI    │  │   TurboAPI   │  │     Benchmark    │   │
-│  │  (Port 8001) │  │  (Port 8002) │  │     (Locust)     │   │
-│  │              │  │              │  │                  │   │
-│  │ • 4 workers  │  │ • 8 workers  │  │  • Load testing  │   │
-│  │ • Valkey L1  │  │ • In-memory  │  │  • wrk support   │   │
-│  │              │  │   L1 + L2    │  │                  │   │
-│  └──────┬───────┘  └──────┬───────┘  └──────────────────┘   │
-│         │                 │                                   │
-│         └────────┬────────┘                                   │
-│                  ▼                                            │
-│         ┌────────────────┐  ┌────────────────┐              │
-│         │   PostgreSQL    │  │     Valkey      │              │
-│         │     18.3        │  │      9.0        │              │
-│         │                 │  │                 │              │
-│         │ • Connection    │  │ • AOF persist   │              │
-│         │   pooling       │  │ • LRU eviction  │              │
-│         │ • Async I/O    │  │ • Connection    │              │
-│         │                 │  │   pooling      │              │
-│         └────────────────┘  └────────────────┘              │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            Docker Network (172.28.0.0/16)                   │
+│                                                                             │
+│  ┌──────────────┐  ┌──────────────┐              ┌──────────────────┐      │
+│  │   FastAPI     │  │   TurboAPI   │              │     Benchmark    │      │
+│  │  (Port 8001)  │  │  (Port 8002) │              │   (wrk / Locust) │      │
+│  │               │  │              │              │   --profile flag │      │
+│  │ • 4 workers   │  │ • 4 workers  │              └──────────────────┘      │
+│  │ • Valkey L1   │  │ • In-memory  │                                        │
+│  │               │  │   L1 + L2    │                                        │
+│  └──────┬────────┘  └──────┬───────┘                                        │
+│         │ writes           │ writes                                          │
+│         ▼                  ▼                                                 │
+│  ┌────────────┐    ┌────────────┐    ┌────────────┐                         │
+│  │  pg_node1  │◄──►│  pg_node2  │◄──►│  pg_node3  │                         │
+│  │ (FastAPI   │    │ (TurboAPI  │    │  (mesh     │                         │
+│  │  primary)  │◄────────────────────►│  member)   │                         │
+│  └────────────┘    └────────────┘    └────────────┘                         │
+│       pglogical bidirectional full-mesh (6 subscriptions)                   │
+│                                                                             │
+│  ┌─────────┐   ┌──────────────┐  ┌──────────────┐                          │
+│  │  Valkey  │──►│   Replica 1  │  │   Replica 2  │                          │
+│  │ Primary  │──►│  (read-only) │  │  (read-only) │                          │
+│  └─────────┘   └──────────────┘  └──────────────┘                          │
+│       ▲  monitored by                                                       │
+│  ┌────┴──────┐  ┌────────────┐  ┌────────────┐                             │
+│  │ Sentinel 1│  │ Sentinel 2 │  │ Sentinel 3 │                             │
+│  └───────────┘  └────────────┘  └────────────┘                             │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Features
+### Services (12 total + 1 one-shot setup)
 
-### PostgreSQL 18.3
-- Async connection pooling via `asyncpg`
-- Tuned memory settings (shared_buffers, work_mem, etc.)
-- `pg_stat_statements` extension for query analysis
-- Proper indexing on benchmark tables
-
-### Valkey 9.0 (Redis-compatible)
-- AOF persistence for durability
-- LRU eviction policy (maxmemory 384MB)
-- Connection pooling
-- Sub-millisecond cache operations
-
-### FastAPI Service
-- Standard async/await patterns
-- Direct Valkey caching (L1)
-- 4 uvicorn workers
-- Rate limiting via slowapi
-
-### TurboAPI Service
-- Two-tier caching: In-memory (L1) + Valkey (L2)
-- Higher concurrency (8 workers)
-- Optimized for repeated queries
-- Better cache hit performance
+| Service | Container | Role |
+|---------|-----------|------|
+| `pg_node1` | `turboapi_pg_node1` | PostgreSQL 18 — FastAPI writes here |
+| `pg_node2` | `turboapi_pg_node2` | PostgreSQL 18 — TurboAPI writes here |
+| `pg_node3` | `turboapi_pg_node3` | PostgreSQL 18 — mesh participant |
+| `pg_setup` | `turboapi_pg_setup` | One-shot: creates pglogical nodes + subscriptions |
+| `valkey` | `turboapi_valkey` | Valkey primary (port 6379) |
+| `valkey_replica1` | `turboapi_valkey_replica1` | Valkey read-only replica |
+| `valkey_replica2` | `turboapi_valkey_replica2` | Valkey read-only replica |
+| `valkey_sentinel1` | `turboapi_valkey_sentinel1` | Sentinel (port 26379) |
+| `valkey_sentinel2` | `turboapi_valkey_sentinel2` | Sentinel |
+| `valkey_sentinel3` | `turboapi_valkey_sentinel3` | Sentinel |
+| `app_fastapi` | `turboapi_fastapi` | FastAPI app (port 8001) |
+| `app_turbo` | `turboapi_turbo` | TurboAPI app (port 8002) |
+| `benchmark` | `turboapi_benchmark` | Benchmark runner (profile: benchmark) |
 
 ## Quick Start
 
-### 1. Start Services
+### 1. Configure environment
 
 ```bash
-# Build and start all services
-docker compose up -d
+cp .env.example .env
+# Edit .env if you want to change defaults (passwords, pool sizes, etc.)
+```
 
-# Verify services are running
+### 2. Start all services
+
+```bash
+docker compose up -d --build
+
+# Watch startup progress (pg_setup must complete before apps start)
+docker compose logs -f pg_setup
+
+# Verify everything is healthy
 docker compose ps
 ```
 
-### 2. Test Endpoints
+### 3. Test endpoints
 
 ```bash
 # Health checks
 curl http://localhost:8001/health
 curl http://localhost:8002/health
 
-# DB latency test
+# DB latency
 curl http://localhost:8001/db-test
 curl http://localhost:8002/db-test
 
-# Cache latency test
+# Cache latency
 curl http://localhost:8001/cache-test
 curl http://localhost:8002/cache-test
 
-# Cached endpoint (first call hits DB, subsequent use cache)
-curl http://localhost:8001/cached%20endpoint
-curl http://localhost:8002/cached%20endpoint
+# Cached endpoint (DB on first call, cache on subsequent)
+curl http://localhost:8001/cached-endpoint
+curl http://localhost:8002/cached-endpoint
 
 # Complex query
 curl "http://localhost:8001/complex-query?n=100"
@@ -98,531 +104,301 @@ curl -X POST "http://localhost:8001/bulk-insert?count=1000"
 curl -X POST "http://localhost:8002/bulk-insert?count=1000"
 ```
 
+## API Endpoints
+
+Both apps expose the same routes:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/health` | GET | Health check (DB + cache status) |
+| `/` | GET | Basic service info |
+| `/db-test` | GET | Simple DB query latency |
+| `/cache-test` | GET | Cache set/get latency |
+| `/cached-endpoint` | GET | DB-backed response with cache (TTL-based) |
+| `/complex-query` | GET | Parameterized query (`?n=100`) |
+| `/bulk-insert` | POST | Bulk insert test (`?count=1000`) |
+
+### Port mapping
+
+| Service | Port |
+|---|---|
+| FastAPI | 8001 |
+| TurboAPI | 8002 |
+
+PostgreSQL and Valkey ports are **not exposed** to the host by default (internal only on the `backend` network).
+
 ## Running Benchmarks
 
-### Quick Benchmark (wrk)
-
-**Note:** Use wrk installed on your host machine, not from the benchmark container.
+### wrk (recommended for quick A/B comparison)
 
 ```bash
-# Install wrk (macOS)
-brew install wrk
+# Install wrk
+brew install wrk    # macOS
+# apt install wrk   # Debian/Ubuntu
 
-# Run the benchmark script
+# Run the benchmark script (sequential: FastAPI first, then TurboAPI)
 ./benchmarks/run_benchmarks.sh
 
-# Or run manually:
-wrk -t4 -c100 -d30s http://localhost:8001/health
-wrk -t4 -c100 -d30s http://localhost:8002/health
-wrk -t4 -c50 -d30s http://localhost:8001/db-test
-wrk -t4 -c50 -d30s http://localhost:8002/db-test
+# Custom duration and concurrency
+./benchmarks/run_benchmarks.sh -d 15 -c 200 -t 8
 ```
 
-### Full Load Test (Locust)
+Results are saved to `benchmarks/results/`.
+
+### Locust (distributed / web UI)
 
 ```bash
-# Start all services including benchmark
+# Start the benchmark container alongside all services
 docker compose --profile benchmark up -d
 
-# Run Locust headless (from host - requires Locust installed)
-locust -f benchmarks/locustfile.py \
-  --headless \
-  --users 500 \
-  --spawn-rate 50 \
-  --run-time 60s \
-  --host http://localhost:8001
+# Run inside the container against FastAPI
+docker compose exec benchmark \
+  locust -f locustfile.py --headless \
+  --users 500 --spawn-rate 50 --run-time 60s \
+  --host http://app_fastapi:8001
 
-# Or use Docker directly
-docker compose run --rm benchmark \
-  locust -f locustfile.py \
-  --headless \
-  --users 500 \
-  --spawn-rate 50 \
-  --run-time 60s \
-  --host http://localhost:8001
-
-# View Locust web UI
-# Open http://localhost:8089
-```
-  --run-time 60s \
+# Run against TurboAPI
+docker compose exec benchmark \
+  locust -f locustfile.py --headless \
+  --users 500 --spawn-rate 50 --run-time 60s \
   --host http://app_turbo:8002
 ```
 
-### Custom Benchmark Script
+## PostgreSQL Cluster
+
+### pglogical bidirectional replication
+
+The 3 PostgreSQL nodes form a **full-mesh** bidirectional replication topology using the `pglogical` extension. This means every node can accept writes and changes propagate to all other nodes.
+
+**6 subscriptions** (one in each direction for every pair):
+
+```
+node1 ──► node2     node2 ──► node1
+node1 ──► node3     node3 ──► node1
+node2 ──► node3     node3 ──► node2
+```
+
+All subscriptions use `forward_origins := '{}'` to prevent infinite replication loops.
+
+### How it works
+
+1. `postgres/init.sql` runs on each node via `docker-entrypoint-initdb.d`, creating the schema, extensions (`pglogical`, `pg_stat_statements`, `uuid-ossp`), and tables with primary keys (default PK-based replica identity).
+2. After all 3 nodes are healthy, the `pg_setup` one-shot container runs `postgres/setup_replication.sh`:
+   - Creates a pglogical node on each host
+   - Adds all public tables to the `default` replication set on each node
+   - Creates 6 bidirectional subscriptions
+   - Staggers SERIAL sequences per node (`INCREMENT BY 3`, offsets 1/2/3) to prevent PK conflicts in multi-master writes
+   - Runs a smoke test (insert on each node, verify convergence across all 3)
+
+### Verify replication
 
 ```bash
-# Run the benchmark helper script
-./benchmarks/run_benchmarks.sh
+# Check subscription status on all nodes
+docker exec turboapi_pg_node1 psql -U appuser -d app_db -c \
+  "SELECT subscription_name, status FROM pglogical.show_subscription_status();"
+
+docker exec turboapi_pg_node2 psql -U appuser -d app_db -c \
+  "SELECT subscription_name, status FROM pglogical.show_subscription_status();"
+
+docker exec turboapi_pg_node3 psql -U appuser -d app_db -c \
+  "SELECT subscription_name, status FROM pglogical.show_subscription_status();"
+
+# Insert on one node, verify it appears on the others
+docker exec turboapi_pg_node1 psql -U appuser -d app_db -c \
+  "INSERT INTO benchmark_table (data) VALUES ('test_from_node1');"
+
+sleep 3
+
+docker exec turboapi_pg_node2 psql -U appuser -d app_db -c \
+  "SELECT * FROM benchmark_table WHERE data = 'test_from_node1';"
+
+docker exec turboapi_pg_node3 psql -U appuser -d app_db -c \
+  "SELECT * FROM benchmark_table WHERE data = 'test_from_node1';"
 ```
 
-## API Reference
+### PostgreSQL tuning
 
-### Endpoints (Both Services)
+All nodes share the same tuning parameters (defined as `x-pg-tuning` in `docker-compose.yml`):
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check (DB + Cache status) |
-| `/` | GET | Basic info |
-| `/db-test` | GET | Simple DB query latency |
-| `/cache-test` | GET | Cache set/get latency |
-| `/cached endpoint` | GET | Cached response (DB hit on first, cache on subsequent) |
-| `/complex-query` | GET | Complex query with results (param: n) |
-| `/bulk-insert` | POST | Bulk insert test (param: count) |
+| Parameter | Value | Purpose |
+|---|---|---|
+| `shared_preload_libraries` | `pglogical,pg_stat_statements` | Required extensions |
+| `wal_level` | `logical` | Required for pglogical |
+| `max_connections` | 200 | Connection headroom |
+| `shared_buffers` | 256MB | In-memory page cache |
+| `effective_cache_size` | 512MB | Planner hint |
+| `work_mem` | 16MB | Per-operation sort/hash memory |
+| `max_replication_slots` | 10 | Enough for 6 subscriptions + headroom |
+| `max_wal_senders` | 10 | Matching replication slots |
+| `max_wal_size` | 2GB | WAL retention |
+| `wal_keep_size` | 1GB | Prevents WAL recycling before replicas catch up |
+| `statement_timeout` | 300s | Kill runaway queries |
+| `idle_in_transaction_session_timeout` | 60s | Kill idle transactions |
 
-### Port Mapping
-
-| Service | Internal Port | External Port |
-|---------|---------------|---------------|
-| FastAPI | 8001 | 8001 |
-| TurboAPI | 8002 | 8002 |
-| PostgreSQL | 5432 | 5432 |
-| Valkey | 6379 | 6379 |
-
-## Database Access
-
-### Connection Details
-
-| Parameter | Value |
-|-----------|-------|
-| Host | localhost (external) / postgres (internal) |
-| Port | 5432 |
-| Database | app_db |
-| Username | appuser |
-| Password | changeme_prod_2024 (or from .env) |
-
-### Connect from Host Machine
+### Connect to a node from host
 
 ```bash
-# Using psql (install with: brew install postgresql)
-psql -h localhost -p 5432 -U appuser -d app_db
+# The PG ports are not exposed by default. Use docker exec:
+docker exec -it turboapi_pg_node1 psql -U appuser -d app_db
+docker exec -it turboapi_pg_node2 psql -U appuser -d app_db
+docker exec -it turboapi_pg_node3 psql -U appuser -d app_db
 
-# Using Docker
-docker exec -it turboapi_postgres psql -U appuser -d app_db
+# Useful queries
+docker exec turboapi_pg_node1 psql -U appuser -d app_db -c "SELECT version();"
+docker exec turboapi_pg_node1 psql -U appuser -d app_db -c "\dt"
+docker exec turboapi_pg_node1 psql -U appuser -d app_db -c \
+  "SELECT query, calls, mean_exec_time, total_exec_time
+   FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;"
 ```
 
-### Connect from Inside Docker Network
+## Valkey HA Cluster
+
+### Architecture
+
+- **1 primary** — read/write, AOF + RDB persistence, 384MB maxmemory with LRU eviction
+- **2 replicas** — read-only, async replication from primary
+- **3 sentinels** — monitor the primary, quorum of 2 for automatic failover
+
+The apps connect via **Sentinel-aware clients** (`redis.asyncio.sentinel.Sentinel`), so they automatically follow failovers.
+
+### Verify Valkey cluster
 
 ```bash
-# From any container
-docker exec -it turboapi_fastapi psql -h postgres -U appuser -d app_db
+# Check primary info
+docker exec turboapi_valkey valkey-cli info replication
 
-# Using inline SQL
-docker exec -it turboapi_postgres psql -U appuser -d app_db -c "SELECT version();"
-```
+# Check sentinel status
+docker exec turboapi_valkey_sentinel1 valkey-cli -p 26379 sentinel master valkey-primary
 
-### Useful SQL Commands
+# List replicas known to sentinel
+docker exec turboapi_valkey_sentinel1 valkey-cli -p 26379 sentinel replicas valkey-primary
 
-```sql
--- List tables
-\dt
+# Check key count
+docker exec turboapi_valkey valkey-cli dbsize
 
--- List users/roles
-\du
-
--- Show database size
-SELECT pg_size_pretty(pg_database_size('app_db'));
-
--- Show table sizes
-SELECT table_name, pg_size_pretty(pg_total_relation_size(quote_ident(table_name)))
-FROM information_schema.tables
-WHERE table_schema = 'public'
-ORDER BY pg_total_relation_size(quote_ident(table_name)) DESC;
-
--- Check active connections
-SELECT pid, usename, application_name, client_addr, state
-FROM pg_stat_activity
-WHERE datname = 'app_db';
-
--- Query statistics (requires pg_stat_statements extension)
-SELECT query, calls, mean_time, total_time
-FROM pg_stat_statements
-ORDER BY total_time DESC
-LIMIT 10;
-
--- Reset statistics
-SELECT pg_stat_statements_reset();
-```
-
-### Enable Port Forwarding (Optional)
-
-Add to docker-compose.yml if you want external PostgreSQL access:
-
-```yaml
-services:
-  postgres:
-    ports:
-      - "5432:5432"
-```
-
-### Valkey/Redis Access
-
-```bash
-# Connect via CLI
-docker exec -it turboapi_valkey valkey-cli
-
-# Or from host (if port 6379 is exposed)
-valkey-cli -h localhost -p 6379
-
-# Useful commands
-valkey-cli ping           # Test connection
-valkey-cli info stats     # Statistics
-valkey-cli dbsize         # Number of keys
-valkey-cli keys '*'       # List all keys
-valkey-cli flushall       # Clear all keys (careful!)
+# Flush all cache (careful!)
+docker exec turboapi_valkey valkey-cli flushall
 ```
 
 ## Environment Variables
 
-Create a `.env` file (copy from `.env.example`). All settings are configurable:
+Copy `.env.example` to `.env`. All values have sensible defaults in `docker-compose.yml`.
 
-### Database Settings
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `POSTGRES_USER` | appuser | PostgreSQL username |
-| `POSTGRES_PASSWORD` | changeme_prod_2024 | PostgreSQL password |
-| `DATABASE_POOL_SIZE` | 20 | Database connection pool size |
-| `DATABASE_MAX_OVERFLOW` | 10 | Max overflow connections |
+|---|---|---|
+| `POSTGRES_USER` | `appuser` | PostgreSQL username (all nodes) |
+| `POSTGRES_PASSWORD` | `changeme_prod_2024` | PostgreSQL password |
+| `POSTGRES_DB` | `app_db` | Database name |
+| `DATABASE_POOL_SIZE` | `20` | SQLAlchemy async pool size |
+| `DATABASE_MAX_OVERFLOW` | `10` | Pool overflow connections |
+| `CACHE_DEFAULT_TTL` | `300` | Default cache TTL (seconds) |
+| `UVICORN_WORKERS` | `4` | Workers per app |
+| `UVICORN_TIMEOUT_KEEP_ALIVE` | `65` | Keep-alive timeout |
+| `UVICORN_LIMIT_CONCURRENCY` | `1000` | Max concurrent connections |
+| `UVICORN_ACCESS_LOG` | `false` | Access log toggle |
+| `VALKEY_MAX_CONNECTIONS` | `100` | Max Valkey connections per app |
+| `LOG_LEVEL` | `INFO` | Application log level |
 
-### Cache Settings
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VALKEY_HOST` | valkey | Valkey/Redis host |
-| `VALKEY_PORT` | 6379 | Valkey/Redis port |
-| `CACHE_DEFAULT_TTL` | 300 | Default cache TTL in seconds |
+### Tuning for higher load
 
-### Uvicorn Server Settings
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `UVICORN_WORKERS` | 4 | Number of worker processes |
-| `UVICORN_HOST` | 0.0.0.0 | Host to bind to |
-| `UVICORN_PORT` | 8001/8002 | Port to bind to |
-| `UVICORN_TIMEOUT_KEEP_ALIVE` | 65 | Keep-alive timeout (seconds) |
-| `UVICORN_LIMIT_CONCURRENCY` | 1000/2000 | Max concurrent connections |
-| `UVICORN_LIMIT_MAX_REQUESTS` | 10000 | Max requests per worker before restart |
-| `UVICORN_ACCESS_LOG` | false | Enable/disable access logging |
-
-### Example .env Configuration
-
-```env
-# PostgreSQL Configuration
-POSTGRES_USER=appuser
-POSTGRES_PASSWORD=changeme_prod_2024
-
-# Valkey (Redis) Configuration
-VALKEY_HOST=valkey
-VALKEY_PORT=6379
-
-# Application Settings
-LOG_LEVEL=INFO
-DEBUG=false
-
-# Database Pool Settings
-DATABASE_POOL_SIZE=20
-DATABASE_MAX_OVERFLOW=10
-CACHE_DEFAULT_TTL=300
-
-# Uvicorn Server Settings
-UVICORN_WORKERS=4
-UVICORN_HOST=0.0.0.0
-UVICORN_TIMEOUT_KEEP_ALIVE=65
-UVICORN_LIMIT_CONCURRENCY=1000
-UVICORN_LIMIT_MAX_REQUESTS=10000
-UVICORN_ACCESS_LOG=false
-
-# Benchmark URLs
-FASTAPI_URL=http://app_fastapi:8001
-TURBOAPI_URL=http://app_turbo:8002
-```
-
-### Tuning for High Performance
-
-For production benchmarks, you can increase workers and concurrency:
-
-```env
+```bash
+# In .env:
 UVICORN_WORKERS=8
 UVICORN_LIMIT_CONCURRENCY=5000
 DATABASE_POOL_SIZE=50
-```
-
-## Production Considerations
-
-### Database Tuning
-- `shared_buffers`: 256MB (1/4 of available RAM)
-- `work_mem`: 16MB per operation
-- `maintenance_work_mem`: 128MB for maintenance
-- Connection pool: 20-30 connections per worker
-
-### Cache Configuration
-- Maxmemory: 384MB with LRU eviction
-- AOF persistence every second
-- Connection pooling with 50 max connections
-
-### Application Settings
-- Health checks with 10s interval
-- Resource limits and reservations
-- Non-root users in containers
-- Graceful shutdown handling
-
-## Troubleshooting
-
-### Services won't start
-```bash
-# Check logs
-docker compose -f docker-compose-cluster.yml logs postgres_provider
-docker compose -f docker-compose-cluster.yml logs valkey
-docker compose -f docker-compose-cluster.yml logs app_fastapi
-docker compose -f docker-compose-cluster.yml logs app_turbo
-```
-
-### PostgreSQL 18 hot_standby error
-If you see: `FATAL: unrecognized configuration parameter "_hot_standby"`
-Fix: Change `-c-hot_standby=on` to `-chot_standby=on` in docker-compose-cluster.yml
-
-### Database connection issues
-```bash
-# Remove volumes and restart fresh
-docker compose -f docker-compose-cluster.yml down -v
-docker compose -f docker-compose-cluster.yml up -d
-```
-
-### Clear all data
-```bash
-docker compose -f docker-compose-cluster.yml down -v --remove-orphans
-docker compose -f docker-compose-cluster.yml up -d
+DATABASE_MAX_OVERFLOW=20
+VALKEY_MAX_CONNECTIONS=200
 ```
 
 ## Project Structure
 
 ```
-.
-├── docker-compose.yml              # Main orchestration (single PG)
-├── docker-compose-cluster.yml      # 3-node PostgreSQL cluster
-├── app_fastapi/                   # FastAPI service
-│   ├── main.py                    # Application code
-│   ├── config.py                  # Settings (env var loading)
-│   ├── entrypoint.sh               # Configurable uvicorn startup
-│   ├── Dockerfile
-│   └── requirements.txt
-├── app_turbo/                     # TurboAPI service
-│   ├── main.py                    # Application code
-│   ├── config.py                  # Settings
-│   ├── entrypoint.sh               # Configurable uvicorn startup
-│   ├── Dockerfile
-│   └── requirements.txt
+turboapi/
+├── docker-compose.yml               # Single unified compose file
+├── .env                              # Environment variables
+├── .env.example                      # Environment template
 ├── postgres/
-│   ├── Dockerfile                  # Custom PG image with pglogical
-│   ├── init.sql                    # Tables + extensions
-│   ├── pg_hba.conf                 # Replication auth config
-│   ├── .pgpass                     # Credentials file
-│   ├── setup_cluster.sh            # 3-node cluster setup script
-│   └── setup_replication.sh        # Single replica setup
+│   ├── Dockerfile                    # PG 18 + pglogical extension
+│   ├── init.sql                      # Schema, extensions, tables (all nodes)
+│   ├── pg_hba.conf                   # Auth config (covers 172.28.0.0/16)
+│   └── setup_replication.sh          # 3-node full-mesh pglogical setup
 ├── valkey/
-│   └── valkey.conf                # Production Valkey config
+│   └── sentinel.conf                 # Sentinel monitoring config
+├── app_fastapi/
+│   ├── Dockerfile
+│   ├── main.py                       # FastAPI app (sentinel-aware Valkey)
+│   ├── config.py                     # Settings via pydantic-settings
+│   ├── entrypoint.sh                 # Uvicorn startup script
+│   └── requirements.txt
+├── app_turbo/
+│   ├── Dockerfile
+│   ├── main.py                       # TurboAPI app (L1 TTL cache + sentinel)
+│   ├── config.py                     # Settings
+│   ├── entrypoint.sh                 # Uvicorn startup script
+│   └── requirements.txt
 ├── benchmarks/
-│   ├── locustfile.py              # Locust test file
-│   ├── run_benchmarks.sh          # Benchmark runner
-│   └── Dockerfile
-├── .env.example                   # Environment template
+│   ├── Dockerfile                    # wrk + locust image
+│   ├── locustfile.py                 # Single APIUser class, --host flag
+│   ├── run_benchmarks.sh             # wrk-based sequential A/B comparison
+│   ├── requirements.txt
+│   └── results/                      # Benchmark output (git-ignored)
 └── README.md
 ```
 
-## Sample Benchmark Results
+## Troubleshooting
 
-### Single Request Latency (ms)
-
-| Endpoint | FastAPI | TurboAPI | Winner |
-|----------|---------|----------|--------|
-| `/health` | ~5-10 | ~5-10 | Tie |
-| `/db-test` | 15-25 | 40-60 | FastAPI |
-| `/cache-test` | 10-15 | 10-15 | Tie |
-| `/complex-query` | 25-35 | 60-80 | FastAPI |
-| `/bulk-insert` | 20-25 | 40-55 | FastAPI |
-
-### wrk Load Test Results (10s, 50 concurrent connections)
-
-#### Health Endpoint (No DB/Cache)
-```
-FastAPI:
-  Requests/sec:    1164.81
-  Avg Latency:     69.00ms
-  Max Latency:     774.54ms
-  Transfer/sec:    263.65KB
-
-TurboAPI:
-  Requests/sec:    1872.59 (+61%)
-  Avg Latency:     42.53ms (-38%)
-  Max Latency:     1070ms
-  Transfer/sec:    425.64KB (+61%)
-```
-
-**Winner: TurboAPI** - 61% higher throughput, 38% lower latency
-
-#### Cache Test Endpoint
-```
-FastAPI:
-  Requests/sec:    975.32
-  Avg Latency:     118.66ms
-  Max Latency:     868.43ms
-
-TurboAPI:
-  Requests/sec:    336.85 (-65%)
-  Avg Latency:     314.59ms (+165%)
-  Max Latency:     1310ms
-```
-
-**Winner: FastAPI** - Higher throughput at cache-only operations
-
-#### Database Query Endpoint
-```
-FastAPI:
-  Requests/sec:    463.48
-  Avg Latency:     100.08ms
-  Max Latency:     1890ms
-  Timeouts:        40
-
-TurboAPI:
-  Requests/sec:    741.98 (+60%)
-  Avg Latency:     131.55ms
-  Max Latency:     1990ms
-  Timeouts:        7 (-83%)
-```
-
-**Winner: TurboAPI** - 60% higher throughput, 83% fewer timeouts
-
-### Analysis
-
-1. **Health Checks**: TurboAPI with 8 workers handles non-blocking requests 61% better
-2. **Database Operations**: TurboAPI's higher concurrency and cache optimization reduces connection exhaustion
-3. **Cache Operations**: FastAPI's simpler architecture is faster for pure cache hits
-4. **Overall**: TurboAPI's two-tier caching and higher concurrency wins for mixed workloads
-
-## PostgreSQL Replication (3-Node Cluster)
-
-### Architecture
-
-```
-┌─────────────────────┐          ┌─────────────────────┐
-│   Provider (Write)   │ ───────► │   Replica1 (Read)   │
-│   postgres_provider │  WAL     │  postgres_replica1   │
-│   Port: 5432        │          │   Port: 5432        │
-└─────────────────────┘          └─────────────────────┘
-          │
-          └──────────────────────► ┌─────────────────────┐
-               WAL                │   Replica2 (Read)   │
-                                  │  postgres_replica2   │
-                                  │   Port: 5432        │
-                                  └─────────────────────┘
-```
-
-### Start Cluster
+### Check logs
 
 ```bash
-# Start 3-node cluster
-docker compose -f docker-compose-cluster.yml up -d
+# All services
+docker compose logs -f
 
-# Wait for all nodes to be healthy
-docker compose -f docker-compose-cluster.yml ps
+# Specific service
+docker compose logs -f pg_node1
+docker compose logs -f pg_setup
+docker compose logs -f app_fastapi
+docker compose logs -f valkey_sentinel1
 ```
 
-### Manual Replication Setup
+### pg_setup failed or replication not working
 
 ```bash
-# 1. Create publication on provider
-docker exec turboapi_postgres_provider psql -U appuser -d app_db << 'EOSQL'
-CREATE PUBLICATION app_replication_set FOR TABLE benchmark_table, users, posts;
-CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'repl_password_secure_2024';
-GRANT CONNECT ON DATABASE app_db TO replicator;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO replicator;
-ALTER TABLE benchmark_table REPLICA IDENTITY DEFAULT;
-ALTER TABLE users REPLICA IDENTITY DEFAULT;
-ALTER TABLE posts REPLICA IDENTITY DEFAULT;
-EOSQL
+# Re-run setup (tear down volumes first for a clean slate)
+docker compose down -v
+docker compose up -d --build
 
-# 2. Create subscription on replica1
-docker exec turboapi_postgres_replica1 psql -U appuser -d app_db << 'EOSQL'
-CREATE SUBSCRIPTION replica1_subscription 
-CONNECTION 'host=postgres_provider port=5432 dbname=app_db user=replicator password=repl_password_secure_2024'
-PUBLICATION app_replication_set
-WITH (slot_name = 'replica1_subscription', create_slot = true, copy_data = true);
-EOSQL
-
-# 3. Create subscription on replica2
-docker exec turboapi_postgres_replica2 psql -U appuser -d app_db << 'EOSQL'
-CREATE SUBSCRIPTION replica2_subscription 
-CONNECTION 'host=postgres_provider port=5432 dbname=app_db user=replicator password=repl_password_secure_2024'
-PUBLICATION app_replication_set
-WITH (slot_name = 'replica2_subscription', create_slot = true, copy_data = true);
-EOSQL
+# Or just re-run the setup container
+docker compose up pg_setup
 ```
 
-### Verify Replication
+### Apps can't connect to database
+
+The apps depend on `pg_setup` completing successfully. If `pg_setup` failed, the apps won't start. Check `docker compose logs pg_setup` for errors.
+
+### Clear all data and start fresh
 
 ```bash
-# Check publications on provider
-docker exec turboapi_postgres_provider psql -U appuser -d app_db -c "SELECT * FROM pg_publication_tables;"
-
-# Check subscription status
-docker exec turboapi_postgres_replica1 psql -U appuser -d app_db -c "SELECT * FROM pg_stat_subscription;"
-
-# Check replication stats
-docker exec turboapi_postgres_provider psql -U appuser -d app_db -c "SELECT * FROM pg_stat_replication;"
-
-# Test replication
-docker exec turboapi_postgres_provider psql -U appuser -d app_db -c "INSERT INTO benchmark_table (id, data) VALUES (999, 'test') RETURNING *;"
-docker exec turboapi_postgres_replica1 psql -U appuser -d app_db -c "SELECT * FROM benchmark_table WHERE id = 999;"
+docker compose down -v --remove-orphans
+docker compose up -d --build
 ```
 
-### Replication Requirements
+### Sentinel can't find primary after restart
 
-- Tables must have PRIMARY KEY for UPDATE/DELETE replication
-- Set `REPLICA IDENTITY` for tables without PRIMARY KEY
-- wal_level must be `logical`
-- `max_replication_slots` >= number of subscriptions
-- `max_wal_senders` >= number of subscriptions
+If Valkey containers were stopped uncleanly, sentinel state may be stale. Remove volumes:
 
-### PostgreSQL 18 Compatibility
-
-Note: pglogical extension has known issues with PostgreSQL 18.3. If you need full pglogical functionality:
-- Use PostgreSQL 15 or 16
-- Or use native PostgreSQL logical replication (shown above)
-
-Key PostgreSQL 18 differences:
-- `hot_standby` (not `-hot_standby`) in config
-- `pg_subscription_rel` behavior differs from earlier versions
-- Some pglogical views have changed column names
-
-## Current Status
-
-### Working ✓
-- **Single PostgreSQL** (docker-compose.yml) - Full functionality
-- **3-Node Cluster** (docker-compose-cluster.yml) - Containers healthy, native logical replication configured
-- **FastAPI Service** (Port 8001) - All endpoints working, connects to PostgreSQL and Valkey
-- **TurboAPI Service** (Port 8002) - All endpoints working, connects to PostgreSQL and Valkey
-- **Valkey Cache** - Healthy, AOF persistence enabled
-- **Custom PostgreSQL Image** - Successfully built with pglogical extension
-
-### Replication Status
-- Provider/Subscriber structure created
-- `app_replication_set` publication exists on provider
-- `replicator` role with REPLICATION privilege created
-- Subscriptions connecting between nodes
-- **Note**: Native PostgreSQL logical replication in progress; pglogical extension has compatibility issues with PostgreSQL 18.3
-
-### Quick Test
 ```bash
-# Health checks
-curl http://localhost:8001/health
-curl http://localhost:8002/health
-
-# DB test
-curl http://localhost:8001/db-test
-
-# Cache test
-curl http://localhost:8001/cache-test
-
-# Complex query
-curl http://localhost:8001/complex-query
+docker compose down -v
+docker compose up -d
 ```
+
+## Key Design Decisions
+
+- **pglogical over native PG logical replication**: pglogical's `forward_origins` parameter is essential for preventing infinite loops in bidirectional/multi-master topologies. Native PG logical replication does not have an equivalent.
+- **`forward_origins := '{}'`**: Each subscription only replicates rows that originated locally on the provider, preventing replication loops in the 3-node mesh.
+- **`REPLICA IDENTITY` using default (PK)**: All replicated tables have primary keys, so pglogical uses PK-based identity for UPDATE/DELETE replication. No need for `REPLICA IDENTITY FULL`.
+- **Staggered SERIAL sequences**: Each node uses `INCREMENT BY 3` with different start offsets (node1=1, node2=2, node3=3) so concurrent multi-master writes never produce conflicting primary keys (node1: 1,4,7..., node2: 2,5,8..., node3: 3,6,9...).
+- **Sentinel over Valkey Cluster**: Sentinel provides HA failover for a single primary, which is simpler and sufficient for this caching use case. Valkey Cluster (sharding) would be overkill.
+- **Single `docker-compose.yml`**: All infrastructure in one file, no multi-file confusion. The benchmark service uses a Docker Compose profile (`--profile benchmark`) so it only starts on demand.
 
 ## License
 

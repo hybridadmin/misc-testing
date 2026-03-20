@@ -3,15 +3,22 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    create_async_engine,
+    AsyncSession,
+    async_sessionmaker,
+)
 from sqlalchemy import text
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.middleware import SlowAPIMiddleware
 import redis.asyncio as redis
+from redis.asyncio.sentinel import Sentinel
 from redis.asyncio import ConnectionPool
 import logging
 import time
+import json
+import os
 from typing import Optional
 
 from config import get_settings
@@ -20,10 +27,13 @@ settings = get_settings()
 limiter = Limiter(key_func=get_remote_address)
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 db_engine: Optional[create_async_engine] = None
 db_session_maker: Optional[async_sessionmaker] = None
-redis_pool: Optional[ConnectionPool] = None
 redis_client: Optional[redis.Redis] = None
 
 
@@ -35,6 +45,7 @@ async def init_db():
         max_overflow=settings.database_max_overflow,
         pool_timeout=settings.database_pool_timeout,
         pool_recycle=settings.database_pool_recycle,
+        pool_pre_ping=True,
         echo=settings.database_echo,
     )
     db_session_maker = async_sessionmaker(
@@ -46,15 +57,53 @@ async def init_db():
 
 
 async def init_redis():
-    global redis_pool, redis_client
-    redis_pool = ConnectionPool.from_url(
+    """Connect to Valkey.
+    If VALKEY_SENTINEL_HOSTS is set, discover the primary via Sentinel.
+    Otherwise fall back to direct VALKEY_URL connection.
+    """
+    global redis_client
+    sentinel_hosts_str = os.getenv("VALKEY_SENTINEL_HOSTS", "")
+    sentinel_master = os.getenv("VALKEY_SENTINEL_MASTER", "valkey-primary")
+
+    if sentinel_hosts_str:
+        sentinels = []
+        for hp in sentinel_hosts_str.split(","):
+            hp = hp.strip()
+            if ":" in hp:
+                h, p = hp.rsplit(":", 1)
+                sentinels.append((h, int(p)))
+        if sentinels:
+            try:
+                sentinel = Sentinel(
+                    sentinels,
+                    socket_timeout=settings.valkey_socket_timeout,
+                    socket_connect_timeout=settings.valkey_socket_connect_timeout,
+                )
+                redis_client = sentinel.master_for(
+                    sentinel_master,
+                    redis_class=redis.Redis,
+                    decode_responses=settings.valkey_decode_responses,
+                )
+                await redis_client.ping()
+                logger.info(
+                    "Connected to Valkey via Sentinel (master=%s)", sentinel_master
+                )
+                return
+            except Exception as e:
+                logger.warning(
+                    "Sentinel connection failed (%s), falling back to direct", e
+                )
+
+    # Direct connection fallback
+    pool = ConnectionPool.from_url(
         settings.valkey_url,
         max_connections=settings.valkey_max_connections,
         socket_timeout=settings.valkey_socket_timeout,
         socket_connect_timeout=settings.valkey_socket_connect_timeout,
         decode_responses=settings.valkey_decode_responses,
     )
-    redis_client = redis.Redis(connection_pool=redis_pool)
+    redis_client = redis.Redis(connection_pool=pool)
+    logger.info("Connected to Valkey directly at %s", settings.valkey_url)
 
 
 async def close_db():
@@ -64,20 +113,18 @@ async def close_db():
 
 
 async def close_redis():
-    global redis_pool, redis_client
+    global redis_client
     if redis_client:
         await redis_client.aclose()
-    if redis_pool:
-        await redis_pool.disconnect()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting FastAPI application...")
+    logger.info("Starting FastAPI application ...")
     await init_db()
     await init_redis()
     yield
-    logger.info("Shutting down FastAPI application...")
+    logger.info("Shutting down FastAPI application ...")
     await close_redis()
     await close_db()
 
@@ -100,13 +147,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
-
 app.state.limiter = limiter
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    logger.error("Unhandled exception: %s", exc, exc_info=True)
     return JSONResponse(
         status_code=500,
         content={
@@ -116,26 +162,30 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+# ─── Routes ──────────────────────────────────────────────────
+
+
 @app.get("/health")
 async def health_check():
-    db_status = "healthy"
-    redis_status = "healthy"
-
+    db_ok = True
+    cache_ok = True
+    try:
+        async with db_session_maker() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception:
+        db_ok = False
     try:
         if redis_client:
-            async with redis_client.pipeline() as pipe:
-                pipe.ping()
-                result = await pipe.execute()
-                if result and result[0]:
-                    redis_status = "healthy"
-    except Exception as e:
-        redis_status = f"unhealthy: {str(e)[:50]}"
+            await redis_client.ping()
+    except Exception:
+        cache_ok = False
 
+    status = "healthy" if (db_ok and cache_ok) else "degraded"
     return {
-        "status": "healthy",
+        "status": status,
         "app": settings.app_name,
-        "database": db_status,
-        "cache": redis_status,
+        "database": "healthy" if db_ok else "unhealthy",
+        "cache": "healthy" if cache_ok else "unhealthy",
         "timestamp": time.time(),
     }
 
@@ -149,7 +199,7 @@ async def root():
 async def db_test():
     start = time.perf_counter()
     async with db_session_maker() as session:
-        result = await session.execute(text("SELECT 1 as id, NOW() as timestamp"))
+        result = await session.execute(text("SELECT 1 AS id, NOW() AS ts"))
         row = result.fetchone()
     duration = time.perf_counter() - start
     return {
@@ -173,44 +223,42 @@ async def cache_test():
     }
 
 
-@app.get("/cached endpoint")
+@app.get("/cached-endpoint")
 @limiter.limit("100/second")
 async def cached_endpoint(request: Request, key: str = "default"):
-    cache_key = f"cached:endpoint:{key}"
+    cache_key = f"fastapi:cached:{key}"
     cached = await redis_client.get(cache_key)
 
     if cached:
-        import json
-
         data = json.loads(cached)
         data["cached"] = True
         return data
 
     start = time.perf_counter()
     async with db_session_maker() as session:
-        result = await session.execute(text("SELECT NOW() as timestamp, 42 as answer"))
+        result = await session.execute(text("SELECT NOW() AS ts, 42 AS answer"))
         row = result.fetchone()
-
     duration = time.perf_counter() - start
+
     data = {
         "timestamp": str(row[0]),
         "answer": row[1],
         "db_duration_ms": round(duration * 1000, 3),
         "cached": False,
     }
-
-    import json
-
     await redis_client.setex(cache_key, settings.cache_default_ttl, json.dumps(data))
     return data
 
 
 @app.get("/complex-query")
 async def complex_query(n: int = 100):
+    if n < 1 or n > 10000:
+        raise HTTPException(status_code=400, detail="n must be between 1 and 10000")
     start = time.perf_counter()
     async with db_session_maker() as session:
         result = await session.execute(
-            text(f"SELECT generate_series(1, {n}) as num, NOW() as ts")
+            text("SELECT gs, NOW() AS ts FROM generate_series(1, :n) AS gs"),
+            {"n": n},
         )
         rows = result.fetchall()
     duration = time.perf_counter() - start
@@ -223,13 +271,19 @@ async def complex_query(n: int = 100):
 
 @app.post("/bulk-insert")
 async def bulk_insert(count: int = 1000):
+    if count < 1 or count > 50000:
+        raise HTTPException(status_code=400, detail="count must be between 1 and 50000")
     start = time.perf_counter()
     async with db_session_maker() as session:
-        values = ", ".join([f"({i}, 'test_{i}', NOW())" for i in range(count)])
+        # Use generate_series for efficient bulk insert instead of building values string
         await session.execute(
             text(
-                f"INSERT INTO benchmark_table (id, data, created_at) VALUES {values} ON CONFLICT (id) DO NOTHING"
-            )
+                "INSERT INTO benchmark_table (data, created_at) "
+                "SELECT 'bench_' || gs, NOW() "
+                "FROM generate_series(1, :cnt) AS gs "
+                "ON CONFLICT DO NOTHING"
+            ),
+            {"cnt": count},
         )
         await session.commit()
     duration = time.perf_counter() - start
