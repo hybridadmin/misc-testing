@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     debug: bool = False
     environment: Literal["development", "staging", "production"] = "production"
 
-    database_url: str = "postgresql+asyncpg://appuser:changeme@postgres:5432/app_db"
+    database_url: str = "postgres://appuser:changeme@postgres:5432/app_db"
     database_url_sync: str = (
         "postgresql+psycopg2://appuser:changeme@postgres:5432/app_db"
     )

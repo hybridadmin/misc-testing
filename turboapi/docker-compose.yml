@@ -425,7 +425,7 @@ services:
     environment:
       <<: *common-env
       APP_NAME: "turboapi"
-      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-changeme_prod_2024}@pg_node2:5432/app_db"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-changeme_prod_2024}@pg_node2:5432/app_db"
       DATABASE_URL_SYNC: "postgresql+psycopg2://${POSTGRES_USER:-appuser}:${POSTGRES_PASSWORD:-changeme_prod_2024}@pg_node2:5432/app_db"
       VALKEY_SENTINEL_HOSTS: "valkey_sentinel1:26379,valkey_sentinel2:26379,valkey_sentinel3:26379"
       VALKEY_SENTINEL_MASTER: "valkey-primary"
@@ -449,7 +449,7 @@ services:
         condition: service_healthy
     healthcheck:
       <<: *healthcheck
-      test: ["CMD", "curl", "-sf", "http://localhost:8002/health"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:8002/health || exit 1"]
     networks:
       - backend
     deploy:

@@ -1,30 +1,53 @@
 #!/bin/bash
 set -e
 
-ACCESS_LOG_FLAG=""
-if [ "${UVICORN_ACCESS_LOG:-false}" = "true" ]; then
-    ACCESS_LOG_FLAG="--access-log"
-fi
-
-MAX_REQUESTS_FLAG=""
-if [ -n "${UVICORN_LIMIT_MAX_REQUESTS}" ] && [ "${UVICORN_LIMIT_MAX_REQUESTS}" != "0" ]; then
-    MAX_REQUESTS_FLAG="--limit-max-requests ${UVICORN_LIMIT_MAX_REQUESTS}"
-fi
-
-echo "Starting TurboAPI with configuration:"
-echo "  Workers: ${UVICORN_WORKERS:-4}"
+echo "Starting TurboAPI v1.0 with TurboDB..."
 echo "  Host: ${UVICORN_HOST:-0.0.0.0}"
 echo "  Port: ${UVICORN_PORT:-8002}"
-echo "  Timeout: ${UVICORN_TIMEOUT_KEEP_ALIVE:-65}s"
-echo "  Concurrency: ${UVICORN_LIMIT_CONCURRENCY:-2000}"
-echo "  Max Requests: ${UVICORN_LIMIT_MAX_REQUESTS:-0} (0=disabled)"
-echo "  Access Log: ${UVICORN_ACCESS_LOG:-false}"
 
-exec python -m uvicorn main:app \
-    --host "${UVICORN_HOST:-0.0.0.0}" \
-    --port "${UVICORN_PORT:-8002}" \
-    --workers "${UVICORN_WORKERS:-4}" \
-    --timeout-keep-alive "${UVICORN_TIMEOUT_KEEP_ALIVE:-65}" \
-    --limit-concurrency "${UVICORN_LIMIT_CONCURRENCY:-2000}" \
-    $MAX_REQUESTS_FLAG \
-    $ACCESS_LOG_FLAG
+exec /opt/python3.14t/bin/python3 -c "
+import sys
+import io
+
+class FilterOutput:
+    def __init__(self, output):
+        self.output = output
+        self.buffer = []
+        
+    def write(self, text):
+        for char in text:
+            if char == '\n':
+                self._flush()
+            else:
+                self.buffer.append(char)
+        return len(text)
+    
+    def _flush(self):
+        if self.buffer:
+            line = ''.join(self.buffer).rstrip()
+            self.buffer = []
+            if not line:
+                return
+            # Only keep these specific lines
+            keep = [
+                'Using pure Python',
+                'Using Zig native',
+                'TurboAPI: Python',
+                'TurboNet-Zig server listening',
+                'Zig HTTP core active',
+            ]
+            for k in keep:
+                if k in line:
+                    self.output.write(line + '\n')
+                    return
+    
+    def flush(self):
+        self._flush()
+        self.output.flush()
+
+old_stdout = sys.stdout
+sys.stdout = FilterOutput(sys.stdout)
+
+import main
+main.app.run(host='${UVICORN_HOST:-0.0.0.0}', port=${UVICORN_PORT:-8002})
+"
