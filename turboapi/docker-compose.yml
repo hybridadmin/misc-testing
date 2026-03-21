@@ -10,60 +10,6 @@ x-healthcheck-defaults: &healthcheck
   retries: 5
   start_period: 30s
 
-x-pg-tuning: &pg-tuning
-  - -c
-  - shared_preload_libraries=pglogical,pg_stat_statements
-  - -c
-  - max_connections=200
-  - -c
-  - shared_buffers=256MB
-  - -c
-  - effective_cache_size=512MB
-  - -c
-  - work_mem=16MB
-  - -c
-  - maintenance_work_mem=128MB
-  - -c
-  - checkpoint_completion_target=0.9
-  - -c
-  - wal_buffers=16MB
-  - -c
-  - default_statistics_target=100
-  - -c
-  - random_page_cost=1.1
-  - -c
-  - effective_io_concurrency=200
-  - -c
-  - max_wal_size=2GB
-  - -c
-  - min_wal_size=80MB
-  - -c
-  - wal_level=logical
-  - -c
-  - max_replication_slots=10
-  - -c
-  - max_wal_senders=10
-  - -c
-  - max_worker_processes=16
-  - -c
-  - max_logical_replication_workers=4
-  - -c
-  - max_sync_workers_per_subscription=2
-  - -c
-  - wal_keep_size=1GB
-  - -c
-  - log_min_duration_statement=1000
-  - -c
-  - log_lock_waits=on
-  - -c
-  - log_temp_files=0
-  - -c
-  - idle_in_transaction_session_timeout=60000
-  - -c
-  - statement_timeout=300000
-  - -c
-  - hba_file=/etc/postgresql/pg_hba.conf
-
 services:
   # ─── PostgreSQL Node 1 (FastAPI writes here) ───
   pg_node1:
@@ -80,10 +26,15 @@ services:
       PGLOGICAL_NODE_NAME: node1
       PGLOGICAL_PEER_HOST: pg_node2
       PGLOGICAL_PEER_NAME: node2
-    command: *pg-tuning
+      PGBACKREST_STANZA: turboapi-node1
+    command: postgres -c shared_preload_libraries=pglogical,pg_stat_statements
     volumes:
       - pg_node1_data:/var/lib/postgresql
-      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - pgbackrest_repo:/var/lib/pgbackrest
+      - pgbackrest_spool1:/var/spool/pgbackrest
+      - pgbackrest_log1:/var/log/pgbackrest
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
     healthcheck:
       <<: *healthcheck
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser} -d app_db"]
@@ -111,10 +62,15 @@ services:
       PGLOGICAL_NODE_NAME: node2
       PGLOGICAL_PEER_HOST: pg_node1
       PGLOGICAL_PEER_NAME: node1
-    command: *pg-tuning
+      PGBACKREST_STANZA: turboapi-node2
+    command: postgres -c shared_preload_libraries=pglogical,pg_stat_statements
     volumes:
       - pg_node2_data:/var/lib/postgresql
-      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - pgbackrest_repo:/var/lib/pgbackrest
+      - pgbackrest_spool2:/var/spool/pgbackrest
+      - pgbackrest_log2:/var/log/pgbackrest
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
     healthcheck:
       <<: *healthcheck
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser} -d app_db"]
@@ -140,10 +96,15 @@ services:
       POSTGRES_DB: app_db
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
       PGLOGICAL_NODE_NAME: node3
-    command: *pg-tuning
+      PGBACKREST_STANZA: turboapi-node3
+    command: postgres -c shared_preload_libraries=pglogical,pg_stat_statements
     volumes:
       - pg_node3_data:/var/lib/postgresql
-      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - pgbackrest_repo:/var/lib/pgbackrest
+      - pgbackrest_spool3:/var/spool/pgbackrest
+      - pgbackrest_log3:/var/log/pgbackrest
+      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf
+      - ./postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
     healthcheck:
       <<: *healthcheck
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-appuser} -d app_db"]
@@ -484,6 +445,13 @@ volumes:
   pg_node1_data:
   pg_node2_data:
   pg_node3_data:
+  pgbackrest_repo:
+  pgbackrest_spool1:
+  pgbackrest_spool2:
+  pgbackrest_spool3:
+  pgbackrest_log1:
+  pgbackrest_log2:
+  pgbackrest_log3:
   valkey_primary_data:
   valkey_replica1_data:
   valkey_replica2_data:
