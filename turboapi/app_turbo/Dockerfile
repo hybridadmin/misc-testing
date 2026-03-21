@@ -54,7 +54,7 @@ ENV PATH="/opt/python3.14t/bin:$PATH"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl3 zlib1g libbz2-1.0 libreadline8 libsqlite3-0 \
-        libncurses6 libffi8 liblzma5 curl \
+        libncurses6 libffi8 liblzma5 curl gcc libc-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/lib /usr/local/lib
@@ -65,6 +65,8 @@ RUN useradd --create-home --shell /bin/bash appuser
 WORKDIR /app
 
 COPY --chown=appuser:appuser . .
+
+RUN gcc -shared -fPIC -o /usr/local/lib/libwrite_filter.so write_filter.c
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1

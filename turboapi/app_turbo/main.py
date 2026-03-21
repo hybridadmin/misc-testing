@@ -25,7 +25,10 @@ def _convert_to_turbo_url(async_url: str) -> str:
 
 
 turbo_url = _convert_to_turbo_url(settings.database_url)
-print(f"Configuring TurboDB: {turbo_url}")
+import re
+
+obfuscated_url = re.sub(r"(://[^:]+:)[^@]+(@)", r"\1****\2", turbo_url)
+print(f"Configuring TurboDB: {obfuscated_url}")
 
 app = TurboAPI(
     title="TurboAPI Performance Test",
