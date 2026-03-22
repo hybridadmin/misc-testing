@@ -1,0 +1,36 @@
+services:
+  postgres:
+    build: .
+    container_name: postgres-barman
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin_password
+      POSTGRES_DB: proddb
+      # Used in the init script
+      BARMAN_PASSWORD: barman_password
+      # Cron schedule for backup (e.g., every day at 2 AM)
+      BACKUP_SCHEDULE: "0 2 * * *"
+    volumes:
+      - pg_data:/var/lib/postgresql
+      - ./postgres/initdb.d:/docker-entrypoint-initdb.d
+      - barman_data:/var/lib/barman
+      - barman_logs:/var/log/barman
+    command: >
+      postgres
+      -c wal_level=replica
+      -c max_wal_senders=3
+      -c max_replication_slots=3
+      -c listen_addresses='*'
+    ports:
+      - "5432:5432"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d proddb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pg_data:
+  barman_data:
+  barman_logs:
