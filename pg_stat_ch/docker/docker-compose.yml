@@ -1,0 +1,93 @@
+# =============================================================================
+# pg_stat_ch Demo Stack
+# =============================================================================
+# PostgreSQL 18 (with pg_stat_ch) + ClickHouse (latest)
+#
+# Usage:
+#   docker compose up -d --build
+#   docker compose logs -f postgres     # watch pg_stat_ch background worker
+#   docker compose down -v              # tear down (including volumes)
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # ClickHouse — analytical store for query telemetry
+  # ---------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: pg_stat_ch_clickhouse
+    ports:
+      - "9000:9000"     # Native TCP protocol (used by pg_stat_ch)
+      - "8123:8123"     # HTTP interface (for clickhouse-client / DBeaver / etc.)
+    volumes:
+      - ./init/clickhouse:/docker-entrypoint-initdb.d   # auto-applies 00-schema.sql
+      - clickhouse-data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DB: pg_stat_ch
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "-q", "SELECT 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 18 with pg_stat_ch extension pre-installed
+  # ---------------------------------------------------------------------------
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
+    container_name: pg_stat_ch_postgres
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: demo
+    command:
+      - "postgres"
+      # --- pg_stat_ch configuration ---
+      - "-c"
+      - "shared_preload_libraries=pg_stat_ch"
+      - "-c"
+      - "pg_stat_ch.enabled=on"
+      - "-c"
+      - "pg_stat_ch.clickhouse_host=clickhouse"
+      - "-c"
+      - "pg_stat_ch.clickhouse_port=9000"
+      - "-c"
+      - "pg_stat_ch.clickhouse_user=default"
+      - "-c"
+      - "pg_stat_ch.clickhouse_password="
+      - "-c"
+      - "pg_stat_ch.clickhouse_database=pg_stat_ch"
+      - "-c"
+      - "pg_stat_ch.flush_interval_ms=250"
+      - "-c"
+      - "pg_stat_ch.batch_max=1000"
+      # --- PostgreSQL tuning for better telemetry ---
+      - "-c"
+      - "track_io_timing=on"
+      - "-c"
+      - "compute_query_id=on"
+    volumes:
+      - ./init/postgres:/docker-entrypoint-initdb.d     # seeds demo schema + data
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d demo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  clickhouse-data:
+  postgres-data:

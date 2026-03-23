@@ -1,0 +1,58 @@
+# =============================================================================
+# PostgreSQL 18 + pg_stat_ch extension
+# =============================================================================
+# Multi-stage build:
+#   Stage 1 (builder): Compiles pg_stat_ch from source against PG18 dev headers
+#   Stage 2 (runtime): Slim postgres:18 image with only the compiled extension
+# =============================================================================
+
+FROM debian:bookworm AS builder
+
+# Install PostgreSQL 18 dev headers and build tools
+RUN apt-get update && apt-get install -y \
+        curl ca-certificates gnupg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+       | gpg --dearmor -o /usr/share/keyrings/postgresql.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+       > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update && apt-get install -y \
+        build-essential \
+        cmake \
+        ninja-build \
+        git \
+        postgresql-server-dev-18 \
+        libssl-dev \
+        zlib1g-dev \
+        libc-ares-dev \
+        libre2-dev \
+        libprotobuf-dev \
+        protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone pg_stat_ch (with vendored clickhouse-cpp submodule)
+WORKDIR /build
+RUN git clone --recurse-submodules https://github.com/ClickHouse/pg_stat_ch.git
+
+# Build the extension
+WORKDIR /build/pg_stat_ch
+RUN cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DWITH_OPENSSL=ON \
+    && cmake --build build
+
+# ---------------------------------------------------------------------------
+# Runtime stage — slim postgres:18 image
+# ---------------------------------------------------------------------------
+FROM postgres:18-bookworm
+
+RUN apt-get update && apt-get install -y \
+        libssl3 \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy compiled extension artefacts from builder
+COPY --from=builder /build/pg_stat_ch/build/pg_stat_ch.so        /usr/lib/postgresql/18/lib/
+COPY --from=builder /build/pg_stat_ch/sql/pg_stat_ch--0.1.sql    /usr/share/postgresql/18/extension/
+COPY --from=builder /build/pg_stat_ch/pg_stat_ch.control          /usr/share/postgresql/18/extension/
+
+EXPOSE 5432
