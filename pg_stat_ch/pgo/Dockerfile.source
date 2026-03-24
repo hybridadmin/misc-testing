@@ -1,0 +1,104 @@
+# =============================================================================
+# Crunchy Postgres 18 + pg_stat_ch extension (build from source)
+# =============================================================================
+# Multi-stage build:
+#   Stage 1 (pg-build):  Compile PostgreSQL 18.1 from source on Fedora to
+#                         produce the server headers and pg_config needed by
+#                         extension builds.
+#   Stage 2 (ext-build): Compile pg_stat_ch against those PG18 headers.
+#   Stage 3 (runtime):   Crunchy Postgres UBI9 image with only the compiled
+#                         extension copied in.
+# =============================================================================
+
+ARG PG_VERSION=18.1
+ARG BASE_IMAGE=registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi9-18.1-2550
+
+# ---------------------------------------------------------------------------
+# Stage 1 — Build PostgreSQL 18 from source
+# ---------------------------------------------------------------------------
+# Full build + install so that pg_config, server headers, and PGXS are all
+# correctly placed under --prefix=/usr/pgsql-18.
+# readline is disabled (--without-readline) since we only need build artifacts.
+# ---------------------------------------------------------------------------
+FROM fedora:41 AS pg-build
+
+ARG PG_VERSION
+
+RUN dnf install -y \
+        gcc \
+        gcc-c++ \
+        make \
+        bison \
+        flex \
+        perl \
+        zlib-devel \
+        openssl-devel \
+        curl \
+    && dnf clean all
+
+WORKDIR /build
+RUN curl -fSL \
+        "https://ftp.postgresql.org/pub/source/v${PG_VERSION}/postgresql-${PG_VERSION}.tar.bz2" \
+        -o postgresql.tar.bz2 \
+    && tar xjf postgresql.tar.bz2 \
+    && rm postgresql.tar.bz2
+
+WORKDIR /build/postgresql-${PG_VERSION}
+RUN ./configure \
+        --prefix=/usr/pgsql-18 \
+        --with-openssl \
+        --without-readline \
+        --without-icu \
+    && make -j"$(nproc)" \
+    && make install
+
+# ---------------------------------------------------------------------------
+# Stage 2 — Build pg_stat_ch against the PG18 headers
+# ---------------------------------------------------------------------------
+FROM fedora:41 AS ext-build
+
+RUN dnf install -y \
+        gcc \
+        gcc-c++ \
+        cmake \
+        ninja-build \
+        git \
+        make \
+        openssl-devel \
+        zlib-devel \
+    && dnf clean all
+
+# Bring in the PG18 headers, pg_config, and pgxs from stage 1
+COPY --from=pg-build /usr/pgsql-18 /usr/pgsql-18
+
+# Clone pg_stat_ch (with vendored clickhouse-cpp submodule)
+WORKDIR /build
+RUN git clone --recurse-submodules https://github.com/ClickHouse/pg_stat_ch.git
+
+# Build the extension using the locally-compiled pg_config
+WORKDIR /build/pg_stat_ch
+RUN export PATH="/usr/pgsql-18/bin:$PATH" \
+    && cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DWITH_OPENSSL=ON \
+    && cmake --build build --parallel $(nproc)
+
+# ---------------------------------------------------------------------------
+# Stage 3 (runtime) — Crunchy Postgres image with the compiled extension
+# ---------------------------------------------------------------------------
+FROM ${BASE_IMAGE}
+
+USER root
+
+# Copy compiled extension artefacts from ext-build into the paths pg_config
+# reports on the Crunchy UBI9 image:
+#   pg_config --pkglibdir  -> /usr/pgsql-18/lib
+#   pg_config --sharedir   -> /usr/pgsql-18/share
+COPY --from=ext-build /build/pg_stat_ch/build/pg_stat_ch.so       /usr/pgsql-18/lib/
+COPY --from=ext-build /build/pg_stat_ch/sql/pg_stat_ch--0.1.sql   /usr/pgsql-18/share/extension/
+COPY --from=ext-build /build/pg_stat_ch/pg_stat_ch.control         /usr/pgsql-18/share/extension/
+
+EXPOSE 5432
+
+# Switch back to the postgres user (Crunchy uses UID 26)
+USER 26
