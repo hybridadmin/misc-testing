@@ -54,14 +54,26 @@ enabled=1\n' > /etc/yum.repos.d/centos9.repo \
 WORKDIR /build
 RUN git clone --recurse-submodules https://github.com/ClickHouse/pg_stat_ch.git
 
+<<<<<<< Updated upstream
 # Build the extension using the locally-compiled pg_config.
 # gRPC (pulled by opentelemetry-cpp) is extremely memory-hungry to compile.
 # Cap parallelism to 2 jobs to avoid OOM kills in constrained Docker builds.
 # Increase BUILD_JOBS if you have plenty of RAM (each gRPC compile job can
 # use 1-2 GB).
 ARG BUILD_JOBS=4
+||||||| Stash base
+# Build the extension using the locally-compiled pg_config
+=======
+# Build the extension using the locally-compiled pg_config.
+# gRPC (pulled by opentelemetry-cpp) is extremely memory-hungry to compile.
+# Cap parallelism to 2 jobs to avoid OOM kills in constrained Docker builds.
+# Increase BUILD_JOBS if you have plenty of RAM (each gRPC compile job can
+# use 1-2 GB).
+ARG BUILD_JOBS=2
+>>>>>>> Stashed changes
 WORKDIR /build/pg_stat_ch
 RUN export PATH="/usr/pgsql-18/bin:$PATH" \
+<<<<<<< Updated upstream
     && cmake --preset release -DPG_CONFIG=/usr/pgsql-18/bin/pg_config \
     && cmake --build build --parallel ${BUILD_JOBS} \
     # Remove debug symbols to shrink the extension from ~512M to ~24M
@@ -79,6 +91,17 @@ RUN export PATH="/usr/pgsql-18/bin:$PATH" \
 #        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
 #        -DWITH_OPENSSL=ON \
 #    && cmake --build build --parallel $(nproc)
+||||||| Stash base
+    && cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DWITH_OPENSSL=ON \
+    && cmake --build build --parallel $(nproc)
+=======
+    && cmake -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DWITH_OPENSSL=ON \
+    && cmake --build build --parallel ${BUILD_JOBS}
+>>>>>>> Stashed changes
 
 # ---------------------------------------------------------------------------
 # Stage 2 (runtime) — Crunchy Postgres image with the compiled extension
