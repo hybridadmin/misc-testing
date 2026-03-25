@@ -1,0 +1,28 @@
+<clickhouse>
+    <users>
+        <insert_user>
+            <!-- No password -->
+            <no_password/>
+
+            <!-- Restrict source network (recommended with no password) -->
+            <!-- Use <ip>::/0</ip> to allow from anywhere (less secure) -->
+            <networks>
+                <ip>10.0.0.0/8</ip>
+            </networks>
+
+            <!-- Default database -->
+            <default_database>my_database</default_database>
+
+            <!-- Profile -->
+            <profile>default</profile>
+
+            <!-- Quota -->
+            <quota>default</quota>
+
+            <!-- Grant only INSERT on the specific database (requires ClickHouse 22.4+) -->
+            <grants>
+                <query>GRANT INSERT ON my_database.* TO insert_user</query>
+            </grants>
+        </insert_user>
+    </users>
+</clickhouse>
