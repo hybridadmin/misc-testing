@@ -1,0 +1,816 @@
+# Kubernetes Bare-Metal Deployment (Manual)
+
+Production-ready Kubernetes cluster deployment on Debian 12/13 bare-metal, using shell scripts and kubeadm. Designed for a minimal topology of 1 control plane + 1 worker node with full best-practice hardening.
+
+## Architecture
+
+```
+                    ┌──────────────────────────────────┐
+                    │       Control Plane (cp1)         │
+                    │                                   │
+                    │  kube-apiserver     (6443)        │
+                    │  etcd               (2379-2380)   │
+                    │  kube-scheduler     (10259)       │
+                    │  controller-manager (10257)       │
+                    │  kubelet            (10250)       │
+                    │  containerd                       │
+                    │                                   │
+                    │  CoreDNS, Calico, kube-proxy      │
+                    └──────────────┬───────────────────┘
+                                   │
+                            K8s API (6443)
+                            Calico VXLAN (8472)
+                                   │
+                    ┌──────────────┴───────────────────┐
+                    │        Worker Node (worker1)      │
+                    │                                   │
+                    │  kubelet            (10250)       │
+                    │  kube-proxy         (10256)       │
+                    │  containerd                       │
+                    │                                   │
+                    │  Calico, NodePorts (30000-32767)  │
+                    │  Workload pods                    │
+                    └──────────────────────────────────┘
+```
+
+### What Gets Installed
+
+| Layer | Component | Purpose |
+|-------|-----------|---------|
+| Runtime | containerd | Container runtime (with SystemdCgroup) |
+| Orchestration | kubeadm + kubelet + kubectl | Cluster bootstrap and management |
+| CNI | Calico (Tigera Operator) | Pod networking + NetworkPolicy enforcement |
+| Load Balancer | MetalLB (L2 mode) | `type: LoadBalancer` for bare-metal |
+| Ingress | NGINX Ingress Controller | HTTP/HTTPS reverse proxy |
+| Storage | Longhorn or local-path-provisioner | Persistent volumes |
+| TLS | cert-manager | Automated certificate management |
+| Monitoring | kube-prometheus-stack + Loki | Metrics, dashboards, alerts, logs |
+| Security | PSA, NetworkPolicies, etcd encryption, audit logging | Defense in depth |
+| Backup | etcd snapshots (cron) + Velero (template) | Disaster recovery |
+
+## Prerequisites
+
+### Hardware
+
+| Node | Minimum | Recommended |
+|------|---------|-------------|
+| Control plane | 2 CPU, 2 GB RAM, 30 GB disk | 4 CPU, 4 GB RAM, 50 GB disk |
+| Worker | 2 CPU, 2 GB RAM, 30 GB disk | 4+ CPU, 8+ GB RAM, 100+ GB disk |
+
+The monitoring stack (Prometheus, Grafana, Loki) and Longhorn are the biggest resource consumers. If you're tight on resources, reduce `MONITORING_RETENTION_DAYS` or switch to `local-path` storage.
+
+### Software
+
+- Debian 12 (bookworm) or Debian 13 (trixie) -- fresh minimal install
+- Root or sudo access on both nodes
+- Network connectivity between nodes (no firewall blocking required ports)
+- Internet access (to pull packages and container images)
+
+### Network
+
+- Both nodes must be able to reach each other on their primary IP
+- The following ports must be open between nodes:
+
+| Port | Protocol | Direction | Purpose |
+|------|----------|-----------|---------|
+| 6443 | TCP | Worker -> CP | Kubernetes API |
+| 2379-2380 | TCP | CP <-> CP | etcd (peers only) |
+| 10250 | TCP | CP <-> Worker | Kubelet API |
+| 10256 | TCP | CP -> Worker | kube-proxy health |
+| 10259 | TCP | Localhost | kube-scheduler |
+| 10257 | TCP | Localhost | controller-manager |
+| 8472 | UDP | CP <-> Worker | Calico VXLAN |
+| 30000-32767 | TCP/UDP | External -> Worker | NodePort services |
+
+## Files
+
+```
+manual/
+├── 00-env.sh                    # Central configuration (source by all scripts)
+├── 01-prereqs.sh                # OS preparation
+├── 02-containerd.sh             # Container runtime
+├── 03-k8s-packages.sh           # kubeadm, kubelet, kubectl, Helm
+├── 04-init-control-plane.sh     # kubeadm init with production config
+├── 05-cni-calico.sh             # Calico CNI via Helm
+├── 06-join-worker.sh            # Worker node join
+├── 07-metallb.sh                # MetalLB L2 load balancer
+├── 08-ingress-nginx.sh          # NGINX Ingress Controller
+├── 09-storage.sh                # Longhorn or local-path-provisioner
+├── 10-cert-manager.sh           # cert-manager + ClusterIssuers
+├── 11-monitoring.sh             # Prometheus + Grafana + Loki
+├── 12-security.sh               # PSA, NetworkPolicies, RBAC, audit
+├── 13-backup.sh                 # etcd snapshots + Velero template
+├── 14-verify.sh                 # Cluster health verification
+├── configs/                     # Generated configs (kubeadm, Helm values, etc.)
+│   ├── kubeadm-config.yaml      # (generated by 04)
+│   ├── kubeadm-init-output.log  # (generated by 04)
+│   ├── worker-join-command.sh   # (generated by 04) -- CONTAINS SECRET TOKEN
+│   ├── calico-values.yaml       # (generated by 05)
+│   ├── metallb-pool.yaml        # (generated by 07)
+│   ├── ingress-nginx-values.yaml          # (generated by 08)
+│   ├── longhorn-values.yaml               # (generated by 09)
+│   ├── cert-manager-issuers.yaml          # (generated by 10)
+│   ├── prometheus-stack-values.yaml       # (generated by 11)
+│   ├── loki-stack-values.yaml             # (generated by 11)
+│   ├── namespace-restricted-template.yaml # (generated by 12)
+│   ├── netpol-default-deny.yaml           # (generated by 12)
+│   ├── rbac-admin.yaml                    # (generated by 12)
+│   ├── sa-no-automount.yaml               # (generated by 12)
+│   └── velero-values.yaml                 # (generated by 13)
+└── env.local                    # (optional) Your local variable overrides
+```
+
+## Configuration
+
+All configuration is centralized in `00-env.sh`. Every script sources it. You have two ways to set variables:
+
+### Option 1: Create an env.local file (recommended)
+
+```bash
+cat > env.local <<'EOF'
+# Cluster
+CLUSTER_NAME="my-prod"
+K8S_VERSION="1.31"
+K8S_VERSION_FULL="1.31.0"
+
+# Node IPs -- REQUIRED
+CONTROL_PLANE_IP="192.168.1.10"
+CONTROL_PLANE_HOSTNAME="cp1"
+WORKER_IP="192.168.1.11"
+WORKER_HOSTNAME="worker1"
+
+# Networking
+POD_CIDR="10.244.0.0/16"
+SERVICE_CIDR="10.96.0.0/12"
+
+# MetalLB -- allocate free IPs on your LAN
+METALLB_IP_RANGE="192.168.1.200-192.168.1.210"
+
+# Storage
+STORAGE_PROVIDER="longhorn"      # or "local-path"
+
+# cert-manager
+LETSENCRYPT_EMAIL="admin@example.com"
+
+# Monitoring
+GRAFANA_ADMIN_PASSWORD="MySecurePassword123"
+MONITORING_RETENTION_DAYS="15"
+EOF
+```
+
+### Option 2: Export variables
+
+```bash
+export CONTROL_PLANE_IP="192.168.1.10"
+export WORKER_IP="192.168.1.11"
+export METALLB_IP_RANGE="192.168.1.200-192.168.1.210"
+```
+
+### All Variables
+
+| Variable | Default | Required | Description |
+|----------|---------|----------|-------------|
+| `CLUSTER_NAME` | `k8s-prod` | No | Cluster name in kubeadm config |
+| `K8S_VERSION` | `1.31` | No | K8s minor version (for apt repo) |
+| `K8S_VERSION_FULL` | `1.31.0` | No | Full K8s version for package install |
+| `CONTROL_PLANE_IP` | (empty) | **Yes** | Control plane node IP |
+| `CONTROL_PLANE_HOSTNAME` | `cp1` | No | Control plane hostname |
+| `WORKER_IP` | (empty) | **Yes** | Worker node IP |
+| `WORKER_HOSTNAME` | `worker1` | No | Worker hostname |
+| `POD_CIDR` | `10.244.0.0/16` | No | Pod network CIDR |
+| `SERVICE_CIDR` | `10.96.0.0/12` | No | Service network CIDR |
+| `DNS_DOMAIN` | `cluster.local` | No | Cluster DNS domain |
+| `CALICO_VERSION` | `3.29.3` | No | Calico Helm chart version |
+| `CALICO_MODE` | `vxlan` | No | `vxlan` or `ipip` |
+| `METALLB_VERSION` | `0.14.9` | No | MetalLB Helm chart version |
+| `METALLB_IP_RANGE` | (empty) | **Yes** (for 07) | IP range for LoadBalancer services |
+| `INGRESS_NGINX_VERSION` | `4.12.1` | No | ingress-nginx Helm chart version |
+| `STORAGE_PROVIDER` | `longhorn` | No | `longhorn` or `local-path` |
+| `LONGHORN_VERSION` | `1.7.3` | No | Longhorn Helm chart version |
+| `CERT_MANAGER_VERSION` | `1.17.1` | No | cert-manager version |
+| `LETSENCRYPT_EMAIL` | (empty) | No* | Email for Let's Encrypt issuers |
+| `KUBE_PROMETHEUS_STACK_VERSION` | `69.8.2` | No | Prometheus stack Helm chart version |
+| `LOKI_STACK_VERSION` | `2.10.2` | No | Loki stack Helm chart version |
+| `GRAFANA_ADMIN_PASSWORD` | `changeme` | No | Grafana admin password |
+| `MONITORING_RETENTION_DAYS` | `15` | No | Prometheus + Loki data retention |
+| `VELERO_VERSION` | `8.3.0` | No | Velero Helm chart version |
+| `ETCD_BACKUP_DIR` | `/var/backups/etcd` | No | etcd snapshot storage path |
+| `ETCD_BACKUP_RETENTION_DAYS` | `30` | No | Days to keep etcd snapshots |
+| `CONTAINERD_VERSION` | (latest) | No | Pin containerd version |
+| `HELM_VERSION` | (latest) | No | Pin Helm version |
+
+*`LETSENCRYPT_EMAIL` is required only if you want Let's Encrypt ClusterIssuers. The internal-ca and selfsigned issuers are always created.
+
+## Deployment Guide
+
+### Step 1: Prepare the scripts on both nodes
+
+Copy this entire directory to both nodes. The easiest method:
+
+```bash
+# From your workstation
+scp -r manual/ user@cp1:~/k8s-setup/
+scp -r manual/ user@worker1:~/k8s-setup/
+```
+
+Create your `env.local` on both nodes (or copy it over):
+
+```bash
+# On both nodes
+cd ~/k8s-setup
+vi env.local    # set CONTROL_PLANE_IP, WORKER_IP, METALLB_IP_RANGE at minimum
+```
+
+### Step 2: OS preparation (BOTH nodes)
+
+```bash
+# On cp1
+sudo -E ./01-prereqs.sh
+
+# On worker1 (can run in parallel)
+sudo -E ./01-prereqs.sh
+```
+
+This script:
+- Disables swap permanently (required by kubelet)
+- Loads kernel modules: `overlay`, `br_netfilter`, `ip_vs`, `ip_vs_rr`, `ip_vs_wrr`, `ip_vs_sh`, `nf_conntrack`
+- Sets sysctl: `net.bridge.bridge-nf-call-iptables=1`, `net.ipv4.ip_forward=1`, conntrack tuning, inotify limits
+- Installs base packages: `curl`, `gnupg`, `jq`, `socat`, `conntrack`, `ipvsadm`, `open-iscsi`, etc.
+- Enables `iscsid` (needed for Longhorn)
+- Configures time sync and hostname
+- Sets up logrotate for container logs
+
+### Step 3: Install containerd (BOTH nodes)
+
+```bash
+# On cp1
+sudo -E ./02-containerd.sh
+
+# On worker1 (can run in parallel)
+sudo -E ./02-containerd.sh
+```
+
+This script:
+- Adds the Docker apt repository (for the `containerd.io` package)
+- Falls back to `bookworm` repo if your Debian codename isn't available yet
+- Configures containerd with `SystemdCgroup = true` (required for kubelet)
+- Sets the sandbox image to `registry.k8s.io/pause:3.10`
+- Configures `crictl` to use the containerd socket
+
+### Step 4: Install K8s packages (BOTH nodes)
+
+```bash
+# On cp1
+sudo -E ./03-k8s-packages.sh
+
+# On worker1 (can run in parallel)
+sudo -E ./03-k8s-packages.sh
+```
+
+This script:
+- Adds the official `pkgs.k8s.io` apt repository
+- Installs `kubeadm`, `kubelet`, `kubectl` at the specified version
+- Pins packages with `apt-mark hold` to prevent accidental upgrades
+- Installs Helm
+- Sets up bash completion for kubectl, kubeadm, and helm
+
+### Step 5: Initialize the control plane (CP only)
+
+```bash
+# On cp1 ONLY
+sudo -E ./04-init-control-plane.sh
+```
+
+This is the most critical script. It:
+
+- Generates a `kubeadm-config.yaml` with production hardening:
+  - **API server**: audit logging, anonymous auth disabled, profiling disabled, `NodeRestriction` + `PodSecurity` admission plugins, etcd encryption at rest
+  - **Controller manager**: profiling disabled, terminated pod GC threshold
+  - **Scheduler**: profiling disabled
+  - **Kubelet**: systemd cgroup driver, read-only port disabled, certificate rotation, TLS 1.2+ with strong cipher suites, kernel defaults protection
+  - **kube-proxy**: IPVS mode with strictARP (required for MetalLB)
+  - **etcd**: metrics endpoint enabled
+- Creates an AES-CBC encryption config for Secrets and ConfigMaps at rest in etcd
+- Runs `kubeadm init` with the generated config
+- Configures kubectl for root and the sudo-calling user
+- Saves the worker join command to `configs/worker-join-command.sh`
+
+**Important**: The join command file contains a bootstrap token. Transfer it to the worker securely (e.g., `scp` over SSH). Do not commit it to version control.
+
+### Step 6: Install Calico CNI (CP only)
+
+```bash
+# On cp1 ONLY
+sudo -E ./05-cni-calico.sh
+```
+
+- Installs Calico via the Tigera Operator Helm chart
+- Configures VXLAN encapsulation by default (set `CALICO_MODE=ipip` for IPIP)
+- BGP is disabled (not needed for a 2-node cluster)
+- Typha is disabled (only useful for 50+ node clusters)
+- Waits for Calico and CoreDNS to become ready
+- The node should transition to `Ready` status
+
+### Step 7: Join the worker (WORKER only)
+
+First, copy the join command to the worker:
+
+```bash
+# From cp1
+scp ~/k8s-setup/configs/worker-join-command.sh user@worker1:~/k8s-setup/configs/
+```
+
+Then on the worker:
+
+```bash
+# On worker1 ONLY
+sudo -E ./06-join-worker.sh
+```
+
+Or pass the join command directly:
+
+```bash
+export JOIN_COMMAND="kubeadm join 192.168.1.10:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
+sudo -E ./06-join-worker.sh
+```
+
+If the token has expired (tokens are valid for 24 hours), regenerate on the control plane:
+
+```bash
+kubeadm token create --print-join-command
+```
+
+Verify on the control plane:
+
+```bash
+kubectl get nodes -o wide
+# Both nodes should show Ready within 60 seconds
+```
+
+### Step 8: Install MetalLB (CP only)
+
+```bash
+# On cp1 ONLY
+sudo -E ./07-metallb.sh
+```
+
+- Installs MetalLB in L2 mode via Helm
+- Creates an `IPAddressPool` and `L2Advertisement` using `METALLB_IP_RANGE`
+- Verifies kube-proxy `strictARP` is enabled
+
+Choose `METALLB_IP_RANGE` from free IPs on your LAN subnet. For example, if your nodes are on `192.168.1.0/24`, you might use `192.168.1.200-192.168.1.210`. These IPs must not be assigned to any other device or managed by DHCP.
+
+### Step 9: Install NGINX Ingress (CP only)
+
+```bash
+# On cp1 ONLY
+sudo -E ./08-ingress-nginx.sh
+```
+
+- Installs the NGINX Ingress Controller via Helm as a `LoadBalancer` service
+- MetalLB assigns it an external IP from the pool
+- Configures security headers (HSTS, hide server tokens, force SSL)
+- Enables Prometheus metrics with a ServiceMonitor
+- Sets sane proxy timeouts and body size limits
+
+After installation, note the external IP:
+
+```bash
+kubectl get svc -n ingress-nginx
+```
+
+Point your DNS records (A records) to this IP.
+
+### Step 10: Install storage (CP only)
+
+```bash
+# On cp1 ONLY
+sudo -E ./09-storage.sh
+```
+
+**Longhorn** (default, `STORAGE_PROVIDER=longhorn`):
+- Distributed block storage with replication (replica count: 2)
+- Supports snapshots and backups
+- Reclaim policy: Retain (prevents accidental data loss)
+- Web UI available via port-forward: `kubectl port-forward svc/longhorn-frontend 8080:80 -n longhorn-system`
+- Requires `open-iscsi` on all nodes (installed by `01-prereqs.sh`)
+
+**local-path-provisioner** (`STORAGE_PROVIDER=local-path`):
+- Simple hostPath-based dynamic provisioner
+- No replication -- data is lost if the node dies
+- Suitable for workloads that handle their own replication
+
+Both are set as the default StorageClass.
+
+### Step 11: Install cert-manager (CP only)
+
+```bash
+# On cp1 ONLY
+sudo -E ./10-cert-manager.sh
+```
+
+Creates the following ClusterIssuers:
+
+| Issuer | Use Case |
+|--------|----------|
+| `selfsigned` | Bootstrap, testing |
+| `internal-ca` | Internal service TLS (10-year CA, auto-renewed) |
+| `letsencrypt-staging` | Public TLS testing (not browser-trusted) |
+| `letsencrypt-prod` | Public TLS production (rate-limited) |
+
+The Let's Encrypt issuers are only created if `LETSENCRYPT_EMAIL` is set. They use HTTP-01 challenge via the nginx ingress class.
+
+Usage in an Ingress:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+    - hosts:
+        - app.example.com
+      secretName: app-tls
+  rules:
+    - host: app.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-app
+                port:
+                  number: 80
+```
+
+### Step 12: Install monitoring (CP only)
+
+```bash
+# On cp1 ONLY
+sudo -E ./11-monitoring.sh
+```
+
+Installs two Helm releases:
+
+**kube-prometheus-stack** (Prometheus + Grafana + Alertmanager):
+- Pre-configured dashboards for cluster, node, and pod metrics
+- Scrapes etcd, scheduler, controller-manager, kube-proxy metrics
+- Persistent storage for Prometheus (20 Gi) and Alertmanager (2 Gi)
+- Grafana with Loki datasource pre-configured
+
+**Loki + Promtail**:
+- Centralized log aggregation
+- Promtail runs as a DaemonSet, ships logs to Loki
+- Queryable from Grafana's Explore tab
+
+Access after installation:
+
+```bash
+# Grafana (admin / <GRAFANA_ADMIN_PASSWORD>)
+kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring
+
+# Prometheus
+kubectl port-forward svc/kube-prometheus-stack-prometheus 9090:9090 -n monitoring
+
+# Alertmanager
+kubectl port-forward svc/kube-prometheus-stack-alertmanager 9093:9093 -n monitoring
+```
+
+### Step 13: Security hardening (CP only)
+
+```bash
+# On cp1 ONLY
+sudo -E ./12-security.sh
+```
+
+This script applies post-install security measures:
+
+1. **Pod Security Admission (PSA)**: Labels all system namespaces with `privileged` enforcement. Provides a template (`namespace-restricted-template.yaml`) for creating new production namespaces with `restricted` enforcement.
+
+2. **NetworkPolicy templates**: Creates `netpol-default-deny.yaml` with:
+   - Default deny-all ingress and egress
+   - Allow DNS egress (port 53)
+   - Allow ingress from the nginx ingress namespace
+   - Allow Prometheus scraping from the monitoring namespace
+
+3. **etcd encryption verification**: Tests that Secrets are encrypted at rest with AES-CBC.
+
+4. **RBAC**: Creates a `cluster-viewer` ServiceAccount with read-only cluster access.
+
+5. **Service account hardening**: Template to disable `automountServiceAccountToken` on default service accounts.
+
+6. **Audit policy**: Creates `/etc/kubernetes/audit-policy.yaml` with sensible levels (Metadata for secrets, RequestResponse for writes, None for noisy system watchers).
+
+### Step 14: Backup configuration (CP only)
+
+```bash
+# On cp1 ONLY
+sudo -E ./13-backup.sh
+```
+
+**etcd snapshots**:
+- Installs `etcdctl` if not present
+- Creates `/usr/local/bin/etcd-backup.sh` -- takes a compressed snapshot
+- Schedules a cron job: every 6 hours
+- Retention: 30 days (configurable via `ETCD_BACKUP_RETENTION_DAYS`)
+- Backups stored in `/var/backups/etcd/`
+
+**K8s resource export**:
+- Creates `/usr/local/bin/k8s-backup-resources.sh` -- exports all deployments, services, configmaps, secrets, etc. as YAML
+
+**Velero** (template only):
+- Generates `configs/velero-values.yaml` for Helm installation
+- Velero requires an S3-compatible backend (e.g., MinIO) -- the script does not install it automatically
+- Includes a daily backup schedule (2:00 AM, 30-day TTL)
+
+### Step 15: Verify (CP only)
+
+```bash
+# On cp1 ONLY
+sudo -E ./14-verify.sh
+```
+
+Runs a comprehensive health check across all components:
+
+- API server health, node status, K8s version
+- Core components (etcd, CoreDNS, kube-proxy mode)
+- CNI (Calico pods, pod connectivity test)
+- MetalLB (pods, IP pools)
+- Ingress (pods, external IP)
+- Storage (default StorageClass, Longhorn/local-path status)
+- cert-manager (pods, ClusterIssuers)
+- Monitoring (Prometheus, Grafana, Loki)
+- Security (encryption config, anonymous auth, PSA labels, audit logging)
+- Backup (cron job, snapshot count)
+- Problem pods (anything not Running/Completed)
+
+Outputs a PASS/FAIL/WARN summary.
+
+## Execution Summary
+
+| Step | Script | Run On | Time |
+|------|--------|--------|------|
+| 1 | `01-prereqs.sh` | Both (parallel) | ~2 min |
+| 2 | `02-containerd.sh` | Both (parallel) | ~1 min |
+| 3 | `03-k8s-packages.sh` | Both (parallel) | ~1 min |
+| 4 | `04-init-control-plane.sh` | CP only | ~3 min |
+| 5 | `05-cni-calico.sh` | CP only | ~3 min |
+| 6 | `06-join-worker.sh` | Worker only | ~1 min |
+| 7 | `07-metallb.sh` | CP only | ~2 min |
+| 8 | `08-ingress-nginx.sh` | CP only | ~2 min |
+| 9 | `09-storage.sh` | CP only | ~5 min |
+| 10 | `10-cert-manager.sh` | CP only | ~2 min |
+| 11 | `11-monitoring.sh` | CP only | ~5 min |
+| 12 | `12-security.sh` | CP only | ~1 min |
+| 13 | `13-backup.sh` | CP only | ~2 min |
+| 14 | `14-verify.sh` | CP only | ~1 min |
+| | | **Total** | **~30 min** |
+
+## Post-Deployment
+
+### Deploying a workload
+
+```bash
+# 1. Create a namespace with restricted PSA
+kubectl create namespace my-app
+kubectl label namespace my-app \
+    pod-security.kubernetes.io/enforce=restricted \
+    pod-security.kubernetes.io/warn=restricted \
+    pod-security.kubernetes.io/audit=restricted
+
+# 2. Apply default-deny NetworkPolicies
+kubectl apply -f configs/netpol-default-deny.yaml -n my-app
+
+# 3. Disable SA token automount
+kubectl apply -f configs/sa-no-automount.yaml -n my-app
+
+# 4. Deploy your application
+kubectl apply -f my-app-deployment.yaml -n my-app
+
+# 5. Create application-specific NetworkPolicies to allow needed traffic
+```
+
+### Accessing dashboards
+
+| Dashboard | Command | URL |
+|-----------|---------|-----|
+| Grafana | `kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring` | http://localhost:3000 |
+| Prometheus | `kubectl port-forward svc/kube-prometheus-stack-prometheus 9090:9090 -n monitoring` | http://localhost:9090 |
+| Alertmanager | `kubectl port-forward svc/kube-prometheus-stack-alertmanager 9093:9093 -n monitoring` | http://localhost:9093 |
+| Longhorn UI | `kubectl port-forward svc/longhorn-frontend 8080:80 -n longhorn-system` | http://localhost:8080 |
+
+For persistent access, create Ingress resources with TLS certificates:
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: monitoring
+  annotations:
+    cert-manager.io/cluster-issuer: "internal-ca"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["grafana.internal.example.com"]
+      secretName: grafana-tls
+  rules:
+    - host: grafana.internal.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kube-prometheus-stack-grafana
+                port:
+                  number: 80
+```
+
+### Upgrading Kubernetes
+
+```bash
+# 1. Update K8S_VERSION and K8S_VERSION_FULL in env.local
+# 2. On the control plane:
+sudo apt-mark unhold kubeadm
+sudo apt-get update
+sudo apt-get install -y kubeadm=<new-version>-*
+sudo apt-mark hold kubeadm
+sudo kubeadm upgrade plan
+sudo kubeadm upgrade apply v<new-version>
+sudo apt-mark unhold kubelet kubectl
+sudo apt-get install -y kubelet=<new-version>-* kubectl=<new-version>-*
+sudo apt-mark hold kubelet kubectl
+sudo systemctl daemon-reload && sudo systemctl restart kubelet
+
+# 3. Drain and upgrade the worker:
+kubectl drain worker1 --ignore-daemonsets --delete-emptydir-data
+# On the worker node:
+sudo apt-mark unhold kubeadm kubelet kubectl
+sudo apt-get update
+sudo apt-get install -y kubeadm=<new-version>-* kubelet=<new-version>-* kubectl=<new-version>-*
+sudo apt-mark hold kubeadm kubelet kubectl
+sudo kubeadm upgrade node
+sudo systemctl daemon-reload && sudo systemctl restart kubelet
+# On the control plane:
+kubectl uncordon worker1
+```
+
+### Backup and restore
+
+**Manual etcd backup:**
+
+```bash
+sudo /usr/local/bin/etcd-backup.sh
+```
+
+**Restore etcd from snapshot:**
+
+```bash
+# Stop kubelet and all control plane static pods
+sudo systemctl stop kubelet
+
+# Restore
+sudo ETCDCTL_API=3 etcdctl snapshot restore /var/backups/etcd/etcd-snapshot-YYYYMMDD_HHMMSS.db.gz \
+    --data-dir=/var/lib/etcd-restore \
+    --name=cp1 \
+    --initial-cluster=cp1=https://127.0.0.1:2380 \
+    --initial-advertise-peer-urls=https://127.0.0.1:2380
+
+# Replace etcd data
+sudo mv /var/lib/etcd /var/lib/etcd.bak
+sudo mv /var/lib/etcd-restore /var/lib/etcd
+
+# Restart
+sudo systemctl start kubelet
+```
+
+**Export all K8s resources:**
+
+```bash
+sudo /usr/local/bin/k8s-backup-resources.sh
+# Saved to /var/backups/k8s-resources/<timestamp>/
+```
+
+### Adding a second worker node
+
+```bash
+# 1. Run steps 1-3 on the new node (01-prereqs.sh, 02-containerd.sh, 03-k8s-packages.sh)
+# 2. Generate a new join token on the control plane:
+kubeadm token create --print-join-command > configs/worker-join-command.sh
+# 3. Copy and run 06-join-worker.sh on the new node
+# 4. If using Longhorn, increase defaultReplicaCount to 3
+```
+
+## Resetting the cluster
+
+To completely tear down and start over:
+
+```bash
+# On worker node:
+sudo kubeadm reset -f
+sudo rm -rf /etc/cni/net.d /var/lib/kubelet /var/lib/etcd /etc/kubernetes
+sudo iptables -F && sudo iptables -X && sudo iptables -t nat -F && sudo iptables -t nat -X
+
+# On control plane:
+sudo kubeadm reset -f
+sudo rm -rf /etc/cni/net.d /var/lib/kubelet /var/lib/etcd /etc/kubernetes
+sudo iptables -F && sudo iptables -X && sudo iptables -t nat -F && sudo iptables -t nat -X
+
+# Then re-run from step 4 (04-init-control-plane.sh)
+# Steps 1-3 do not need to be repeated
+```
+
+## Troubleshooting
+
+### kubeadm init fails with preflight errors
+
+```bash
+# Check the specific errors in the output, common ones:
+# - Swap not disabled: swapoff -a && sed -i '/swap/d' /etc/fstab
+# - br_netfilter not loaded: modprobe br_netfilter
+# - Port 6443 in use: another cluster is running, reset first
+# - Container runtime not ready: systemctl restart containerd
+```
+
+### Node stuck in NotReady
+
+```bash
+# Check kubelet logs
+journalctl -xeu kubelet --no-pager | tail -50
+
+# Common causes:
+# - CNI not installed yet (expected before step 5)
+# - containerd not running: systemctl restart containerd
+# - Network issues between nodes
+```
+
+### Pods stuck in Pending
+
+```bash
+kubectl describe pod <pod-name> -n <namespace>
+
+# Check events at the bottom. Common causes:
+# - No nodes available (taints): kubectl describe node <node>
+# - Insufficient resources: check resource requests vs node capacity
+# - PVC not bound: kubectl get pvc -n <namespace>
+```
+
+### CoreDNS pods in CrashLoopBackOff
+
+```bash
+kubectl logs -n kube-system -l k8s-app=kube-dns
+
+# Common on Debian: /etc/resolv.conf has a loop
+# Fix: set a real upstream DNS in CoreDNS configmap
+kubectl edit configmap coredns -n kube-system
+# Change 'forward . /etc/resolv.conf' to 'forward . 8.8.8.8 1.1.1.1'
+kubectl rollout restart deployment coredns -n kube-system
+```
+
+### MetalLB not assigning IPs
+
+```bash
+kubectl get ipaddresspool -n metallb-system
+kubectl logs -n metallb-system -l app.kubernetes.io/component=controller
+
+# Verify kube-proxy strictARP:
+kubectl get configmap kube-proxy -n kube-system -o yaml | grep strictARP
+# Must be 'true' for MetalLB L2 to work
+```
+
+### Can't pull images (containerd)
+
+```bash
+# Check containerd is running
+systemctl status containerd
+
+# Try pulling manually
+crictl pull nginx:latest
+
+# If DNS fails inside containerd, check /etc/resolv.conf on the host
+```
+
+## Security Checklist
+
+After deployment, verify these are in place:
+
+- [ ] API server anonymous auth is disabled
+- [ ] etcd encryption at rest is configured (aescbc for secrets + configmaps)
+- [ ] API server audit logging is enabled
+- [ ] RBAC is enforced (kubeadm default)
+- [ ] kube-proxy runs in IPVS mode
+- [ ] Kubelet read-only port is disabled (10255)
+- [ ] Kubelet certificate rotation is enabled
+- [ ] TLS 1.2+ enforced on kubelet with strong ciphers
+- [ ] PSA labels on system namespaces
+- [ ] Default-deny NetworkPolicies template ready for workload namespaces
+- [ ] etcd backup cron is running
+- [ ] Grafana password changed from default
+- [ ] NodeRestriction admission plugin enabled
+- [ ] Profiling disabled on API server, scheduler, and controller manager
+
+Run `14-verify.sh` to check most of these automatically.
