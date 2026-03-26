@@ -14,8 +14,8 @@ set -euo pipefail
 
 # ---- Cluster identity -------------------------------------------------------
 CLUSTER_NAME="${CLUSTER_NAME:-k8s-prod}"
-K8S_VERSION="${K8S_VERSION:-1.31}"              # minor version (apt repo)
-K8S_VERSION_FULL="${K8S_VERSION_FULL:-1.31.0}"  # full version for kubeadm
+K8S_VERSION="${K8S_VERSION:-1.35}"              # minor version (apt repo)
+K8S_VERSION_FULL="${K8S_VERSION_FULL:-1.35.3}"  # full version for kubeadm
 
 # ---- Node IPs (MUST be set before running) -----------------------------------
 CONTROL_PLANE_IP="${CONTROL_PLANE_IP:-}"        # e.g. 192.168.1.10
@@ -29,33 +29,36 @@ SERVICE_CIDR="${SERVICE_CIDR:-10.96.0.0/12}"
 DNS_DOMAIN="${DNS_DOMAIN:-cluster.local}"
 
 # ---- CNI (Calico) -----------------------------------------------------------
-CALICO_VERSION="${CALICO_VERSION:-3.29.3}"
+CALICO_VERSION="${CALICO_VERSION:-3.31.4}"
 CALICO_MODE="${CALICO_MODE:-vxlan}"              # vxlan or ipip
 
 # ---- MetalLB ----------------------------------------------------------------
-METALLB_VERSION="${METALLB_VERSION:-0.14.9}"
+METALLB_VERSION="${METALLB_VERSION:-0.15.3}"
 METALLB_IP_RANGE="${METALLB_IP_RANGE:-}"         # e.g. 192.168.1.200-192.168.1.210
 
 # ---- Ingress NGINX ----------------------------------------------------------
-INGRESS_NGINX_VERSION="${INGRESS_NGINX_VERSION:-4.12.1}"  # Helm chart version
+# NOTE: The kubernetes/ingress-nginx repo was archived on 2026-03-24.
+# Chart 4.15.1 is the final release. Consider migrating to an alternative
+# ingress controller (e.g., Envoy Gateway, Traefik) for future updates.
+INGRESS_NGINX_VERSION="${INGRESS_NGINX_VERSION:-4.15.1}"  # Helm chart version
 
 # ---- Storage ----------------------------------------------------------------
 # Options: "longhorn" or "local-path"
 STORAGE_PROVIDER="${STORAGE_PROVIDER:-longhorn}"
-LONGHORN_VERSION="${LONGHORN_VERSION:-1.7.3}"
+LONGHORN_VERSION="${LONGHORN_VERSION:-1.11.1}"
 
 # ---- cert-manager -----------------------------------------------------------
-CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-1.17.1}"
+CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-1.20.0}"
 LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"        # required for Let's Encrypt
 
 # ---- Monitoring --------------------------------------------------------------
-KUBE_PROMETHEUS_STACK_VERSION="${KUBE_PROMETHEUS_STACK_VERSION:-69.8.2}"
-LOKI_STACK_VERSION="${LOKI_STACK_VERSION:-2.10.2}"
+KUBE_PROMETHEUS_STACK_VERSION="${KUBE_PROMETHEUS_STACK_VERSION:-82.14.1}"
+LOKI_STACK_VERSION="${LOKI_STACK_VERSION:-2.10.3}"
 GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:-changeme}"
 MONITORING_RETENTION_DAYS="${MONITORING_RETENTION_DAYS:-15}"
 
 # ---- Backup (Velero) --------------------------------------------------------
-VELERO_VERSION="${VELERO_VERSION:-8.3.0}"          # Helm chart version
+VELERO_VERSION="${VELERO_VERSION:-12.0.0}"          # Helm chart version
 ETCD_BACKUP_DIR="${ETCD_BACKUP_DIR:-/var/backups/etcd}"
 ETCD_BACKUP_RETENTION_DAYS="${ETCD_BACKUP_RETENTION_DAYS:-30}"
 

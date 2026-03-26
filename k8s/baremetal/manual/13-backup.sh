@@ -144,7 +144,7 @@ credentials:
 
 initContainers:
   - name: velero-plugin-for-aws
-    image: velero/velero-plugin-for-aws:v1.11.0
+    image: velero/velero-plugin-for-aws:v1.14.0
     volumeMounts:
       - mountPath: /target
         name: plugins

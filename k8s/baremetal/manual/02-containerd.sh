@@ -52,8 +52,8 @@ containerd config default > /etc/containerd/config.toml
 sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
 
 # Set the sandbox (pause) image to match the K8s version
-# kubeadm 1.31 uses registry.k8s.io/pause:3.10
-PAUSE_IMAGE="registry.k8s.io/pause:3.10"
+# kubeadm 1.35 uses registry.k8s.io/pause:3.10.2
+PAUSE_IMAGE="registry.k8s.io/pause:3.10.2"
 sed -i "s|sandbox_image = .*|sandbox_image = \"${PAUSE_IMAGE}\"|" /etc/containerd/config.toml
 
 log_info "containerd configured with SystemdCgroup=true, pause=${PAUSE_IMAGE}"

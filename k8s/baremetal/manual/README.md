@@ -130,8 +130,8 @@ All configuration is centralized in `00-env.sh`. Every script sources it. You ha
 cat > env.local <<'EOF'
 # Cluster
 CLUSTER_NAME="my-prod"
-K8S_VERSION="1.31"
-K8S_VERSION_FULL="1.31.0"
+K8S_VERSION="1.35"
+K8S_VERSION_FULL="1.35.3"
 
 # Node IPs -- REQUIRED
 CONTROL_PLANE_IP="192.168.1.10"
@@ -171,8 +171,8 @@ export METALLB_IP_RANGE="192.168.1.200-192.168.1.210"
 | Variable | Default | Required | Description |
 |----------|---------|----------|-------------|
 | `CLUSTER_NAME` | `k8s-prod` | No | Cluster name in kubeadm config |
-| `K8S_VERSION` | `1.31` | No | K8s minor version (for apt repo) |
-| `K8S_VERSION_FULL` | `1.31.0` | No | Full K8s version for package install |
+| `K8S_VERSION` | `1.35` | No | K8s minor version (for apt repo) |
+| `K8S_VERSION_FULL` | `1.35.3` | No | Full K8s version for package install |
 | `CONTROL_PLANE_IP` | (empty) | **Yes** | Control plane node IP |
 | `CONTROL_PLANE_HOSTNAME` | `cp1` | No | Control plane hostname |
 | `WORKER_IP` | (empty) | **Yes** | Worker node IP |
@@ -180,20 +180,20 @@ export METALLB_IP_RANGE="192.168.1.200-192.168.1.210"
 | `POD_CIDR` | `10.244.0.0/16` | No | Pod network CIDR |
 | `SERVICE_CIDR` | `10.96.0.0/12` | No | Service network CIDR |
 | `DNS_DOMAIN` | `cluster.local` | No | Cluster DNS domain |
-| `CALICO_VERSION` | `3.29.3` | No | Calico Helm chart version |
+| `CALICO_VERSION` | `3.31.4` | No | Calico Helm chart version |
 | `CALICO_MODE` | `vxlan` | No | `vxlan` or `ipip` |
-| `METALLB_VERSION` | `0.14.9` | No | MetalLB Helm chart version |
+| `METALLB_VERSION` | `0.15.3` | No | MetalLB Helm chart version |
 | `METALLB_IP_RANGE` | (empty) | **Yes** (for 07) | IP range for LoadBalancer services |
-| `INGRESS_NGINX_VERSION` | `4.12.1` | No | ingress-nginx Helm chart version |
+| `INGRESS_NGINX_VERSION` | `4.15.1` | No | ingress-nginx Helm chart version (⚠ repo archived, see note below) |
 | `STORAGE_PROVIDER` | `longhorn` | No | `longhorn` or `local-path` |
-| `LONGHORN_VERSION` | `1.7.3` | No | Longhorn Helm chart version |
-| `CERT_MANAGER_VERSION` | `1.17.1` | No | cert-manager version |
+| `LONGHORN_VERSION` | `1.11.1` | No | Longhorn Helm chart version |
+| `CERT_MANAGER_VERSION` | `1.20.0` | No | cert-manager version |
 | `LETSENCRYPT_EMAIL` | (empty) | No* | Email for Let's Encrypt issuers |
-| `KUBE_PROMETHEUS_STACK_VERSION` | `69.8.2` | No | Prometheus stack Helm chart version |
-| `LOKI_STACK_VERSION` | `2.10.2` | No | Loki stack Helm chart version |
+| `KUBE_PROMETHEUS_STACK_VERSION` | `82.14.1` | No | Prometheus stack Helm chart version |
+| `LOKI_STACK_VERSION` | `2.10.3` | No | Loki stack Helm chart version |
 | `GRAFANA_ADMIN_PASSWORD` | `changeme` | No | Grafana admin password |
 | `MONITORING_RETENTION_DAYS` | `15` | No | Prometheus + Loki data retention |
-| `VELERO_VERSION` | `8.3.0` | No | Velero Helm chart version |
+| `VELERO_VERSION` | `12.0.0` | No | Velero Helm chart version |
 | `ETCD_BACKUP_DIR` | `/var/backups/etcd` | No | etcd snapshot storage path |
 | `ETCD_BACKUP_RETENTION_DAYS` | `30` | No | Days to keep etcd snapshots |
 | `CONTAINERD_VERSION` | (latest) | No | Pin containerd version |
@@ -254,7 +254,7 @@ This script:
 - Adds the Docker apt repository (for the `containerd.io` package)
 - Falls back to `bookworm` repo if your Debian codename isn't available yet
 - Configures containerd with `SystemdCgroup = true` (required for kubelet)
-- Sets the sandbox image to `registry.k8s.io/pause:3.10`
+- Sets the sandbox image to `registry.k8s.io/pause:3.10.2`
 - Configures `crictl` to use the containerd socket
 
 ### Step 4: Install K8s packages (BOTH nodes)
@@ -380,6 +380,12 @@ kubectl get svc -n ingress-nginx
 ```
 
 Point your DNS records (A records) to this IP.
+
+> **Warning — ingress-nginx archived:** The `kubernetes/ingress-nginx` GitHub
+> repository was **archived on 2026-03-24**. Chart version 4.15.1 is the final
+> release and will receive no further updates. Plan a migration to an
+> actively-maintained ingress controller such as **Envoy Gateway**
+> (`gateway.envoyproxy.io`) or **Traefik** before your next major upgrade cycle.
 
 ### Step 10: Install storage (CP only)
 
@@ -814,3 +820,13 @@ After deployment, verify these are in place:
 - [ ] Profiling disabled on API server, scheduler, and controller manager
 
 Run `14-verify.sh` to check most of these automatically.
+
+## Known Limitations
+
+- **ingress-nginx archived (2026-03-24):** The upstream `kubernetes/ingress-nginx`
+  repository has been archived. Chart 4.15.1 is the last release. Consider migrating
+  to [Envoy Gateway](https://gateway.envoyproxy.io/) or
+  [Traefik](https://traefik.io/) for long-term support.
+- **Single control plane:** This toolkit deploys one CP node. For HA, you would need
+  to extend `04-init-control-plane.sh` with `kubeadm join --control-plane` for
+  additional masters behind a load balancer.
