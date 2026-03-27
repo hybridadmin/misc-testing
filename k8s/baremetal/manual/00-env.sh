@@ -62,6 +62,9 @@ VELERO_VERSION="${VELERO_VERSION:-12.0.0}"          # Helm chart version
 ETCD_BACKUP_DIR="${ETCD_BACKUP_DIR:-/var/backups/etcd}"
 ETCD_BACKUP_RETENTION_DAYS="${ETCD_BACKUP_RETENTION_DAYS:-30}"
 
+# ---- Secrets Store CSI Driver (optional) ------------------------------------
+SECRETS_STORE_CSI_VERSION="${SECRETS_STORE_CSI_VERSION:-1.5.6}"  # Helm chart version
+
 # ---- Containerd -------------------------------------------------------------
 CONTAINERD_VERSION="${CONTAINERD_VERSION:-}"       # empty = latest from repo
 
