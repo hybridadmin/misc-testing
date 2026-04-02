@@ -1,0 +1,136 @@
+version: "3.8"
+
+services:
+  # ============================================================
+  # PostgreSQL Primary
+  # ============================================================
+  pg-primary:
+    image: postgres:16-alpine
+    container_name: pgcat-primary
+    hostname: pg-primary
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_primary_data:/var/lib/postgresql/data
+      - ./sql/init-primary.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./config/pg_hba_primary.conf:/etc/pg_hba_custom.conf
+      - ./config/primary-postgresql.conf:/etc/postgresql-custom.conf
+    command: >
+      postgres
+        -c hba_file=/etc/pg_hba_custom.conf
+        -c config_file=/etc/postgresql-custom.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - pgcat-net
+
+  # ============================================================
+  # PostgreSQL Replica (Streaming Replication)
+  # ============================================================
+  pg-replica:
+    image: postgres:16-alpine
+    container_name: pgcat-replica
+    hostname: pg-replica
+    environment:
+      PGUSER: replicator
+      PGPASSWORD: replicator_password
+    ports:
+      - "5433:5432"
+    volumes:
+      - pg_replica_data:/var/lib/postgresql/data
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+    entrypoint: |
+      bash -c '
+      # Wait for primary to be fully ready
+      until pg_isready -h pg-primary -p 5432 -U postgres; do
+        echo "Waiting for primary..."
+        sleep 2
+      done
+
+      # If data directory is empty, create base backup from primary
+      if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+        echo "Creating base backup from primary..."
+        pg_basebackup -h pg-primary -p 5432 -U replicator -D /var/lib/postgresql/data -Fp -Xs -P -R
+        
+        # Configure replica settings
+        cat >> /var/lib/postgresql/data/postgresql.conf <<EOF
+      hot_standby = on
+      primary_conninfo = '\''host=pg-primary port=5432 user=replicator password=replicator_password'\''
+      EOF
+        
+        chown -R postgres:postgres /var/lib/postgresql/data
+      fi
+
+      # Start PostgreSQL as the postgres user
+      exec su-exec postgres postgres
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - pgcat-net
+
+  # ============================================================
+  # PgCat - Connection Pooler & Load Balancer
+  # ============================================================
+  pgcat:
+    image: ghcr.io/postgresml/pgcat:latest
+    container_name: pgcat-pooler
+    hostname: pgcat
+    ports:
+      - "6432:6432"
+    volumes:
+      - ./config/pgcat.toml:/etc/pgcat/pgcat.toml
+    depends_on:
+      pg-primary:
+        condition: service_healthy
+      pg-replica:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U bench_user -d benchdb || true"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pgcat-net
+
+  # ============================================================
+  # pgbench runner (on-demand)
+  # ============================================================
+  pgbench:
+    image: postgres:16-alpine
+    container_name: pgcat-pgbench
+    depends_on:
+      pgcat:
+        condition: service_healthy
+    environment:
+      PGHOST: pgcat
+      PGPORT: "6432"
+      PGUSER: bench_user
+      PGPASSWORD: bench_password
+      PGDATABASE: benchdb
+    volumes:
+      - ./scripts:/scripts
+      - ./sql:/sql
+    entrypoint: ["sleep", "infinity"]
+    networks:
+      - pgcat-net
+
+volumes:
+  pg_primary_data:
+  pg_replica_data:
+
+networks:
+  pgcat-net:
+    driver: bridge

@@ -1,0 +1,6 @@
+# Benchmark results (generated)
+scripts/results/
+
+# Docker volumes
+pg_primary_data/
+pg_replica_data/

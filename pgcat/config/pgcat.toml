@@ -1,0 +1,101 @@
+# PgCat Configuration
+# Documentation: https://github.com/postgresml/pgcat
+
+[general]
+# Host to bind to
+host = "0.0.0.0"
+
+# Port to listen on
+port = 6432
+
+# Enable admin database for stats and management
+admin_username = "pgcat"
+admin_password = "pgcat_admin"
+
+# Connection timeout (ms)
+connect_timeout = 5000
+
+# Idle client timeout (ms) - disconnect idle clients after 30 minutes
+idle_client_in_transaction_timeout = 30000
+
+# Healthcheck timeout (ms)
+healthcheck_timeout = 1000
+
+# Healthcheck delay between checks (ms)
+healthcheck_delay = 30000
+
+# Shutdown timeout (ms) - wait for active queries before force shutdown
+shutdown_timeout = 60000
+
+# Ban time for misbehaving servers (s)
+ban_time = 60
+
+# Log client connections/disconnections
+log_client_connections = true
+log_client_disconnections = true
+
+# Worker threads (0 = auto-detect based on CPU cores)
+worker_threads = 4
+
+# TCP keepalive settings
+tcp_keepalives_idle = 5
+tcp_keepalives_count = 5
+tcp_keepalives_interval = 1
+
+# Enable prepared statements support
+prepared_statements = true
+
+# ============================================================
+# Pool: benchdb
+# Primary + Read Replica with load balancing
+# ============================================================
+[pools.benchdb]
+pool_mode = "transaction"
+
+# Default role for queries (any, primary, replica)
+default_role = "any"
+
+# Query parser - needed for read/write splitting
+query_parser_enabled = true
+
+# Read/write splitting: send SELECT to replicas, writes to primary
+query_parser_read_write_splitting = true
+
+# Automatic sharding (disabled - single shard setup)
+automatic_sharding_key = ""
+sharding_function = "pg_bigint_hash"
+
+# Pool size per server
+pool_size = 20
+
+# Minimum pool size to maintain
+min_pool_size = 5
+
+# Number of servers to check before giving up
+connect_timeout = 3000
+
+# Auth query for user lookup (optional)
+# auth_query = "SELECT usename, passwd FROM pg_shadow WHERE usename=$1"
+
+# Users allowed to connect through this pool
+[pools.benchdb.users.0]
+username = "bench_user"
+password = "bench_password"
+pool_size = 30
+min_pool_size = 5
+pool_mode = "transaction"
+
+[pools.benchdb.users.1]
+username = "postgres"
+password = "postgres"
+pool_size = 10
+min_pool_size = 2
+pool_mode = "transaction"
+
+# Shard 0 - our single shard containing primary and replica
+[pools.benchdb.shards.0]
+servers = [
+    ["pg-primary", 5432, "primary"],
+    ["pg-replica", 5432, "replica"],
+]
+database = "benchdb"
